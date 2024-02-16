@@ -28,7 +28,10 @@ RUN mamba install \
     torchvision \
     pytorch-cuda=12.1 \
     transformers \
+    accelerate \
     diffusers \
+    safetensors \
+    xformers \
     matplotlib \
     scipy \
     pandas \
@@ -39,7 +42,10 @@ RUN mamba install \
     tqdm \
     -c conda-forge \
     -c pytorch \
-    -c nvidia -y
+    -c nvidia \
+    -c huggingface \
+    -c xformers \
+    -y
 
 # Create nonroot user, setup env
 RUN useradd -m -d /home/user -g root -G sudo -u 1000 user
