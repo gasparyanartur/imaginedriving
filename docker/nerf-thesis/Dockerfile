@@ -26,12 +26,11 @@ RUN mamba install \
     python=3.11 \
     pytorch=2.2.0 \
     torchvision \
-    pytorch-cuda=12.1 \
+    pytorch-cuda \
     transformers \
     accelerate \
     diffusers \
     safetensors \
-    xformers \
     matplotlib \
     scipy \
     pandas \
