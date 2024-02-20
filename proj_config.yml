@@ -2,7 +2,10 @@ project_name: ImagineDriving
 
 datasets: 
   pandaset: 
-    path: /proj/adas-data/data/pandaset
+    path: 
+      #/proj/adas-data/data/pandaset
+      #/proj/adas-data/data/pandaset
+      /home/s0001900/dev/datasets/pandaset
     scenes:         # 001, 002-010, 100, ..
       - "001"
       - "002-010"

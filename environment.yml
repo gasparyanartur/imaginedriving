@@ -20,5 +20,4 @@ dependencies:
   - jupyter
   - jupyterlab
   - nb_conda_kernels
-  - ipykernel
   - tqdm
