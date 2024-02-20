@@ -24,29 +24,7 @@ RUN cd /tmp && \
     bash Mambaforge-$(uname)-$(uname -m).sh -fp /opt/mambaforge -b && \
     rm Mambaforge*sh
 
-RUN mamba install \
-    python=3.11 \
-    pytorch=2.2.0 \
-    torchvision \
-    pytorch-cuda \
-    transformers \
-    accelerate \
-    diffusers \
-    safetensors \
-    matplotlib \
-    scipy \
-    pandas \
-    jupyter \
-    jupyterlab \
-    nb_conda_kernels \
-    ipykernel \
-    tqdm \
-    -c conda-forge \
-    -c pytorch \
-    -c nvidia \
-    -c huggingface \
-    -c xformers \
-    -y
+RUN mamba update -f environment.yml
 
 # Create nonroot user, setup env
 RUN useradd -m -d /home/user -g root -G sudo -u 1000 user
