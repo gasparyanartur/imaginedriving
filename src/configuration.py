@@ -92,11 +92,11 @@ def setup_project(config_path: Path = None):
     set_if_no_key(config, "proj_dir", Path.cwd())
     proj_dir = config["proj_dir"]
 
-    set_if_no_key(config, "cache_dir", proj_dir / "cache_dir")
+    set_if_no_key(config, "cache_dir", proj_dir / ".cache")
     cache_dir = config["cache_dir"]
 
-    set_env("HF_HOME", cache_dir / 'hf' / '.cache')              # Huggingface cache dir
-    set_env("MPLCONFIGDIR", cache_dir / 'mpl' / '.cache')        # Matplotlib cache dir
+    set_env("HF_HUB_CACHE", cache_dir / 'hf')         # Huggingface cache dir
+    set_env("MPLCONFIGDIR", cache_dir / 'mpl')        # Matplotlib cache dir
 
     for dataset in config["datasets"].values():
         dataset["path"] = Path(dataset["path"])
