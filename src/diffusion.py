@@ -27,26 +27,27 @@ sdxl_models = {
 }
 
 
-def init_sd_pipe(model_id: str, device: torch.device):
-    return StableDiffusionImg2ImgPipeline.from_pretrained(model_id, torch_dtype=torch.float16, variant="fp16").to(device)
-
-
-def init_sdxl_pipe(model_id: str, device: torch.device):
-    return StableDiffusionXLImg2ImgPipeline.from_pretrained(model_id, torch_dtype=torch.float16, variant="fp16").to(device)
-
-
 class ImageToImageDiffusionModel:
-    def __init__(self, model_id: str = ModelId.sdxl_ref_v1_0, device_name: str = None) -> None:
-        self.device = get_device() if device_name is None else torch.device(device_name)
+    def __init__(self, model_id: str = ModelId.sdxl_ref_v1_0, device_name: str = None, low_mem_mode: bool = False) -> None:
+        device = get_device() if device_name is None else torch.device(device_name)
         
         if model_id in sd_models:
-            self.pipe = init_sd_pipe(model_id, self.device)
+            pipe = StableDiffusionImg2ImgPipeline.from_pretrained(model_id, torch_dtype=torch.float16, variant="fp16")
 
         elif model_id in sdxl_models:
-            self.pipe = init_sdxl_pipe(model_id, self.device)
+            pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(model_id, torch_dtype=torch.float16, variant="fp16")
 
         else:
             raise NotImplementedError
+
+        if low_mem_mode:
+            pipe.enable_sequential_cpu_offload()
+
+        else:
+            pipe = pipe.to(device)
+        
+        self.pipe = pipe
+        self.device = device
 
     def forward(self, image: Image, prompt: str = "", strength: float=0.1, guidance_scale: float=0.0, num_steps: int = 50):
         img = self.pipe(
