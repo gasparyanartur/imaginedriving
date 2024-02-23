@@ -1,11 +1,9 @@
-from pathlib import Path
-import json
+import torch
 
 
-def sort_paths_numerically(paths: list[Path]) -> list[Path]:
-  return sorted(paths, key=lambda path: int(path.stem))
+def get_device():
+    try:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    except Exception:
+        return torch.device("cpu")
 
-
-def load_json(path):
-    with open(path, 'rb') as f:
-      return json.load(f)
