@@ -1,10 +1,13 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 
 from PIL import Image
 import torch
 from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionXLImg2ImgPipeline
 
 from src.utils import get_device
+from src.data import read_PIL_img, save_PIL_img
 
 
 @dataclass
@@ -54,3 +57,12 @@ class ImageToImageDiffusionModel:
             num_inference_steps=num_steps
         )
         return img.images[0]
+
+
+def diffuse_images_to_dir(model: ImageToImageDiffusionModel, img_paths: Iterable[Path], dst_dir: Path):
+    dst_dir.mkdir(exist_ok=True, parents=True)
+    for src_img_path in img_paths:
+        src_img = read_PIL_img(src_img_path)
+        dst_img = model.forward(src_img)
+
+        save_PIL_img(dst_dir / src_img_path.name, dst_img)
