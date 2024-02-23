@@ -9,6 +9,8 @@ dependencies:
   - python=3.11
   - pytorch=2.2.0
   - torchvision
+  - lightning
+  - torchmetrics
   - pytorch-cuda
   - transformers
   - accelerate
