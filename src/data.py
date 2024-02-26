@@ -9,7 +9,9 @@ import torchvision as tv
 
 base_img_pipeline = tvtf2.Compose([
     tvtf2.ToDtype(torch.float32, scale=True)
-])
+]
+
+)
 
 
 def sort_paths_numerically(paths: list[Path]) -> list[Path]:
@@ -28,11 +30,14 @@ def load_img_paths_from_dir(dir_path: Path):
 def read_image(img_path: Path, pipeline_type: str = "base") -> Tensor:
     img = tv.io.read_image(str(img_path))
 
+    
     if pipeline_type == "base":
         img = base_img_pipeline(img)
 
     else:
         raise NotImplementedError
+    
+    return img[None, ...]
 
 
 def save_image(save_path: Path, img: Tensor, jpg_quality: int = 100) -> None:
