@@ -24,7 +24,11 @@ RUN cd /tmp && \
     bash Mambaforge-$(uname)-$(uname -m).sh -fp /opt/mambaforge -b && \
     rm Mambaforge*sh
 
-RUN mamba update -f environment.yml
+COPY environment.yml .
+RUN mamba env update -f environment.yml 
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
 
 # Create nonroot user, setup env
 RUN useradd -m -d /home/user -g root -G sudo -u 1000 user
@@ -38,6 +42,9 @@ USER 1000
 WORKDIR /home/user
 # Add local user binary folder to Path variable
 ENV PATH="${PATH}:/home/user/.local/bin"
+
+RUN echo "source activate env-diffusion" > ~/.bashrc
+ENV PATH /opt/mambaforge/envs/env-diffusion/bin:$PATH
 SHELL ["/bin/bash", "-c"]
 
 WORKDIR /workspace
