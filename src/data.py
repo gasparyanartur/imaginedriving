@@ -39,7 +39,3 @@ def read_image(img_path: Path, pipeline_type: str = "base") -> Tensor:
 def save_image(save_path: Path, img: Tensor, jpg_quality: int = 100) -> None:
     torchvision.io.write_jpeg(img, str(save_path), quality=jpg_quality)
 
-
-def read_image_from_sample(data, sample_idx):
-    img_path = data["img_paths"][sample_idx]
-    return read_image(img_path)
