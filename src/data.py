@@ -37,7 +37,7 @@ def read_image(img_path: Path, pipeline_type: str = "base") -> Tensor:
     else:
         raise NotImplementedError
     
-    return img[None, ...]
+    return img
 
 
 def save_image(save_path: Path, img: Tensor, jpg_quality: int = 100) -> None:
