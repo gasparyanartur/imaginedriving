@@ -27,5 +27,15 @@ def benchmark_img_to_img(img_pred_path: pl.Path, img_gt_path: pl.Path, metric_na
     return metrics
 
 
-def benchmark_dir_to_dir(dir1_path: pl.Path, dir2: pl.Path, metric_names: Iterable[str]) -> dict[str, float]:
-    """"""
+def benchmark_dir_to_dir(dir1_path: pl.Path, dir2_path: pl.Path, metric_names: Iterable[str]) -> dict[str, float]:
+    dir1 = {}
+    dir2 = {}
+    for f in dir1_path.glob("*.jpg"):
+        dir1[f.stem] = f
+    print(dir1)
+
+    for f in dir2_path.glob("*.jpg"):
+        if f.stem in dir1:
+            dir2[f.stem] = benchmark_img_to_img(f, dir1[f.stem], metric_names)
+
+    return dir2
