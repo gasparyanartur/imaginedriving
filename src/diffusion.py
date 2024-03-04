@@ -89,7 +89,6 @@ class ImageToImageDiffusionModel:
             if len(image.shape) < 4:
                 image = image.expand(batch_size, *image.shape)
 
-        print(len(prompt), len(generator), len(image))
         img = self.pipe(
             image=image,
             prompt=prompt,
