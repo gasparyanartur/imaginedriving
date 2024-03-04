@@ -60,6 +60,10 @@ class ImageToImageDiffusionModel:
         self.device = device
         self.post_processing = post_processing
 
+    def __call__(self, **kwargs):
+        return self.forward(**kwargs)
+
+
     def forward(
         self,
         image: Tensor,
@@ -67,16 +71,36 @@ class ImageToImageDiffusionModel:
         strength: float = 0.1,
         guidance_scale: float = 0.0,
         num_steps: int = 50,
-    ):
+        generator: torch.Generator | Iterable[torch.Generator] = None,
+        seeds: Iterable[int] = None,
+    ) -> Tensor:
+        if generator is None:
+            if seeds is not None:
+                generator = [torch.Generator(self.device).manual_seed(s) for s in seeds]
+
+        batch_size = (len(generator) if generator else 1)
+        if batch_size > 1:
+            if isinstance(prompt, str):
+                prompt = [prompt] 
+            
+            if len(prompt) == 1:
+                prompt = prompt * batch_size
+
+            if len(image.shape) < 4:
+                image = image.expand(batch_size, *image.shape)
+
+        print(len(prompt), len(generator), len(image))
         img = self.pipe(
             image=image,
             prompt=prompt,
             strength=strength,
             guidance_scale=guidance_scale,
             num_inference_steps=num_steps,
-        ).images[0]
+            generator=generator,
+            batch_size=batch_size     
+        )
         img = self.post_processing(img)
-        return img
+        return torch.stack(img.images)
 
 
 def diffuse_images_to_dir(
