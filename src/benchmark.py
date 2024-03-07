@@ -1,8 +1,7 @@
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-
 import pathlib as pl
 from collections.abc import Iterable
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, FrechetInceptionDistance
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from src.data import read_image
 
@@ -10,6 +9,7 @@ metric_names_mapping = {
     "psnr": PeakSignalNoiseRatio(data_range=1.0),
     "ssim": StructuralSimilarityIndexMeasure(data_range=1.0),
     "lpips": LearnedPerceptualImagePatchSimilarity(net_type="squeeze"),
+    "fid": FrechetInceptionDistance(feature=64),
 }
 
 
@@ -24,7 +24,14 @@ def benchmark_img_to_img(
 
     for metric_name in metric_names:
         if metric_name in metric_names_mapping:
-            metrics[metric_name] = metric_names_mapping[metric_name](img_pred, img_gt)
+            if metric_name == "fid":
+                metric_names_mapping[metric_name].update(img_pred, real=False)
+                metric_names_mapping[metric_name].update(img_gt, real=True)
+                metrics[metric_name] = metric_names_mapping[metric_name].compute()
+
+            else:
+                metrics[metric_name] = metric_names_mapping[metric_name](
+                    img_pred, img_gt)
 
     return metrics
 
