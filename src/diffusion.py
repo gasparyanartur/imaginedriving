@@ -7,6 +7,9 @@ import torchvision.transforms.v2 as tvtf2
 from torch import Tensor
 
 from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionXLImg2ImgPipeline
+from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import retrieve_latents
+from diffusers.image_processor import VaeImageProcessor
+from diffusers import AutoencoderKL
 
 from src.utils import get_device
 from src.data import read_image, save_image
@@ -133,10 +136,21 @@ def diffuse_images_to_dir(
 
 
 
-def encode_img(vae, img):
+def encode_img(img_processor: VaeImageProcessor, vae: AutoencoderKL, img: Tensor, seed: int = 0) -> Tensor:
     upcast_vae(vae)     # Ensure float32 to avoid overflow
-    latents = vae.encode(img)
-    latents = 
+    img = img_processor.preprocess(img)
+    latents = vae.encode(img.to("cuda"))
+    latents = retrieve_latents(latents, generator=torch.manual_seed(seed)) 
+    latents = latents * vae.config.scaling_factor
+    latents = latents.to(next(iter(vae.post_quant_conv.parameters())).dtype)
+
+    return latents
+
+
+def decode_img(img_processor: VaeImageProcessor, vae: AutoencoderKL, latents: Tensor) -> Tensor:
+    img = vae.decode(latents / vae.config.scaling_factor, return_dict=False)[0]
+    img = img_processor.postprocess(img, output_type="pt")
+    return img
 
 
 def upcast_vae(vae):
