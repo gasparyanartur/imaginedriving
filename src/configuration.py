@@ -8,7 +8,7 @@ def set_env(key: str, val: any) -> None:
 def get_env(key: str) -> str | Path:
     val = os.environ.get(key)
 
-    if bool(val) and (val[0] == '/') and (val_path := Path(val)).exists():
+    if val and (val[0] == '/') and (val_path := Path(val)).exists():
         return val_path
 
     return val
@@ -17,6 +17,8 @@ def get_env(key: str) -> str | Path:
 def set_if_no_key(config, key, val):
     if not config.get(key):   
         config[key] = val
+
+    return val
 
 
 def iter_scene_names(start_name, end_name):
@@ -74,26 +76,23 @@ def iter_scene_names(start_name, end_name):
 
 
 def setup_project(config_path: Path = None):
-    if Path.cwd().stem == "notebooks":
-        os.chdir(Path.cwd().parent)
+    proj_dir = get_env("PROJ_DIR") or Path.cwd()
 
     if config_path is None:
         config_path = get_env("PROJ_CONF_PATH")
 
         if config_path is None:
-            config_path = Path.cwd() / "proj_config.yml"
-            print(config_path)
+            config_path = proj_dir / "proj_config.yml"
+
             if not config_path.exists():
                 raise ValueError(f"No config path specified")
 
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
-    set_if_no_key(config, "proj_dir", Path.cwd())
-    proj_dir = config["proj_dir"]
-
-    set_if_no_key(config, "cache_dir", proj_dir / ".cache")
-    cache_dir = config["cache_dir"]
+    proj_dir = set_if_no_key(config, "PROJ_DIR", proj_dir)
+    cache_dir = set_if_no_key(config, "CACHE_DIR", proj_dir / ".cache")
+    cache_dir = config["CACHE_DIR"]
 
     set_env("HF_HUB_CACHE", cache_dir / 'hf')         # Huggingface cache dir
     set_env("MPLCONFIGDIR", cache_dir / 'mpl')        # Matplotlib cache dir

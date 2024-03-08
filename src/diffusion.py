@@ -30,7 +30,7 @@ sdxl_models = {ModelId.sdxl_ref_v1_0, ModelId.sdxl_base_v1_0}
 class ImageToImageDiffusionModel:
     def __init__(
         self,
-        model_id: str = ModelId.sdxl_ref_v1_0,
+        model_id: str = ModelId.sdxl_base_v1_0,
         device_name: str = None,
         low_mem_mode: bool = False,
         disable_grad: bool = True,
@@ -85,7 +85,10 @@ class ImageToImageDiffusionModel:
                 generator = [torch.Generator(self.device).manual_seed(s) for s in seeds]
 
         batch_size = (len(generator) if generator else 1)
+
         if batch_size > 1:
+            single_img = True
+
             if isinstance(prompt, str):
                 prompt = [prompt] 
             
@@ -94,6 +97,9 @@ class ImageToImageDiffusionModel:
 
             if len(image.shape) < 4:
                 image = image.expand(batch_size, *image.shape)
+            
+        else:
+            single_img = False
 
         def forward_func(image):
             img = self.pipe(
@@ -121,6 +127,9 @@ class ImageToImageDiffusionModel:
         if detach_output:
             img = img.detach().cpu()
 
+        if len(img.shape) == 4 and img.size(0) == 1:
+            img = img[0]
+
         return img
 
 
@@ -131,9 +140,7 @@ def diffuse_images_to_dir(
     for src_img_path in img_paths:
         src_img = read_image(src_img_path)
         dst_img = model.forward(src_img)
-
         save_image(dst_dir / src_img_path.name, dst_img)
-
 
 
 def encode_img(img_processor: VaeImageProcessor, vae: AutoencoderKL, img: Tensor, seed: int = 0) -> Tensor:
