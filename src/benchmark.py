@@ -1,6 +1,8 @@
 import pathlib as pl
 from collections.abc import Iterable
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, FrechetInceptionDistance
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchmetrics.image.fid import FrechetInceptionDistance
+
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from src.data import read_image
