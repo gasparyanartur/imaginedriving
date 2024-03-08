@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 import torch
 from torch import Tensor
 import matplotlib.pyplot as plt
@@ -11,6 +12,14 @@ def get_device():
 
 
 def show_img(img: Tensor, ax=None):
+    if isinstance(img, list):
+        for i in range(len(img)):
+            img[i] = img[i].squeeze()
+
+        img = torch.stack(img)
+
+    img = img.detach().cpu()
+
     batch_size = len(img.shape)
     if batch_size == 4:
         fig, axes = plt.subplots(img.size(0), 1, figsize=(16, 4 * batch_size))
@@ -25,6 +34,10 @@ def show_img(img: Tensor, ax=None):
 
     else:
         assert False
+
+    if not isinstance(axes, Iterable):
+        axes = [axes]
+
 
     if img.shape[-1] != 3:
         img = img.permute(0, 2, 3, 1)
