@@ -11,7 +11,6 @@ dependencies:
   - torchvision
   - lightning
   - torchmetrics
-  - torch-fidelity
   - pytorch-cuda
   - transformers
   - accelerate

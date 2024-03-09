@@ -8,8 +8,6 @@ ENV TZ=Europe/Berlin
 ## CUDA Home, required to find CUDA in some packages.
 ENV CUDA_HOME="/usr/local/cuda"
 ENV PATH=/opt/mambaforge/bin:$PATH
-#ENV HF_HOME=/proj/nlp4adas/users/x_artga/nerf-thesis/.cache
-#ENV MPLCONFIGDIR=/proj/nlp4adas/users/x_artga/nerf-thesis/.cache
 ENV HF_HOME=/proj/nlp4adas/master-thesis-shared/nerf-thesis/.cache
 ENV MPLCONFIGDIR=/proj/nlp4adas/master-thesis-shared/nerf-thesis/.cache
 
