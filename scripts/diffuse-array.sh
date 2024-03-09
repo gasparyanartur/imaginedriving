@@ -9,15 +9,19 @@
 #SBATCH --job-name=ours
 #
 
-# crash if no argument is given
-name=${1:?"No name given"}
 
-export WANDB_RUN_GROUP=$name
-export WANDB_ENTITY=arturruiqi
-export WANDB_PROJECT=master-thesis
+if [ -z ${SOURCE_DIR} ]; then
+    echo "SOURCE_DIR variable is empty. Exiting." ;
+    exit 1;
+fi
 
-method=${METHOD:-neurad}
-dataset=${DATASET:-pandaset}
+if [ -z ${SOURCE_DIR} ]; then
+    echo "SOURCE_DIR variable is empty. Exiting." ;
+    exit 1;
+fi
+
+
+
 # Specify the path to the config file
 id_to_seq=scripts/arrays/${dataset}_id_to_seq${SUFFIX}.txt
 
