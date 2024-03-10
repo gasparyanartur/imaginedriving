@@ -4,7 +4,7 @@ import json
 import torch
 from torch import Tensor
 from torchvision.transforms import v2 as tvtf2
-import torchvision 
+import torchvision
 
 
 base_img_pipeline = tvtf2.Compose([tvtf2.ToDtype(torch.float32, scale=True)])
@@ -39,3 +39,12 @@ def read_image(img_path: Path, pipeline_type: str = "base") -> Tensor:
 def save_image(save_path: Path, img: Tensor, jpg_quality: int = 100) -> None:
     torchvision.io.write_jpeg(img, str(save_path), quality=jpg_quality)
 
+
+def load_img_if_path(img: str | Path | Tensor) -> Tensor:
+    if isinstance(img, str):
+        img = Path(img)
+
+    if isinstance(img, Path):
+        img = read_image(img)
+
+    return img

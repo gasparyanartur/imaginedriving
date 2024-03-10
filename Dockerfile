@@ -8,8 +8,8 @@ ENV TZ=Europe/Berlin
 ## CUDA Home, required to find CUDA in some packages.
 ENV CUDA_HOME="/usr/local/cuda"
 ENV PATH=/opt/mambaforge/bin:$PATH
-ENV HF_HOME=/proj/nlp4adas/users/x_artga/nerf-thesis/.cache
-ENV MPLCONFIGDIR=/proj/nlp4adas/users/x_artga/nerf-thesis/.cache
+ENV HF_HOME=/proj/nlp4adas/master-thesis-shared/nerf-thesis/.cache
+ENV MPLCONFIGDIR=/proj/nlp4adas/master-thesis-shared/nerf-thesis/.cache
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -42,6 +42,7 @@ ENV PATH="${PATH}:/home/user/.local/bin"
 
 RUN echo "source activate env-diffusion" > ~/.bashrc
 ENV PATH /opt/mambaforge/envs/env-diffusion/bin:$PATH
+
 SHELL ["/bin/bash", "-c"]
 
 WORKDIR /workspace
