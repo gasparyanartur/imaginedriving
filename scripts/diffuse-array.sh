@@ -15,8 +15,8 @@ if [ -z ${SOURCE_DIR} ]; then
     exit 1;
 fi
 
-if [ -z ${SOURCE_DIR} ]; then
-    echo "SOURCE_DIR variable is empty. Exiting." ;
+if [ -z ${DEST_DIR} ]; then
+    echo "DEST_DIR variable is empty. Exiting." ;
     exit 1;
 fi
 

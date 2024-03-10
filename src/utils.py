@@ -48,3 +48,9 @@ def show_img(img: Tensor, save_path: Path = None):
 
     if save_path:
         fig.savefig(str(save_path))
+
+def batch_img_if_single(img: Tensor) -> Tensor:
+    if len(img) == 3:
+        img = img[None, ...]
+
+    return img
