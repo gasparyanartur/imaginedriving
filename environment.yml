@@ -5,6 +5,7 @@ channels:
   - nvidia 
   - huggingface 
   - xformers 
+  - anaconda
 dependencies:
   - python=3.11
   - pytorch=2.2.0
@@ -23,3 +24,8 @@ dependencies:
   - jupyterlab
   - nb_conda_kernels
   - tqdm
+  - pyyaml
+  - pip
+  - pip:
+    - torchmetrics[image]
+    - torch-fidelity
