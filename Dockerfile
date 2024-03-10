@@ -27,9 +27,6 @@ RUN cd /tmp && \
 COPY environment.yml .
 RUN mamba env update -f environment.yml 
 
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
 # Create nonroot user, setup env
 RUN useradd -m -d /home/user -g root -G sudo -u 1000 user
 RUN usermod -aG sudo user
