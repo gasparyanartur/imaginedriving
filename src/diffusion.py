@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -6,7 +7,7 @@ import torch
 import torchvision.transforms.v2 as tvtf2
 from torch import Tensor
 
-from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionXLImg2ImgPipeline
+from diffusers import StableDiffusionXLImg2ImgPipeline
 
 from src.utils import get_device
 from src.data import read_image, save_image
@@ -14,73 +15,97 @@ from src.data import read_image, save_image
 
 @dataclass
 class ModelId:
-    sd_v2_1 = "stabilityai/stable-diffusion-2-1"
-    sd_v1_5 = "runwayml/stable-diffusion-v1-5"
-    sdxl_ref_v1_0 = "stabilityai/stable-diffusion-xl-refiner-1.0"
+    sdxl_base = "stabilityai/stable-diffusion-xl-base-1.0"
+    sdxl_refiner = "stabilityai/stable-diffusion-xl-refiner-1.0"
 
 
-sd_models = {ModelId.sd_v1_5, ModelId.sd_v2_1}
-
-sdxl_models = {ModelId.sdxl_ref_v1_0}
-
-
-class ImageToImageDiffusionModel:
+class BaseImg2ImgModel(ABC):
     def __init__(
-        self,
-        model_id: str = ModelId.sdxl_ref_v1_0,
-        device_name: str = None,
-        low_mem_mode: bool = False,
-        post_processing=None,
+        self, device_name: str = None, post_processing=None, prompt=""
     ) -> None:
         device = get_device() if device_name is None else torch.device(device_name)
-
-        if model_id in sd_models:
-            pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-                model_id, torch_dtype=torch.float16, variant="fp16"
-            )
-
-        elif model_id in sdxl_models:
-            pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                model_id, torch_dtype=torch.float16, variant="fp16"
-            )
-
-        else:
-            raise NotImplementedError
-
-        if low_mem_mode:
-            pipe.enable_sequential_cpu_offload()
-
-        else:
-            pipe = pipe.to(device)
 
         if post_processing is None:
             post_processing = tvtf2.Compose([tvtf2.PILToTensor()])
 
-        self.pipe = pipe
         self.device = device
         self.post_processing = post_processing
+        self.prompt = prompt
 
     def forward(
         self,
         image: Tensor,
-        prompt: str = "",
-        strength: float = 0.1,
-        guidance_scale: float = 0.0,
-        num_steps: int = 50,
     ):
-        img = self.pipe(
-            image=image,
-            prompt=prompt,
-            strength=strength,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_steps,
-        ).images[0]
+        img = torch.stack(self._forward(image=image))
         img = self.post_processing(img)
         return img
 
+    @abstractmethod
+    def _forward(self, image: Tensor):
+        raise NotImplementedError
+
+
+class SDXLFull(BaseImg2ImgModel):
+    def __init__(
+        self,
+        n_steps: int = 50,
+        refiner_threshold: float = 0.7,
+        strength_base: float = 0.2,
+        strength_refiner: float = 0.2,
+        base_model_id: str = ModelId.sdxl_base,
+        refiner_model_id=ModelId.sdxl_refiner,
+        device_name: str = None,
+        post_processing=None,
+        prompt="",
+        **model_kwargs,
+    ) -> None:
+        super().__init__(device_name, post_processing, prompt)
+
+        self.base_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            base_model_id,
+            torch_dtype=torch.float16,
+            variant="fp16",
+            use_safetensors=True,
+        ).to(self.device)
+
+        self.refiner_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            refiner_model_id,
+            text_encoder_2=self.base_pipe.text_encoder_2,
+            vae=self.base_pipe.vae,
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+            variant="fp16",
+        ).to(self.device)
+
+        self.n_steps = n_steps
+        self.refiner_threshold = refiner_threshold
+        self.strength_base = strength_base
+        self.strength_refiner = strength_refiner
+        self.model_kwargs = model_kwargs
+
+    def _forward(self, image: Tensor):
+        image = self.base_pipe(
+            prompt=self.prompt,
+            image=image,
+            num_inference_steps=self.n_steps,
+            denoising_end=self.refiner_threshold,
+            strength=self.strength_base,
+            output_type="latent",
+        ).images
+
+        image = self.refiner_pipe(
+            prompt=self.prompt,
+            image=image,
+            num_inference_steps=self.n_steps,
+            denoising_start=self.refiner_threshold,
+            strength = self.strength_refiner
+        ).images
+
+        return image
+
 
 def diffuse_images_to_dir(
-    model: ImageToImageDiffusionModel, img_paths: Iterable[Path], dst_dir: Path
+    model: BaseImg2ImgModel, img_paths: Iterable[Path], dst_dir: Path
 ):
     dst_dir.mkdir(exist_ok=True, parents=True)
     for src_img_path in img_paths:
