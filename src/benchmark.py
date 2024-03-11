@@ -111,7 +111,7 @@ class Metrics:
 
 
 def save_metrics(metrics, save_path: Path, print_results: bool = False):
-    df = pd.DataFrame.from_dict(metrics)
+    df = pd.DataFrame.from_dict(metrics, orient="index")
     df.to_csv(save_path)
 
     if print_results:
