@@ -29,3 +29,6 @@ dependencies:
   - pip:
     - torchmetrics[image]
     - torch-fidelity
+    - gardio
+    - open_clip_torch
+    - clip-interrogator
