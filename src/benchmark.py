@@ -14,34 +14,6 @@ from src.data import NamedImageDataset
 from src.utils import batch_img_if_single
 
 
-def benchmark_fids(fid_metric, pred: Tensor, gt: Tensor) -> Tensor:
-    fid_metric.reset()
-    fid_metric.update(pred, real=False)
-    fid_metric.update(gt, real=True)
-    fid = fid_metric.compute()
-    return fid
-
-
-fid_metric = FrechetInceptionDistance(feature=64, normalize=True)
-
-psnr_metric = PeakSignalNoiseRatio(data_range=(0, 1))
-ssim_metric = StructuralSimilarityIndexMeasure(data_range=(0, 1))
-lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="squeeze", normalize=True)
-
-single_metrics = {
-    "psnr": psnr_metric.__call__,
-    "ssim": ssim_metric.__call__,
-    "lpips": lpips_metric.__call__,
-}
-
-batch_metrics = {
-    "fid": lambda preds, gts: benchmark_fids(fid_metric, preds, gts),
-    "psnr": psnr_metric.__call__,
-    "ssim": ssim_metric.__call__,
-    "lpips": lpips_metric.__call__,
-}
-
-
 def get_mean_aggregate(
     single_function,
     preds: NamedImageDataset | Iterable[Tensor] | Tensor,

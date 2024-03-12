@@ -102,9 +102,6 @@ class NamedImageDataset:
 
             imgs = MemoryImageDataset({name: img for name, img in zip(names, imgs)})
 
-        else:
-            print("NOT LIST")
-
         self.names = list(names)
         self.imgs = imgs
 
