@@ -3,6 +3,7 @@ from collections.abc import Iterable
 import matplotlib.pyplot as plt
 import torch
 from torch import Tensor
+import numpy as np
 
 
 def get_device():
@@ -49,8 +50,32 @@ def show_img(img: Tensor, save_path: Path = None):
     if save_path:
         fig.savefig(str(save_path))
 
-def batch_img_if_single(img: Tensor) -> Tensor:
-    if len(img) == 3:
-        img = img[None, ...]
 
-    return img
+def batch_if_not_iterable(item: any, single_dim: int = 3) -> Iterable[any]:
+    if isinstance(item, (torch.Tensor, np.ndarray)):
+        if len(item) == single_dim:
+            item = item[None, ...]
+
+        return item
+
+    if not isinstance(item, Iterable):
+        return [item]
+
+    return item
+
+
+def validate_same_len(*iters) -> None:
+    prev_iter_len = None
+    for iterator in iters:
+        iter_len = len(iterator)
+
+        if (prev_iter_len is not None) and (iter_len != prev_iter_len):
+            raise ValueError(f"Expected same length on iterators, but received {[len(i) for i in iters]}")
+        
+        prev_iter_len = iter_len
+
+
+def combine_kwargs(kwargs, extra_kwargs):
+    extra_kwargs = extra_kwargs or {} 
+    kwargs = dict(kwargs, **extra_kwargs)
+    return kwargs
