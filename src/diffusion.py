@@ -1,3 +1,4 @@
+from typing import Any
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -19,39 +20,26 @@ from src.utils import (
     get_device,
     validate_same_len,
     batch_if_not_iterable,
-    combine_kwargs
+    combine_kwargs,
 )
 from src.data import read_image, save_image
 
 
 def pipeline_output_to_tensor(imgs: Iterable[PIL.Image.Image]) -> Tensor:
-    return torch.stack([tvtf2.functional.pil_to_tensor(img) for img in imgs])
+    return torch.stack([tvtf2.functional.pil_to_tensor(img) for img in imgs]) / 255.0
 
 
 @dataclass
 class ModelId:
     sdxl_base = "stabilityai/stable-diffusion-xl-base-1.0"
     sdxl_refiner = "stabilityai/stable-diffusion-xl-refiner-1.0"
+    sdxl_turbo = "stabilityai/sdxl-turbo"
 
 
 class ImgToImgModel(ABC):
     @abstractmethod
-    def img_to_img(self, img: Tensor, *args, **kwargs) -> dict[str, any]:
+    def img_to_img(self, img: Tensor, *args, **kwargs) -> dict[str, Any]:
         raise NotImplementedError
-
-
-class SDXLBase(ImgToImgModel):
-    def __init__(
-        self, model_id: str = ModelId.sdxl_base, device: torch.device = get_device()
-    ) -> None:
-        super().__init__()
-
-        self.base_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-            model_id,
-            torch_dtype=torch.float16,
-            variant="fp16",
-            use_safetensors=True,
-        ).to(device)
 
 
 class SDXLBase(ImgToImgModel):
@@ -65,13 +53,43 @@ class SDXLBase(ImgToImgModel):
     ) -> None:
         super().__init__()
 
-        #self.pipe: StableDiffusionXLImg2ImgPipeline = StableDiffusionXLImg2ImgPipeline.from_pretrained(model_id, )
+        self.pipe: StableDiffusionXLImg2ImgPipeline = (
+            StableDiffusionXLImg2ImgPipeline.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16,
+                variant="fp16",
+                use_safetensors=True,
+            ).to(device)
+        )
+
+        self.kwargs = {
+            "num_inference_steps": n_steps,
+            "prompt": prompt,
+            "strength": strength,
+        }
+
+    def img_to_img(
+        self,
+        img: Tensor,
+        gen: torch.Generator | Iterable[torch.Generator] = None,
+        extra_kwargs: dict[str, Any] = None,
+    ) -> dict[str, Any]:
+        kwargs = combine_kwargs(self.kwargs, extra_kwargs)
+        img = batch_if_not_iterable(img)
+        gen = batch_if_not_iterable(gen)
+        validate_same_len(img, gen)
+
+        img = self.pipe(image=img, generator=gen, **kwargs).images
+        img = pipeline_output_to_tensor(img)
+
+        return {"image": img}
+
 
 class SDXLFull(ImgToImgModel):
     def __init__(
         self,
         n_steps: int = 50,
-        mixture_threshold: float = 0.7,
+        mixture_threshold: float = 0.8,
         base_strength: float = 0.2,
         base_prompt: str = "",
         base_model_id: str = ModelId.sdxl_base,
@@ -132,11 +150,13 @@ class SDXLFull(ImgToImgModel):
         refiner_gen = batch_if_not_iterable(refiner_gen)
         validate_same_len(img, base_gen, refiner_gen)
 
-        img = self.base_pipe(image=img, output_type="latent", **base_kwargs).images
-        img = self.refiner_pipe(image=img, **refiner_kwargs).images
+        img = self.base_pipe(image=img, output_type="latent", generator=base_gen, **base_kwargs).images
+        img = self.refiner_pipe(image=img, generator=refiner_gen, **refiner_kwargs).images
         img = pipeline_output_to_tensor(img)
 
-        return {"imgs": img}
+        return {
+            "image": img,
+        }
 
 
 def diffuse_images_to_dir(

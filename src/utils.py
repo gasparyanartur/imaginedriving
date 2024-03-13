@@ -52,6 +52,9 @@ def show_img(img: Tensor, save_path: Path = None):
 
 
 def batch_if_not_iterable(item: any, single_dim: int = 3) -> Iterable[any]:
+    if item is None:
+        return item
+
     if isinstance(item, (torch.Tensor, np.ndarray)):
         if len(item) == single_dim:
             item = item[None, ...]
@@ -67,6 +70,9 @@ def batch_if_not_iterable(item: any, single_dim: int = 3) -> Iterable[any]:
 def validate_same_len(*iters) -> None:
     prev_iter_len = None
     for iterator in iters:
+        if iterator is None:
+            continue
+
         iter_len = len(iterator)
 
         if (prev_iter_len is not None) and (iter_len != prev_iter_len):
