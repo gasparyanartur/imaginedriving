@@ -22,7 +22,7 @@ from src.utils import (
     batch_if_not_iterable,
     combine_kwargs,
 )
-from src.data import read_image, save_image
+from src.data import read_image, save_image, NamedImageDataset
 
 
 def pipeline_output_to_tensor(imgs: Iterable[PIL.Image.Image]) -> Tensor:
@@ -160,10 +160,10 @@ class SDXLFull(ImgToImgModel):
 
 
 def diffuse_images_to_dir(
-    model: ImgToImgModel, img_paths: Iterable[Path], dst_dir: Path
+    model: ImgToImgModel, dataset: NamedImageDataset, dst_dir: Path
 ):
     dst_dir.mkdir(exist_ok=True, parents=True)
-    for src_img_path in img_paths:
+    for name, img in dataset:
         src_img = read_image(src_img_path)
         dst_img = model.img_to_img(src_img)
         save_image(dst_dir / src_img_path.name, dst_img)

@@ -1,4 +1,3 @@
-from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from pathlib import Path
 import json
@@ -105,23 +104,6 @@ class NamedImageDataset:
         self.names = list(names)
         self.imgs = imgs
 
-    @classmethod
-    def from_directory(
-        cls, dir_path: Path, in_memory: bool = False
-    ) -> "NamedImageDataset":
-        paths = load_img_paths_from_dir(dir_path)
-        names = [path.stem for path in paths]
-
-        if in_memory:
-            imgs = MemoryImageDataset(
-                {name: read_image(path) for name, path in zip(names, paths)}
-            )
-
-        else:
-            imgs = LazyImageDataset({name: path for name, path in zip(names, paths)})
-
-        return NamedImageDataset(names, imgs)
-
     def __len__(self) -> int:
         return len(self.imgs)
 
@@ -144,3 +126,31 @@ class NamedImageDataset:
     def get_matching(self, other: "NamedImageDataset"):
         for name in self.get_matching_names(other):
             yield name, (self[name], other[name])
+
+
+
+class DirectoryDataset(NamedImageDataset):
+    def __init__(self, dir_path: Path, names: Iterable[str], imgs: Dataset | list[Tensor], name: str = None):
+        super().__init__(names, imgs)
+        self.dir_path = dir_path
+        self.name = name
+
+    @classmethod
+    def from_directory(
+        cls, dir_path: Path, in_memory: bool = False, name: str = None
+    ) -> "NamedImageDataset":
+        if name is None:
+            name = dir_path.stem
+
+        paths = load_img_paths_from_dir(dir_path)
+        names = [path.stem for path in paths]
+
+        if in_memory:
+            imgs = MemoryImageDataset(
+                {name: read_image(path) for name, path in zip(names, paths)}
+            )
+
+        else:
+            imgs = LazyImageDataset({name: path for name, path in zip(names, paths)})
+
+        return DirectoryDataset(dir_path, names, imgs, name)

@@ -11,7 +11,7 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from src.data import NamedImageDataset
-from src.utils import batch_img_if_single
+from src.utils import batch_if_not_iterable
 
 
 def get_mean_aggregate(
@@ -91,8 +91,8 @@ class DefaultMetricWrapper(SingleMetric, AggregateMetric):
 
     def execute_single(self, pred: Tensor, gt: Tensor) -> float:
         if self.require_batch:
-            pred = batch_img_if_single(pred)
-            gt = batch_img_if_single(gt)
+            pred = batch_if_not_iterable(pred)
+            gt = batch_if_not_iterable(gt)
 
         return self.model(pred, gt)
 
@@ -145,11 +145,11 @@ class FIDMetric(AggregateMetric):
         self.model.reset()
 
         for _, gt in gts:
-            gt = batch_img_if_single(gt).double()
+            gt = batch_if_not_iterable(gt).double()
             self.model.update(gt, real=True)
 
         for _, pred in preds:
-            pred = batch_img_if_single(pred).double()
+            pred = batch_if_not_iterable(pred).double()
             self.model.update(pred, real=False)
 
         return self.model.compute().item()
