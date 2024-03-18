@@ -9,5 +9,5 @@ datasets:
       - "001"
       - "002-010"
 
-proj_dir: null      # null: $(cwd)
-cache_dir: null     # null: $(proj_dir)/.cache
+PROJ_DIR: null      # null: $(cwd)
+CACHE_DIR: null     # null: $(PROJ_DIR)/.cache

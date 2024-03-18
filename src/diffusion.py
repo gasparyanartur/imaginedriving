@@ -124,14 +124,14 @@ class SDXLFull(ImgToImgModel):
             "num_inference_steps": n_steps,
             "prompt": base_prompt,
             "strength": base_strength,
-            "denoising_end": mixture_threshold,
+            #"denoising_end": mixture_threshold,
         }
 
         self.refiner_kwargs = {
             "num_inference_steps": n_steps,
             "prompt": refiner_prompt or base_prompt,
             "strength": refiner_strength,
-            "denoising_start": mixture_threshold,
+            #"denoising_start": mixture_threshold,
         }
 
     def img_to_img(
