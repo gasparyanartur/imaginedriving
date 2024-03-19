@@ -1,13 +1,4 @@
 project_name: ImagineDriving
 
-datasets: 
-  pandaset: 
-    path: 
-      /proj/adas-data/data/pandaset
-      #/home/s0001900/dev/datasets/pandaset
-    scenes:         # 001, 002-010, 100, ..
-      - "001"
-      - "002-010"
-
 PROJ_DIR: null      # null: $(cwd)
 CACHE_DIR: null     # null: $(PROJ_DIR)/.cache

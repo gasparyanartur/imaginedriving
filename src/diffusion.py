@@ -25,6 +25,10 @@ from src.utils import (
 from src.data import read_image, save_image, NamedImageDataset
 
 
+default_prompt = "video recording of dashcam in urban driving scene, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed picture, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
+default_negative_prompt = "face, human features, unrealistic, artifacts, blurry, noisy image, NeRF, oil-painting, art, drawing, poor geometry, oversaturated, undersaturated"
+
+
 def pipeline_output_to_tensor(imgs: Iterable[PIL.Image.Image]) -> Tensor:
     return torch.stack([tvtf2.functional.pil_to_tensor(img) for img in imgs]) / 255.0
 
@@ -42,63 +46,16 @@ class ImgToImgModel(ABC):
         raise NotImplementedError
 
 
-class SDXLBase(ImgToImgModel):
-    def __init__(
-        self,
-        n_steps: int = 50,
-        strength: float = 0.2,
-        prompt: str = "",
-        model_id=ModelId.sdxl_base,
-        device: torch.device = get_device(),
-    ) -> None:
-        super().__init__()
-
-        self.pipe: StableDiffusionXLImg2ImgPipeline = (
-            StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                model_id,
-                torch_dtype=torch.float16,
-                variant="fp16",
-                use_safetensors=True,
-            ).to(device)
-        )
-
-        self.kwargs = {
-            "num_inference_steps": n_steps,
-            "prompt": prompt,
-            "strength": strength,
-        }
-
-    def img_to_img(
-        self,
-        img: Tensor,
-        gen: torch.Generator | Iterable[torch.Generator] = None,
-        extra_kwargs: dict[str, Any] = None,
-    ) -> dict[str, Any]:
-        kwargs = combine_kwargs(self.kwargs, extra_kwargs)
-        img = batch_if_not_iterable(img)
-        gen = batch_if_not_iterable(gen)
-        validate_same_len(img, gen)
-
-        img = self.pipe(image=img, generator=gen, **kwargs).images
-        img = pipeline_output_to_tensor(img)
-
-        return {"image": img}
-
-
 class SDXLFull(ImgToImgModel):
     def __init__(
         self,
-        n_steps: int = 50,
-        mixture_threshold: float = 0.8,
-        base_strength: float = 0.2,
-        base_prompt: str = "",
         base_model_id: str = ModelId.sdxl_base,
-        refiner_strength: float = 0.2,
-        refiner_prompt: str = None,
-        refiner_model_id=ModelId.sdxl_refiner,
+        refiner_model_id: str | None = ModelId.sdxl_refiner,
         device: torch.device = get_device(),
     ) -> None:
         super().__init__()
+
+        self.use_refiner = refiner_model_id is not None
 
         self.base_pipe: StableDiffusionXLImg2ImgPipeline = (
             StableDiffusionXLImg2ImgPipeline.from_pretrained(
@@ -120,53 +77,67 @@ class SDXLFull(ImgToImgModel):
             ).to(device)
         )
 
-        self.base_kwargs = {
-            "num_inference_steps": n_steps,
-            "prompt": base_prompt,
-            "strength": base_strength,
-            #"denoising_end": mixture_threshold,
-        }
-
-        self.refiner_kwargs = {
-            "num_inference_steps": n_steps,
-            "prompt": refiner_prompt or base_prompt,
-            "strength": refiner_strength,
-            #"denoising_start": mixture_threshold,
-        }
-
     def img_to_img(
         self,
         img: Tensor,
+        base_strength: float = 0.2,
+        refiner_strength: float = 0.2,
+        base_denoising_start: int = 0.0,
+        base_denoising_end: int = 1.0,
+        refiner_denoising_start: int = 0.0,
+        refiner_denoising_end: int = 1.0,
+        original_size: tuple[int, int] = (1024, 1024),
+        target_size: tuple[int, int] = (1024, 1024),
+        prompt: str = default_prompt,
+        negative_prompt: str = default_negative_prompt,
+        use_refiner: bool = True,
+        base_num_steps: int = 50,
+        refiner_num_steps: int = 50,
         base_gen: torch.Generator | Iterable[torch.Generator] = None,
         refiner_gen: torch.Generator | Iterable[torch.Generator] = None,
-        base_extra_kwargs: dict[str, any] = None,
-        refiner_extra_kwargs: dict[str, any] = None,
+        base_kwargs: dict[str, any] = None,
+        refiner_kwargs: dict[str, any] = None,
     ):
-        base_kwargs = combine_kwargs(self.base_kwargs, base_extra_kwargs)
-        refiner_kwargs = combine_kwargs(self.refiner_kwargs, refiner_extra_kwargs)
-
         img = batch_if_not_iterable(img)
         base_gen = batch_if_not_iterable(base_gen)
         refiner_gen = batch_if_not_iterable(refiner_gen)
         validate_same_len(img, base_gen, refiner_gen)
 
-        img = self.base_pipe(image=img, output_type="latent", generator=base_gen, **base_kwargs).images
-        img = self.refiner_pipe(image=img, generator=refiner_gen, **refiner_kwargs).images
+        base_kwargs = base_kwargs or {}
+        img = self.base_pipe(
+            image=img,
+            generator=base_gen,
+            output_type="latent" if use_refiner else "pil",
+            strength=base_strength,
+            denoising_start=base_denoising_start,
+            denoising_end=base_denoising_end,
+            num_inference_steps=base_num_steps,
+            original_size=original_size,
+            target_size=target_size,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            **base_kwargs
+        ).images
+
+        if self.use_refiner:
+            refiner_kwargs = refiner_kwargs or {}
+            img = self.refiner_pipe(
+                image=img,
+                generator=refiner_gen,
+                strength=refiner_strength,
+                denoising_start=refiner_denoising_start,
+                denoising_end=refiner_denoising_end,
+                num_inference_steps=refiner_num_steps,
+                original_size=original_size,
+                target_size=target_size,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                **refiner_kwargs
+            ).images
+
         img = pipeline_output_to_tensor(img)
 
-        return {
-            "image": img,
-        }
-
-
-def diffuse_images_to_dir(
-    model: ImgToImgModel, dataset: NamedImageDataset, dst_dir: Path
-):
-    dst_dir.mkdir(exist_ok=True, parents=True)
-    for name, img in dataset:
-        src_img = read_image(src_img_path)
-        dst_img = model.img_to_img(src_img)
-        save_image(dst_dir / src_img_path.name, dst_img)
+        return {"image": img}
 
 
 def encode_img(
