@@ -1,14 +1,47 @@
 experiments:
-  base_strength:
-    variables:
-      base_strength: 
-        - 0.0
-        - 0.2
-        - 0.4
-        - 0.6
-        - 0.8
-        - 1.0
+  base_strength_0.10:
+    model_config_params:
+      model_name: sdxlbase
+      base_model_id: "stabilityai/stable-diffusion-xl-base-1.0"
 
-    configs: 
-      use_refiner: False
+    model_forward_params: 
+      base_strength: 0.1
+      base_num_steps: 50
+
+  base_strength_0.20:
+    model_config_params:
+      model_name: sdxlbase
+      base_model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+
+    model_forward_params: 
+      base_strength: 0.2
+      base_num_steps: 50
+
+  base_strength_0.30:
+    model_config_params:
+      model_name: sdxlbase
+      base_model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+
+    model_forward_params: 
+      base_strength: 0.3
+      base_num_steps: 50
+
+
+  base_strength_0.40:
+    model_config_params:
+      model_name: sdxlbase
+      base_model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+
+    model_forward_params: 
+      base_strength: 0.4
+      base_num_steps: 50
+
+
+  base_strength_0.50:
+    model_config_params:
+      model_name: sdxlbase
+      base_model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+
+    model_forward_params: 
+      base_strength: 0.5
       base_num_steps: 50

@@ -1,3 +1,4 @@
+from typing import Any
 from pathlib import Path
 import os
 import yaml
@@ -80,6 +81,10 @@ def iter_scene_names(start_name, end_name):
 def read_yaml(path: Path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
+
+def save_yaml(path: Path, data: dict[str, Any]):
+    with open(path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False)
 
 
 def read_dataset(config):

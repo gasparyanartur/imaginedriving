@@ -11,6 +11,10 @@ import torchvision
 
 base_img_pipeline = tvtf2.Compose([tvtf2.ToDtype(torch.float32, scale=True)])
 
+def img_float_to_img(img: Tensor):
+    img = img * 255
+    img = img.to(device=img.device, dtype=torch.uint8)
+    return img
 
 def sort_paths_numerically(paths: list[Path]) -> list[Path]:
     return sorted(paths, key=lambda path: int(path.stem))
@@ -39,6 +43,12 @@ def read_image(img_path: Path, pipeline_type: str = "base") -> Tensor:
 
 
 def save_image(save_path: Path, img: Tensor, jpg_quality: int = 100) -> None:
+    img = img.detach().cpu()
+    img = img.squeeze()
+
+    if torch.is_floating_point(img):
+        img = img_float_to_img(img)
+
     torchvision.io.write_jpeg(img, str(save_path), quality=jpg_quality)
 
 

@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+import logging
 
 import PIL
 import torch
@@ -20,17 +21,12 @@ from src.utils import (
     get_device,
     validate_same_len,
     batch_if_not_iterable,
-    combine_kwargs,
 )
 from src.data import read_image, save_image, NamedImageDataset
 
 
-default_prompt = "video recording of dashcam in urban driving scene, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed picture, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
+default_prompt = "dashcam recording, urban driving scene, video, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed picture, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
 default_negative_prompt = "face, human features, unrealistic, artifacts, blurry, noisy image, NeRF, oil-painting, art, drawing, poor geometry, oversaturated, undersaturated"
-
-
-def pipeline_output_to_tensor(imgs: Iterable[PIL.Image.Image]) -> Tensor:
-    return torch.stack([tvtf2.functional.pil_to_tensor(img) for img in imgs]) / 255.0
 
 
 @dataclass
@@ -41,6 +37,8 @@ class ModelId:
 
 
 class ImgToImgModel(ABC):
+    load_model = None
+
     @abstractmethod
     def img_to_img(self, img: Tensor, *args, **kwargs) -> dict[str, Any]:
         raise NotImplementedError
@@ -57,40 +55,35 @@ class SDXLFull(ImgToImgModel):
 
         self.use_refiner = refiner_model_id is not None
 
-        self.base_pipe: StableDiffusionXLImg2ImgPipeline = (
-            StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                base_model_id,
-                torch_dtype=torch.float16,
-                variant="fp16",
-                use_safetensors=True,
-            ).to(device)
-        )
+        self.base_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            base_model_id,
+            torch_dtype=torch.float16,
+            variant="fp16",
+            use_safetensors=True,
+        ).to(device)
 
-        self.refiner_pipe: StableDiffusionXLImg2ImgPipeline = (
-            StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                refiner_model_id,
-                text_encoder_2=self.base_pipe.text_encoder_2,
-                vae=self.base_pipe.vae,
-                torch_dtype=torch.float16,
-                use_safetensors=True,
-                variant="fp16",
-            ).to(device)
-        )
+        self.refiner_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            refiner_model_id,
+            text_encoder_2=self.base_pipe.text_encoder_2,
+            vae=self.base_pipe.vae,
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+            variant="fp16",
+        ).to(device) if self.use_refiner else None
 
     def img_to_img(
         self,
         img: Tensor,
         base_strength: float = 0.2,
         refiner_strength: float = 0.2,
-        base_denoising_start: int = 0.0,
-        base_denoising_end: int = 1.0,
-        refiner_denoising_start: int = 0.0,
-        refiner_denoising_end: int = 1.0,
+        base_denoising_start: int = None,
+        base_denoising_end: int = None,
+        refiner_denoising_start: int = None,
+        refiner_denoising_end: int = None,
         original_size: tuple[int, int] = (1024, 1024),
         target_size: tuple[int, int] = (1024, 1024),
         prompt: str = default_prompt,
         negative_prompt: str = default_negative_prompt,
-        use_refiner: bool = True,
         base_num_steps: int = 50,
         refiner_num_steps: int = 50,
         base_gen: torch.Generator | Iterable[torch.Generator] = None,
@@ -107,7 +100,7 @@ class SDXLFull(ImgToImgModel):
         img = self.base_pipe(
             image=img,
             generator=base_gen,
-            output_type="latent" if use_refiner else "pil",
+            output_type="latent" if self.use_refiner else "pt",
             strength=base_strength,
             denoising_start=base_denoising_start,
             denoising_end=base_denoising_end,
@@ -124,6 +117,7 @@ class SDXLFull(ImgToImgModel):
             img = self.refiner_pipe(
                 image=img,
                 generator=refiner_gen,
+                output_type="pt",
                 strength=refiner_strength,
                 denoising_start=refiner_denoising_start,
                 denoising_end=refiner_denoising_end,
@@ -134,8 +128,6 @@ class SDXLFull(ImgToImgModel):
                 negative_prompt=negative_prompt,
                 **refiner_kwargs
             ).images
-
-        img = pipeline_output_to_tensor(img)
 
         return {"image": img}
 
@@ -169,3 +161,25 @@ def upcast_vae(vae):
     vae.decoder.mid_block.to(dtype)
 
     return vae
+
+
+def load_img2img_model(model_configs: dict[str, Any] = None) -> ImgToImgModel:
+    logging.info(f"Loading diffusion model...")
+
+    model_configs = model_configs or {}
+
+    match model_configs.get("model_name"):
+        case "sdxlbase" | None:
+            base_model_id = model_configs.get("base_model_id") or ModelId.sdxl_base
+            refiner_model_id = None
+
+            model = SDXLFull(base_model_id, refiner_model_id)
+        
+        case _:
+            raise NotImplementedError
+
+    logging.info(f"Finished loading diffusion model")
+    return model
+
+
+ImgToImgModel.load_model = load_img2img_model
