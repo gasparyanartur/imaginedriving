@@ -11,7 +11,7 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from src.data import NamedImageDataset
-from src.utils import batch_if_not_iterable
+from src.utils import batch_if_not_iterable, get_device
 
 
 def get_mean_aggregate(
@@ -84,9 +84,9 @@ class AggregateMetric(Metric, ABC):
 
 
 class DefaultMetricWrapper(SingleMetric, AggregateMetric):
-    def __init__(self, name, model, require_batch: bool = True) -> None:
+    def __init__(self, name, model, device, require_batch: bool = True) -> None:
         super().__init__(name)
-        self.model = model
+        self.model = model.to(device)
         self.require_batch: bool = require_batch
 
     def execute_single(self, pred: Tensor, gt: Tensor) -> float:
@@ -108,36 +108,46 @@ class DefaultMetricWrapper(SingleMetric, AggregateMetric):
 
 
 class PSNRMetric(DefaultMetricWrapper):
-    def __init__(self, name="psnr", data_range=(0, 1), **kwargs) -> None:
-        super().__init__(name, PeakSignalNoiseRatio(data_range=data_range, **kwargs))
+    def __init__(self, name="psnr", data_range=(0, 1), device=get_device(), **kwargs) -> None:
+        super().__init__(name, PeakSignalNoiseRatio(data_range=data_range), device=device, **kwargs)
 
 
 class SSIMMetric(DefaultMetricWrapper):
-    def __init__(self, name="ssim", data_range=(0, 1), **kwargs) -> None:
+    def __init__(self, name="ssim", data_range=(0, 1), device=get_device(), **kwargs) -> None:
         super().__init__(
             name,
-            model=StructuralSimilarityIndexMeasure(data_range=data_range, **kwargs),
-        )
+            model=StructuralSimilarityIndexMeasure(data_range=data_range),
+            device=device,
+            **kwargs
+        ),
 
 
 class LPIPSMetric(DefaultMetricWrapper):
     def __init__(
-        self, name="lpips", net_type: str = "squeeze", normalize=True, **kwargs
+        self, name="lpips", net_type: str = "squeeze", normalize=True, device=get_device(), **kwargs
     ) -> None:
         super().__init__(
             name,
             LearnedPerceptualImagePatchSimilarity(
                 net_type=net_type, normalize=normalize, **kwargs
             ),
+            device=device
         )
 
 
-class FIDMetric(AggregateMetric):
-    def __init__(self, name="fid", feature=64, normalize=True, **kwargs) -> None:
+class FIDMetric(SingleMetric, AggregateMetric):
+    def __init__(self, name: str = "fid", feature: int = 64, normalize: bool = True, device=get_device(), **kwargs) -> None:
         super().__init__(name)
         self.model = FrechetInceptionDistance(
             feature=feature, normalize=normalize, **kwargs
-        ).set_dtype(torch.float64)
+        ).set_dtype(torch.float64).to(device)
+
+    def execute_single(self, pred: Tensor, gt: Tensor) -> float:
+        if self.require_batch:
+            pred = batch_if_not_iterable(pred)
+            gt = batch_if_not_iterable(gt)
+
+        return self.model(pred, gt)
 
     def execute_aggregate(
         self, preds: NamedImageDataset, gts: NamedImageDataset

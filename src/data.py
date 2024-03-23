@@ -98,7 +98,7 @@ class LazyImageDataset(Dataset):
         return img
 
 
-class NamedImageDataset:
+class NamedImageDataset(Dataset):
     def __init__(self, names: Iterable[str], imgs: Dataset | list[Tensor]):
         if not isinstance(imgs, Dataset):
             if isinstance(imgs, Tensor) and not len(imgs.shape) == 4:

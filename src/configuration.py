@@ -1,7 +1,10 @@
 from typing import Any
 from pathlib import Path
 import os
+import logging
 import yaml
+
+import torch
 
 
 def set_env(key: str, val: any) -> None:
@@ -105,6 +108,12 @@ def read_dataset(config):
 
 
 def setup_project(config_path: Path = None):
+    logging.getLogger().setLevel(logging.INFO)
+
+    if not torch.cuda.is_available():
+        logging.warning(f"CUDA not detected. Running on CPU. The code is not supported for CPU and will most likely give incorrect results. Proceed with caution.")
+
+
     proj_dir = get_env("PROJ_DIR") or Path.cwd()
 
     if config_path is None:

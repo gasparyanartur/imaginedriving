@@ -25,8 +25,8 @@ from src.utils import (
 from src.data import read_image, save_image, NamedImageDataset
 
 
-default_prompt = "dashcam recording, urban driving scene, video, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed picture, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
-default_negative_prompt = "face, human features, unrealistic, artifacts, blurry, noisy image, NeRF, oil-painting, art, drawing, poor geometry, oversaturated, undersaturated"
+default_prompt = "dashcam recording, urban driving scene, video, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
+default_negative_prompt = "face, human features, unrealistic, artifacts, blurry, noisy image, NeRF, oil-painting, art, drawing, poor geometry, oversaturated, undersaturated, distorted, bad image, bad photo"
 
 
 @dataclass
@@ -43,6 +43,13 @@ class ImgToImgModel(ABC):
     def img_to_img(self, img: Tensor, *args, **kwargs) -> dict[str, Any]:
         raise NotImplementedError
 
+    def src_dataset_to_dir(self, src_dataset: NamedImageDataset, dst_dir: Path, **kwargs) -> None:
+        dst_dir.mkdir(exist_ok=True, parents=True)
+
+        for name, img in src_dataset:
+            diff_img = self.img_to_img(img, **kwargs)["image"]
+            diff_img_name = (dst_dir / name).with_suffix(".jpg")
+            save_image(diff_img_name, diff_img)
 
 class SDXLFull(ImgToImgModel):
     def __init__(
@@ -130,6 +137,7 @@ class SDXLFull(ImgToImgModel):
             ).images
 
         return {"image": img}
+
 
 
 def encode_img(
