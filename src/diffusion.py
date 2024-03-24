@@ -1,5 +1,5 @@
 from typing import Any
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, abstractproperty
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +52,14 @@ class ImgToImgModel(ABC):
             diff_img = self.img_to_img(img, **kwargs)["image"]
             diff_img_name = (dst_dir / name).with_suffix(".jpg")
             save_image(diff_img_name, diff_img)
+
+    @abstractproperty
+    def vae(self):
+        raise NotImplementedError
+
+    @abstractproperty
+    def image_processor(self):
+        raise NotImplementedError
         
 class SDXLFull(ImgToImgModel):
     def __init__(
@@ -140,6 +148,13 @@ class SDXLFull(ImgToImgModel):
 
         return {"image": img}
 
+    @property
+    def vae(self):
+        return self.base_pipe.vae
+
+    @property
+    def image_processor(self):
+        return self.base_pipe.image_processor
 
 
 def encode_img(
