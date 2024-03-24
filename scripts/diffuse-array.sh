@@ -20,8 +20,6 @@ if [ -z ${DEST_DIR} ]; then
     exit 1;
 fi
 
-
-
 # Specify the path to the config file
 id_to_seq=scripts/arrays/${dataset}_id_to_seq${SUFFIX}.txt
 

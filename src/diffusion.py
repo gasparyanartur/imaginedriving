@@ -22,7 +22,9 @@ from src.utils import (
     validate_same_len,
     batch_if_not_iterable,
 )
-from src.data import read_image, save_image, NamedImageDataset
+from src.data import read_image, save_image, NamedImageDataset, DirectoryDataset
+from src.benchmark import benchmark_single_metrics, benchmark_aggregate_metrics
+from src.configuration import save_yaml
 
 
 default_prompt = "dashcam recording, urban driving scene, video, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
@@ -43,7 +45,7 @@ class ImgToImgModel(ABC):
     def img_to_img(self, img: Tensor, *args, **kwargs) -> dict[str, Any]:
         raise NotImplementedError
 
-    def src_dataset_to_dir(self, src_dataset: NamedImageDataset, dst_dir: Path, **kwargs) -> None:
+    def diffuse_to_dir(self, src_dataset: NamedImageDataset, dst_dir: Path, **kwargs) -> None:
         dst_dir.mkdir(exist_ok=True, parents=True)
 
         for name, img in src_dataset:
@@ -171,14 +173,12 @@ def upcast_vae(vae):
     return vae
 
 
-def load_img2img_model(model_configs: dict[str, Any] = None) -> ImgToImgModel:
+def load_img2img_model(**kwargs: dict[str, Any]) -> ImgToImgModel:
     logging.info(f"Loading diffusion model...")
 
-    model_configs = model_configs or {}
-
-    match model_configs.get("model_name"):
+    match kwargs.get("model_name"):
         case "sdxlbase" | None:
-            base_model_id = model_configs.get("base_model_id") or ModelId.sdxl_base
+            base_model_id = kwargs.get("base_model_id") or ModelId.sdxl_base
             refiner_model_id = None
 
             model = SDXLFull(base_model_id, refiner_model_id)
@@ -191,3 +191,18 @@ def load_img2img_model(model_configs: dict[str, Any] = None) -> ImgToImgModel:
 
 
 ImgToImgModel.load_model = load_img2img_model
+
+
+def diffusion_from_config_to_dir(src_dataset: NamedImageDataset, dst_dir: Path, model_config: dict[str, Any], device=get_device(), model: ImgToImgModel = None):
+    if model is None:
+        model = load_img2img_model(**model_config["model_config_params"])
+
+    dst_dir.mkdir(exist_ok=True, parents=True)
+    model.diffuse_to_dir(src_dataset, dst_dir, **model_config["model_forward_params"])
+
+    dst_dataset = DirectoryDataset.from_directory(dst_dir, device=device)
+    benchmark_single_metrics(dst_dataset, src_dataset).to_csv(dst_dir / "single-metrics.csv")
+    benchmark_aggregate_metrics(dst_dataset, src_dataset).to_csv(dst_dir / "aggregate-metrics.csv")
+    save_yaml(dst_dir / "config.yml", model_config)
+
+    logging.info(f"Finished diffusion.")
