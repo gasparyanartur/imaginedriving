@@ -50,7 +50,7 @@ class ImgToImgModel(ABC):
             diff_img = self.img_to_img(img, **kwargs)["image"]
             diff_img_name = (dst_dir / name).with_suffix(".jpg")
             save_image(diff_img_name, diff_img)
-
+        
 class SDXLFull(ImgToImgModel):
     def __init__(
         self,

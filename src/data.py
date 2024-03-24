@@ -11,10 +11,12 @@ import torchvision
 
 base_img_pipeline = tvtf2.Compose([tvtf2.ToDtype(torch.float32, scale=True)])
 
+
 def img_float_to_img(img: Tensor):
     img = img * 255
     img = img.to(device=img.device, dtype=torch.uint8)
     return img
+
 
 def sort_paths_numerically(paths: list[Path]) -> list[Path]:
     return sorted(paths, key=lambda path: int(path.stem))
@@ -63,10 +65,11 @@ def load_img_if_path(img: str | Path | Tensor) -> Tensor:
 
 
 class MemoryImageDataset(Dataset):
-    def __init__(self, imgs: dict[str, Tensor]) -> None:
+    def __init__(self, imgs: dict[str, Tensor], device=None) -> None:
         super().__init__()
         self.imgs = imgs
         self.names = list(imgs.keys())
+        self.device = device
 
     def __len__(self):
         return len(self.names)
@@ -76,14 +79,18 @@ class MemoryImageDataset(Dataset):
             key = self.names[key]
 
         img = self.imgs[key]
+        if self.device:
+            img = img.to(self.device)
+
         return img
 
 
 class LazyImageDataset(Dataset):
-    def __init__(self, paths: dict[str, Path]) -> None:
+    def __init__(self, paths: dict[str, Path], device=None) -> None:
         super().__init__()
         self.paths = paths
         self.names = list(paths.keys())
+        self.device = device
 
     def __len__(self):
         return len(self.names)
@@ -94,12 +101,14 @@ class LazyImageDataset(Dataset):
 
         path = self.paths[key]
         img = read_image(path)
+        if self.device:
+            img = img.to(self.device)
 
         return img
 
 
 class NamedImageDataset(Dataset):
-    def __init__(self, names: Iterable[str], imgs: Dataset | list[Tensor]):
+    def __init__(self, names: Iterable[str], imgs: Dataset | list[Tensor], device=None):
         if not isinstance(imgs, Dataset):
             if isinstance(imgs, Tensor) and not len(imgs.shape) == 4:
                 raise ValueError(f"Need to have a batch, received {len(imgs.shape)}")
@@ -113,6 +122,7 @@ class NamedImageDataset(Dataset):
 
         self.names = list(names)
         self.imgs = imgs
+        self.device = device
 
     def __len__(self) -> int:
         return len(self.imgs)
@@ -138,16 +148,22 @@ class NamedImageDataset(Dataset):
             yield name, (self[name], other[name])
 
 
-
 class DirectoryDataset(NamedImageDataset):
-    def __init__(self, dir_path: Path, names: Iterable[str], imgs: Dataset | list[Tensor], name: str = None):
-        super().__init__(names, imgs)
+    def __init__(
+        self,
+        dir_path: Path,
+        names: Iterable[str],
+        imgs: Dataset | list[Tensor],
+        name: str = None,
+        device=None,
+    ):
+        super().__init__(names=names, imgs=imgs, device=device)
         self.dir_path = dir_path
         self.name = name
 
     @classmethod
     def from_directory(
-        cls, dir_path: Path, in_memory: bool = False, name: str = None
+        cls, dir_path: Path, in_memory: bool = False, name: str = None, device=None
     ) -> "NamedImageDataset":
         if name is None:
             name = dir_path.stem
@@ -157,10 +173,15 @@ class DirectoryDataset(NamedImageDataset):
 
         if in_memory:
             imgs = MemoryImageDataset(
-                {name: read_image(path) for name, path in zip(names, paths)}
+                imgs={name: read_image(path) for name, path in zip(names, paths)},
+                device=device,
             )
 
         else:
-            imgs = LazyImageDataset({name: path for name, path in zip(names, paths)})
+            imgs = LazyImageDataset(
+                paths={name: path for name, path in zip(names, paths)}, device=device
+            )
 
-        return DirectoryDataset(dir_path, names, imgs, name)
+        return DirectoryDataset(
+            dir_path=dir_path, names=names, imgs=imgs, name=name, device=device
+        )

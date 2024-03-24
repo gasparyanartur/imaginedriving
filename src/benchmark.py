@@ -20,7 +20,7 @@ def get_mean_aggregate(
     gts: NamedImageDataset | Iterable[Tensor] | Tensor,
     mean_value: bool = True,
 ) -> torch.Tensor:
-    running_value = torch.zeros(1, dtype=torch.float32)
+    running_value = torch.zeros(1, dtype=torch.float32, device=preds.device)
     count = 0
 
     if isinstance(preds, NamedImageDataset) or isinstance(gts, NamedImageDataset):
@@ -108,61 +108,73 @@ class DefaultMetricWrapper(SingleMetric, AggregateMetric):
 
 
 class PSNRMetric(DefaultMetricWrapper):
-    def __init__(self, name="psnr", data_range=(0, 1), device=get_device(), **kwargs) -> None:
-        super().__init__(name, PeakSignalNoiseRatio(data_range=data_range), device=device, **kwargs)
+    def __init__(
+        self, name="psnr", data_range=(0, 1), device=get_device(), **kwargs
+    ) -> None:
+        super().__init__(
+            name, PeakSignalNoiseRatio(data_range=data_range), device=device, **kwargs
+        )
 
 
 class SSIMMetric(DefaultMetricWrapper):
-    def __init__(self, name="ssim", data_range=(0, 1), device=get_device(), **kwargs) -> None:
+    def __init__(
+        self, name="ssim", data_range=(0, 1), device=get_device(), **kwargs
+    ) -> None:
         super().__init__(
             name,
             model=StructuralSimilarityIndexMeasure(data_range=data_range),
             device=device,
-            **kwargs
+            **kwargs,
         ),
 
 
 class LPIPSMetric(DefaultMetricWrapper):
     def __init__(
-        self, name="lpips", net_type: str = "squeeze", normalize=True, device=get_device(), **kwargs
+        self,
+        name="lpips",
+        net_type: str = "squeeze",
+        normalize=True,
+        device=get_device(),
+        **kwargs,
     ) -> None:
         super().__init__(
             name,
             LearnedPerceptualImagePatchSimilarity(
                 net_type=net_type, normalize=normalize, **kwargs
             ),
-            device=device
+            device=device,
         )
 
 
-class FIDMetric(SingleMetric, AggregateMetric):
-    def __init__(self, name: str = "fid", feature: int = 64, normalize: bool = True, device=get_device(), **kwargs) -> None:
+class FIDMetric(AggregateMetric):
+    def __init__(
+        self,
+        name: str = "fid",
+        feature: int = 64,
+        normalize: bool = True,
+        device=get_device(),
+        **kwargs,
+    ) -> None:
         super().__init__(name)
-        self.model = FrechetInceptionDistance(
-            feature=feature, normalize=normalize, **kwargs
-        ).set_dtype(torch.float64).to(device)
+        self.model = FrechetInceptionDistance(feature=feature, normalize=normalize, **kwargs).set_dtype(torch.float64).to(device)
 
-    def execute_single(self, pred: Tensor, gt: Tensor) -> float:
-        if self.require_batch:
-            pred = batch_if_not_iterable(pred)
-            gt = batch_if_not_iterable(gt)
-
-        return self.model(pred, gt)
-
-    def execute_aggregate(
-        self, preds: NamedImageDataset, gts: NamedImageDataset
-    ) -> pd.DataFrame:
+    def get_fid(self, preds: Iterable[Tensor], gts: Iterable[Tensor]) -> float:
         self.model.reset()
 
-        for _, gt in gts:
+        for gt in gts:
             gt = batch_if_not_iterable(gt).double()
             self.model.update(gt, real=True)
 
-        for _, pred in preds:
+        for pred in preds:
             pred = batch_if_not_iterable(pred).double()
             self.model.update(pred, real=False)
 
         return self.model.compute().item()
+    
+    def execute_aggregate(
+        self, preds: NamedImageDataset, gts: NamedImageDataset
+    ) -> pd.DataFrame:
+        return self.get_fid((pred for _, pred in preds), (gt for _, gt in gts))
 
 
 default_aggregate_metrics = (PSNRMetric(), SSIMMetric(), LPIPSMetric(), FIDMetric())
