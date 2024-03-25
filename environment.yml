@@ -27,6 +27,7 @@ dependencies:
   - pyyaml
   - pip
   - pip:
+    - peft
     - torchmetrics[image]
     - torch-fidelity
     - clip-interrogator
