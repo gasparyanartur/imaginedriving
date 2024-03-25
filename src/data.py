@@ -12,6 +12,8 @@ import torchvision
 base_img_pipeline = tvtf2.Compose([tvtf2.ToDtype(torch.float32, scale=True)])
 
 
+
+
 def img_float_to_img(img: Tensor):
     img = img * 255
     img = img.to(device=img.device, dtype=torch.uint8)
@@ -32,14 +34,9 @@ def load_img_paths_from_dir(dir_path: Path):
     return img_paths
 
 
-def read_image(img_path: Path, pipeline_type: str = "base") -> Tensor:
+def read_image(img_path: Path, tf_pipeline: tvtf2.Compose = base_img_pipeline) -> Tensor:
     img = torchvision.io.read_image(str(img_path))
-
-    if pipeline_type == "base":
-        img = base_img_pipeline(img)
-
-    else:
-        raise NotImplementedError
+    img = tf_pipeline(img)
 
     return img
 
@@ -185,3 +182,28 @@ class DirectoryDataset(NamedImageDataset):
         return DirectoryDataset(
             dir_path=dir_path, names=names, imgs=imgs, name=name, device=device
         )
+
+
+
+class PandasetDataset(Dataset):
+    def __init__(self, dataset_path: Path, scenes: Iterable[str], text_embedding: Tensor, scene_to_img_dir: str = "camera/front_camera", preprocessing="train") -> None:
+        super().__init__()
+
+        self.text_embedding = text_embedding
+        img_paths = []
+
+        for scene in scenes:
+            img_dir_path = dataset_path / scene / scene_to_img_dir
+            img_paths.extend(load_img_paths_from_dir(img_dir_path))
+
+        self.img_paths = img_paths
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        img = read_image(self.img_paths[idx])
+        return {
+            "pixel_values": img,
+            "text-embedding": self.text_embedding
+        }

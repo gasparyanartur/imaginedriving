@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+import torch
 
 from src.diffusion import load_img2img_model, encode_img, decode_img
 from src.configuration import setup_project
@@ -23,7 +24,9 @@ if __name__ == "__main__":
     img_processor = model.image_processor
 
     img_start = read_image(img_path=args.img_path)
-    img = encode_img(img_processor, vae, img_start)
-    img_out = decode_img(img_processor, vae, img)
+
+    with torch.no_grad():
+        img = encode_img(img_processor, vae, img_start)
+        img_out = decode_img(img_processor, vae, img)
 
     show_img(img=(img_start, img_out), save_path=output_path)

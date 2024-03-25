@@ -108,6 +108,12 @@ class SDXLFull(ImgToImgModel):
         base_kwargs: dict[str, any] = None,
         refiner_kwargs: dict[str, any] = None,
     ):
+        print(f"VAE CONFIG")
+        print(self.vae.config)
+        print()
+        print(f"IMAGE PROCESSOR CONFIG")
+        print(self.image_processor.config)
+
         img = batch_if_not_iterable(img)
         base_gen = batch_if_not_iterable(base_gen)
         refiner_gen = batch_if_not_iterable(refiner_gen)
@@ -149,23 +155,32 @@ class SDXLFull(ImgToImgModel):
         return {"image": img}
 
     @property
-    def vae(self):
+    def vae(self) -> AutoencoderKL:
         return self.base_pipe.vae
 
     @property
-    def image_processor(self):
+    def image_processor(self) -> VaeImageProcessor:
         return self.base_pipe.image_processor
 
 
 def encode_img(
     img_processor: VaeImageProcessor, vae: AutoencoderKL, img: Tensor, seed: int = 0
 ) -> Tensor:
-    upcast_vae(vae)  # Ensure float32 to avoid overflow
     img = img_processor.preprocess(img)
+
+    needs_upcasting = vae.dtype == torch.float16 and vae.config.force_upcast
+    if needs_upcasting:
+        original_vae_dtype = vae.dtype
+        upcast_vae(vae)  # Ensure float32 to avoid overflow
+        img = img.float()
+
     latents = vae.encode(img.to("cuda"))
+
+    if needs_upcasting:
+        vae.to(original_vae_dtype)
+
     latents = retrieve_latents(latents, generator=torch.manual_seed(seed))
     latents = latents * vae.config.scaling_factor
-    latents = latents.to(next(iter(vae.post_quant_conv.parameters())).dtype)
 
     return latents
 
@@ -173,7 +188,17 @@ def encode_img(
 def decode_img(
     img_processor: VaeImageProcessor, vae: AutoencoderKL, latents: Tensor
 ) -> Tensor:
+    needs_upcasting = vae.dtype == torch.float16 and vae.config.force_upcast
+    if needs_upcasting:
+        original_vae_dtype = vae.dtype
+        upcast_vae(vae)
+        latents = latents.to(next(iter(vae.post_quant_conv.parameters())).dtype)
+
     img = vae.decode(latents / vae.config.scaling_factor, return_dict=False)[0]
+
+    if needs_upcasting:
+        vae.to(original_vae_dtype)
+
     img = img_processor.postprocess(img, output_type="pt")
     return img
 
@@ -209,11 +234,19 @@ ImgToImgModel.load_model = load_img2img_model
 
 
 def diffusion_from_config_to_dir(src_dataset: NamedImageDataset, dst_dir: Path, model_config: dict[str, Any], device=get_device(), model: ImgToImgModel = None):
+    if model_config is not None:
+        model_config_params = model_config["model_config_params"] 
+        model_forward_params = model_config["model_forward_params"]
+    else:
+        model_config_params = {}
+        model_forward_params = {}
+
+
     if model is None:
-        model = load_img2img_model(**model_config["model_config_params"])
+        model = load_img2img_model(**model_config_params)
 
     dst_dir.mkdir(exist_ok=True, parents=True)
-    model.diffuse_to_dir(src_dataset, dst_dir, **model_config["model_forward_params"])
+    model.diffuse_to_dir(src_dataset, dst_dir, **model_forward_params)
 
     dst_dataset = DirectoryDataset.from_directory(dst_dir, device=device)
     benchmark_single_metrics(dst_dataset, src_dataset).to_csv(dst_dir / "single-metrics.csv")
