@@ -13,8 +13,9 @@ if __name__ == "__main__":
     parser = ArgumentParser("diffusion")
 
     parser.add_argument("src_dir", type=Path)
+    parser.add_argument("gt_dir", type=path)
     parser.add_argument("experiment_config_path", type=Path)
-    parser.add_argument("-d", "--base_experiment_dir", type=Path, default=None)
+    parser.add_argument("base_experiment_dir", type=Path)
     parser.add_argument("-s", "--show_img", action="store_true")
 
     args = parser.parse_args()
@@ -23,9 +24,6 @@ if __name__ == "__main__":
     experiment_config_path = args.experiment_config_path
     base_experiment_dir = args.base_experiment_dir
     flag_show_img = args.show_img
-
-    if base_experiment_dir is None and flag_show_img is False:
-        raise ValueError(f"Need to either show image or store result")
 
     setup_project()
 
@@ -36,20 +34,14 @@ if __name__ == "__main__":
         raise ValueError(f"Could not find experiment_config_path: {experiment_config_path}")
 
     config = read_yaml(experiment_config_path) 
-
-
     src_ds = DirectoryDataset.from_directory(src_dir)
 
     logging.info("Running experiments...")
-
     prev_model_config_params = None
     model: ImgToImgModel = None
-
-    if base_experiment_dir:
-        base_experiment_dir.mkdir(exist_ok=True, parents=True)
+    base_experiment_dir.mkdir(exist_ok=True, parents=True)
 
     device = get_device()
-
     img_name = img_path.stem
     img = read_image(img_path)
     img = img.to(device)
@@ -65,24 +57,16 @@ if __name__ == "__main__":
         model_forward_params = experiment["model_forward_params"]
         diffused_img = model.img_to_img(img, **model_forward_params)["image"]
 
-        gt_ds = NamedImageDataset([img_name], [img])        
-        pred_ds = NamedImageDataset([img_name], [diffused_img])        
-        
-        metrics = benchmark_single_metrics(pred_ds, gt_ds)
-
         if flag_show_img:
             show_img((img, diffused_img))
-            logging.info(str(metrics))
 
-        if base_experiment_dir:
-            experiment_dir = base_experiment_dir / exp_name
-            experiment_dir.mkdir(exist_ok=True)
-            diff_img_path = (experiment_dir / img_name).with_suffix(".jpg")
+        experiment_dir = base_experiment_dir / exp_name
+        experiment_dir.mkdir(exist_ok=True)
+        diff_img_path = (experiment_dir / img_name).with_suffix(".jpg")
 
-            logging.info(f"Saving experiment to {experiment_dir}")
-            save_yaml(experiment_dir / "config.yml", experiment)
-            save_image(diff_img_path, diffused_img)
-            metrics.to_csv(experiment_dir / "single-metrics.csv")
+        logging.info(f"Saving experiment to {experiment_dir}")
+        save_yaml(experiment_dir / "config.yml", experiment)
+        save_image(diff_img_path, diffused_img)
 
         logging.info(f"Finished running experiment")
 

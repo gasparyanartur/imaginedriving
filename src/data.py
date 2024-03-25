@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from pathlib import Path
 import json
@@ -10,8 +11,6 @@ import torchvision
 
 
 base_img_pipeline = tvtf2.Compose([tvtf2.ToDtype(torch.float32, scale=True)])
-
-
 
 
 def img_float_to_img(img: Tensor):
@@ -59,6 +58,57 @@ def load_img_if_path(img: str | Path | Tensor) -> Tensor:
         img = read_image(img)
 
     return img
+
+
+def iter_numeric_names(start_name: str | int, end_name: str | int, fixed_len: int = 2):
+    start_name = int(start_name)
+    end_name = int(end_name)
+
+    for i in range(start_name, end_name+1):
+        num = str(i)
+        if fixed_len:
+            num = num.rjust(fixed_len, "0")
+        
+        yield num
+
+
+def expand_data_tree(data_tree, scene_name_len: int = 2, sample_name_len: int = 2):
+    dataset_dict = {}
+    for dataset_name, dataset in data_tree.items():
+        scene_dict = {}
+        for scene_name, scene in dataset.items():
+            if isinstance(scene, str):
+                assert scene == "*"
+                sample_list = None
+                
+            else:
+                sample_list = []
+                for sample in scene:
+                    sample = str(sample)
+                    sample = sample.replace(" ", "")
+                    if sample.isdigit():
+                        sample = sample.rjust(sample_name_len, "0")
+                        sample_list.append(sample)
+                    else:
+                        assert "-" in sample
+                        sample_from, sample_to = sample.split("-")
+                        assert sample_from.isdigit() and sample_to.isdigit()
+                        sample_list.extend(iter_numeric_names(sample_from, sample_to, fixed_len=sample_name_len))
+
+            scene_name = str(scene_name)
+            if scene_name.isdigit():
+                scene_name = scene_name.rjust(scene_name_len, "0")
+                scene_dict[scene_name] = sample_list
+            else:
+                assert "-" in scene_name
+                scene_from, scene_to = scene_name.split("-")
+                assert scene_from.isdigit() and scene_to.isdigit()
+
+                for new_scene_name in iter_numeric_names(scene_from, scene_to, fixed_len=scene_name_len):
+                    scene_dict[new_scene_name] = sample_list
+
+        dataset_dict[dataset_name] = scene_dict
+    return dataset_dict
 
 
 class MemoryImageDataset(Dataset):
@@ -186,7 +236,7 @@ class DirectoryDataset(NamedImageDataset):
 
 
 class PandasetDataset(Dataset):
-    def __init__(self, dataset_path: Path, scenes: Iterable[str], text_embedding: Tensor, scene_to_img_dir: str = "camera/front_camera", preprocessing="train") -> None:
+    def __init__(self, dataset_path: Path, scenes: Iterable[str], text_embedding: Tensor, scene_to_img_dir: str = "camera/front_camera", preprocessing=base_img_pipeline) -> None:
         super().__init__()
 
         self.text_embedding = text_embedding
@@ -207,3 +257,50 @@ class PandasetDataset(Dataset):
             "pixel_values": img,
             "text-embedding": self.text_embedding
         }
+
+
+class PathBuilder(ABC):
+    @abstactmethod
+    def get_sample_path(self, dataset_path: Path, dataset: str, scene: str, sample: str) -> Path:
+        raise NotImplementedError
+
+    @abstractmethod
+    def iterate_samples_in_scene(self, dataset_path: Path, dataset: str, scene: str) -> Generator[Path]:
+        raise NotImplementedError
+
+    def paths_from_tree(self, dataset_path: Path, expanded_tree: dict[str, any]) -> list[Path]:
+        samples = []
+        for dataset_name, dataset_dict in tree.items():
+            for scene_name, sample_list in dataset_dict.items():
+                if sample_list is None:
+                    samples.extend(self.iterate_samples_in_scene(dataset_path, dataset_name, scene_name))
+                    continue
+
+                for sample_name in sample_list:
+                    samples.append(self.get_sample_path(dataset_name, scene_name, sample_name))
+        return samples
+
+class PandasetImagePathBuilder(PathBuilder):
+    def __init__(self, camera: str = "front"):
+        ...
+
+
+    def get_sample_path(self, dataset_path: Path, dataset: str, scene: str, sample: str) -> Path:
+        return 
+
+
+class DynamicDataset(Dataset):
+    # Dataset / Scene / Sample
+    def __init__(self, dataset_path: Path, data_tree: dict[str, any], path_builders: dict[str, PathBuilder]):
+        expanded_tree = expand_data_tree(data_tree)
+        self.sample_paths = {
+            name: builder.paths_from_tree(dataset_path, expanded_tree) for name, builder in path_builders.items()
+        }
+
+    def __len__(self) -> int:
+        example_paths = next(self.sample_paths.values())
+        return len(example_paths)
+
+    def __getitem__(self, idx):
+        sample = {} # TODO: Fix sample with loaders
+

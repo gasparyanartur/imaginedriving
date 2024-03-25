@@ -4,8 +4,7 @@ import torch
 
 from src.diffusion import load_img2img_model, encode_img, decode_img
 from src.configuration import setup_project
-from src.data import load_img_paths_from_dir, read_image
-from src.utils import show_img
+from src.data import read_image, save_image
 
 
 if __name__ == "__main__":
@@ -29,4 +28,4 @@ if __name__ == "__main__":
         img = encode_img(img_processor, vae, img_start)
         img_out = decode_img(img_processor, vae, img)
 
-    show_img(img=(img_start, img_out), save_path=output_path)
+    save_image(output_path, img_out)

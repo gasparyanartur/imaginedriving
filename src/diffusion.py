@@ -108,12 +108,6 @@ class SDXLFull(ImgToImgModel):
         base_kwargs: dict[str, any] = None,
         refiner_kwargs: dict[str, any] = None,
     ):
-        print(f"VAE CONFIG")
-        print(self.vae.config)
-        print()
-        print(f"IMAGE PROCESSOR CONFIG")
-        print(self.image_processor.config)
-
         img = batch_if_not_iterable(img)
         base_gen = batch_if_not_iterable(base_gen)
         refiner_gen = batch_if_not_iterable(refiner_gen)
@@ -240,7 +234,6 @@ def diffusion_from_config_to_dir(src_dataset: NamedImageDataset, dst_dir: Path, 
     else:
         model_config_params = {}
         model_forward_params = {}
-
 
     if model is None:
         model = load_img2img_model(**model_config_params)

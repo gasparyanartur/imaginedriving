@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from src.data import DirectoryDataset
+from src.data import DirectoryDataset, NamedImageDataset
 from src.benchmark import benchmark_single_metrics, benchmark_aggregate_metrics
 
 
