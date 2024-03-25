@@ -50,6 +50,8 @@ def show_img(img: Tensor, save_path: Path = None):
     if save_path:
         fig.savefig(str(save_path))
 
+    plt.show()
+
 
 def batch_if_not_iterable(item: any, single_dim: int = 3) -> Iterable[any]:
     if item is None:
@@ -85,3 +87,41 @@ def combine_kwargs(kwargs, extra_kwargs):
     extra_kwargs = extra_kwargs or {} 
     kwargs = dict(kwargs, **extra_kwargs)
     return kwargs
+
+
+from typing import Any
+
+
+def get_parameter_combinations(parameters):
+    names = []
+    values = []
+    idxs = []
+
+    for name, value in parameters.items():
+        names.append(name)
+        values.append(tuple(value))
+        idxs.append(0)
+
+    idxs = tuple(idxs)
+
+    return recurse_param_combinations(names, values, idxs, set())
+
+def recurse_param_combinations(names: list[str], values: list[tuple[Any]], idxs: tuple[int], memory):
+    if idxs in memory:
+        return []
+
+    memory.add(idxs)
+
+    combs = [{names[i]: values[i][idxs[i]] for i in range(len(idxs))}]
+
+    for i in range(len(idxs)):
+        new_idxs = list(idxs)
+        new_idxs[i] += 1
+        new_idxs = tuple(new_idxs)
+
+        if new_idxs[i] >= len(values[i]):
+            continue
+
+        combs.extend(recurse_param_combinations(names, values, new_idxs, memory))
+    
+    return combs

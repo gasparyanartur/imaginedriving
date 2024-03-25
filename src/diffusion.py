@@ -1,8 +1,9 @@
 from typing import Any
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, abstractproperty
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+import logging
 
 import PIL
 import torch
@@ -20,13 +21,14 @@ from src.utils import (
     get_device,
     validate_same_len,
     batch_if_not_iterable,
-    combine_kwargs,
 )
-from src.data import read_image, save_image
+from src.data import read_image, save_image, NamedImageDataset, DirectoryDataset
+from src.benchmark import benchmark_single_metrics, benchmark_aggregate_metrics
+from src.configuration import save_yaml
 
 
-def pipeline_output_to_tensor(imgs: Iterable[PIL.Image.Image]) -> Tensor:
-    return torch.stack([tvtf2.functional.pil_to_tensor(img) for img in imgs]) / 255.0
+default_prompt = "dashcam recording, urban driving scene, video, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
+default_negative_prompt = "face, human features, unrealistic, artifacts, blurry, noisy image, NeRF, oil-painting, art, drawing, poor geometry, oversaturated, undersaturated, distorted, bad image, bad photo"
 
 
 @dataclass
@@ -37,136 +39,122 @@ class ModelId:
 
 
 class ImgToImgModel(ABC):
+    load_model = None
+
     @abstractmethod
     def img_to_img(self, img: Tensor, *args, **kwargs) -> dict[str, Any]:
         raise NotImplementedError
 
+    def diffuse_to_dir(self, src_dataset: NamedImageDataset, dst_dir: Path, **kwargs) -> None:
+        dst_dir.mkdir(exist_ok=True, parents=True)
 
-class SDXLBase(ImgToImgModel):
-    def __init__(
-        self,
-        n_steps: int = 50,
-        strength: float = 0.2,
-        prompt: str = "",
-        model_id=ModelId.sdxl_base,
-        device: torch.device = get_device(),
-    ) -> None:
-        super().__init__()
+        for name, img in src_dataset:
+            diff_img = self.img_to_img(img, **kwargs)["image"]
+            diff_img_name = (dst_dir / name).with_suffix(".jpg")
+            save_image(diff_img_name, diff_img)
 
-        self.pipe: StableDiffusionXLImg2ImgPipeline = (
-            StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                model_id,
-                torch_dtype=torch.float16,
-                variant="fp16",
-                use_safetensors=True,
-            ).to(device)
-        )
+    @abstractproperty
+    def vae(self):
+        raise NotImplementedError
 
-        self.kwargs = {
-            "num_inference_steps": n_steps,
-            "prompt": prompt,
-            "strength": strength,
-        }
-
-    def img_to_img(
-        self,
-        img: Tensor,
-        gen: torch.Generator | Iterable[torch.Generator] = None,
-        extra_kwargs: dict[str, Any] = None,
-    ) -> dict[str, Any]:
-        kwargs = combine_kwargs(self.kwargs, extra_kwargs)
-        img = batch_if_not_iterable(img)
-        gen = batch_if_not_iterable(gen)
-        validate_same_len(img, gen)
-
-        img = self.pipe(image=img, generator=gen, **kwargs).images
-        img = pipeline_output_to_tensor(img)
-
-        return {"image": img}
-
-
+    @abstractproperty
+    def image_processor(self):
+        raise NotImplementedError
+        
 class SDXLFull(ImgToImgModel):
     def __init__(
         self,
-        n_steps: int = 50,
-        mixture_threshold: float = 0.8,
-        base_strength: float = 0.2,
-        base_prompt: str = "",
         base_model_id: str = ModelId.sdxl_base,
-        refiner_strength: float = 0.2,
-        refiner_prompt: str = None,
-        refiner_model_id=ModelId.sdxl_refiner,
+        refiner_model_id: str | None = ModelId.sdxl_refiner,
         device: torch.device = get_device(),
     ) -> None:
         super().__init__()
 
-        self.base_pipe: StableDiffusionXLImg2ImgPipeline = (
-            StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                base_model_id,
-                torch_dtype=torch.float16,
-                variant="fp16",
-                use_safetensors=True,
-            ).to(device)
-        )
+        self.use_refiner = refiner_model_id is not None
 
-        self.refiner_pipe: StableDiffusionXLImg2ImgPipeline = (
-            StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                refiner_model_id,
-                text_encoder_2=self.base_pipe.text_encoder_2,
-                vae=self.base_pipe.vae,
-                torch_dtype=torch.float16,
-                use_safetensors=True,
-                variant="fp16",
-            ).to(device)
-        )
+        self.base_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            base_model_id,
+            torch_dtype=torch.float16,
+            variant="fp16",
+            use_safetensors=True,
+        ).to(device)
 
-        self.base_kwargs = {
-            "num_inference_steps": n_steps,
-            "prompt": base_prompt,
-            "strength": base_strength,
-            "denoising_end": mixture_threshold,
-        }
-
-        self.refiner_kwargs = {
-            "num_inference_steps": n_steps,
-            "prompt": refiner_prompt or base_prompt,
-            "strength": refiner_strength,
-            "denoising_start": mixture_threshold,
-        }
+        self.refiner_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            refiner_model_id,
+            text_encoder_2=self.base_pipe.text_encoder_2,
+            vae=self.base_pipe.vae,
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+            variant="fp16",
+        ).to(device) if self.use_refiner else None
 
     def img_to_img(
         self,
         img: Tensor,
+        base_strength: float = 0.2,
+        refiner_strength: float = 0.2,
+        base_denoising_start: int = None,
+        base_denoising_end: int = None,
+        refiner_denoising_start: int = None,
+        refiner_denoising_end: int = None,
+        original_size: tuple[int, int] = (1024, 1024),
+        target_size: tuple[int, int] = (1024, 1024),
+        prompt: str = default_prompt,
+        negative_prompt: str = default_negative_prompt,
+        base_num_steps: int = 50,
+        refiner_num_steps: int = 50,
         base_gen: torch.Generator | Iterable[torch.Generator] = None,
         refiner_gen: torch.Generator | Iterable[torch.Generator] = None,
-        base_extra_kwargs: dict[str, any] = None,
-        refiner_extra_kwargs: dict[str, any] = None,
+        base_kwargs: dict[str, any] = None,
+        refiner_kwargs: dict[str, any] = None,
     ):
-        base_kwargs = combine_kwargs(self.base_kwargs, base_extra_kwargs)
-        refiner_kwargs = combine_kwargs(self.refiner_kwargs, refiner_extra_kwargs)
-
         img = batch_if_not_iterable(img)
         base_gen = batch_if_not_iterable(base_gen)
         refiner_gen = batch_if_not_iterable(refiner_gen)
         validate_same_len(img, base_gen, refiner_gen)
 
-        img = self.base_pipe(image=img, output_type="latent", generator=base_gen, **base_kwargs).images
-        img = self.refiner_pipe(image=img, generator=refiner_gen, **refiner_kwargs).images
-        img = pipeline_output_to_tensor(img)
+        base_kwargs = base_kwargs or {}
+        img = self.base_pipe(
+            image=img,
+            generator=base_gen,
+            output_type="latent" if self.use_refiner else "pt",
+            strength=base_strength,
+            denoising_start=base_denoising_start,
+            denoising_end=base_denoising_end,
+            num_inference_steps=base_num_steps,
+            original_size=original_size,
+            target_size=target_size,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            **base_kwargs
+        ).images
 
-        return {
-            "image": img,
-        }
+        if self.use_refiner:
+            refiner_kwargs = refiner_kwargs or {}
+            img = self.refiner_pipe(
+                image=img,
+                generator=refiner_gen,
+                output_type="pt",
+                strength=refiner_strength,
+                denoising_start=refiner_denoising_start,
+                denoising_end=refiner_denoising_end,
+                num_inference_steps=refiner_num_steps,
+                original_size=original_size,
+                target_size=target_size,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                **refiner_kwargs
+            ).images
 
+        return {"image": img}
 
-def diffuse_images_to_dir(
-    model: ImgToImgModel, img_paths: Iterable[Path], dst_dir: Path
-):
-    dst_dir.mkdir(exist_ok=True, parents=True)
-    for src_img_path in img_paths:
-        src_img = read_image(src_img_path)
-        dst_img = model.img_to_img(src_img)
-        save_image(dst_dir / src_img_path.name, dst_img)
+    @property
+    def vae(self):
+        return self.base_pipe.vae
+
+    @property
+    def image_processor(self):
+        return self.base_pipe.image_processor
 
 
 def encode_img(
@@ -198,3 +186,38 @@ def upcast_vae(vae):
     vae.decoder.mid_block.to(dtype)
 
     return vae
+
+
+def load_img2img_model(**kwargs: dict[str, Any]) -> ImgToImgModel:
+    logging.info(f"Loading diffusion model...")
+
+    match kwargs.get("model_name"):
+        case "sdxlbase" | None:
+            base_model_id = kwargs.get("base_model_id") or ModelId.sdxl_base
+            refiner_model_id = None
+
+            model = SDXLFull(base_model_id, refiner_model_id)
+        
+        case _:
+            raise NotImplementedError
+
+    logging.info(f"Finished loading diffusion model")
+    return model
+
+
+ImgToImgModel.load_model = load_img2img_model
+
+
+def diffusion_from_config_to_dir(src_dataset: NamedImageDataset, dst_dir: Path, model_config: dict[str, Any], device=get_device(), model: ImgToImgModel = None):
+    if model is None:
+        model = load_img2img_model(**model_config["model_config_params"])
+
+    dst_dir.mkdir(exist_ok=True, parents=True)
+    model.diffuse_to_dir(src_dataset, dst_dir, **model_config["model_forward_params"])
+
+    dst_dataset = DirectoryDataset.from_directory(dst_dir, device=device)
+    benchmark_single_metrics(dst_dataset, src_dataset).to_csv(dst_dir / "single-metrics.csv")
+    benchmark_aggregate_metrics(dst_dataset, src_dataset).to_csv(dst_dir / "aggregate-metrics.csv")
+    save_yaml(dst_dir / "config.yml", model_config)
+
+    logging.info(f"Finished diffusion.")
