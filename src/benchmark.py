@@ -1,7 +1,6 @@
-from abc import ABC, abstractmethod, abstractproperty
-from pathlib import Path
+from typing import Any
+from abc import ABC, abstractmethod
 from collections.abc import Iterable
-import pandas as pd
 import logging
 
 import torch
@@ -10,26 +9,27 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from src.data import NamedImageDataset
+from src.data import DynamicDataset
 from src.utils import batch_if_not_iterable, get_device
 
 
 def get_mean_aggregate(
     single_function,
-    preds: NamedImageDataset | Iterable[Tensor] | Tensor,
-    gts: NamedImageDataset | Iterable[Tensor] | Tensor,
+    preds: DynamicDataset | Iterable[Tensor] | Tensor,
+    gts: DynamicDataset | Iterable[Tensor] | Tensor,
     mean_value: bool = True,
-) -> torch.Tensor:
+    match_attrs=("scene", "sample"),
+) -> float:
     running_value = torch.zeros(1, dtype=torch.float32, device=preds.device)
     count = 0
 
-    if isinstance(preds, NamedImageDataset) or isinstance(gts, NamedImageDataset):
-        if not (
-            isinstance(preds, NamedImageDataset) and isinstance(gts, NamedImageDataset)
-        ):
-            raise ValueError(f"Expected both NamedImageDataset, but got {preds} {gts}")
+    if isinstance(preds, DynamicDataset) or isinstance(gts, DynamicDataset):
+        if not (isinstance(preds, DynamicDataset) and isinstance(gts, DynamicDataset)):
+            raise ValueError(
+                f"Expected both NamedImageDataset, but got {type(preds)} and {type(gts)}"
+            )
 
-        sample_iter = ((pred, gt) for _, (pred, gt) in preds.get_matching(gts))
+        sample_iter = preds.get_matching(gts, match_attrs=match_attrs)
     else:
         sample_iter = zip(preds, gts)
 
@@ -55,41 +55,52 @@ class Metric(ABC):
 
 class SingleMetric(Metric, ABC):
     @abstractmethod
-    def execute_single(self, pred: Tensor, gt: Tensor) -> float:
+    def execute_single(self, pred: dict[str, Any], gt: dict[str, Any]) -> float:
         raise NotImplementedError
 
     def execute_map(
         self,
-        preds: NamedImageDataset | Iterable[Tensor] | Tensor,
-        gts: NamedImageDataset | Iterable[Tensor] | Tensor,
-    ) -> pd.DataFrame:
-        if not isinstance(preds, NamedImageDataset) and not isinstance(
-            gts, NamedImageDataset
+        preds: DynamicDataset,
+        gts: DynamicDataset,
+        match_attrs: tuple[str] = ("scene", "sample"),
+    ) -> dict[tuple[str], float]:
+        if not isinstance(preds, DynamicDataset) and not isinstance(
+            gts, DynamicDataset
         ):
             raise NotImplementedError
 
-        metrics = {
-            sample_name: self.execute_single(pred, gt).item()
-            for sample_name, (pred, gt) in preds.get_matching(gts)
-        }
-        return pd.Series(metrics)
+        metrics = {}
+        for pred, gt in preds.get_matching(gts, match_attrs=match_attrs):
+            query = tuple(pred[attr] for attr in match_attrs)
+            metrics[query] = self.execute_single(pred, gt).item()
+
+        return metrics
 
 
 class AggregateMetric(Metric, ABC):
     @abstractmethod
     def execute_aggregate(
-        self, preds: NamedImageDataset, gts: NamedImageDataset
-    ) -> pd.DataFrame:
+        self,
+        preds: DynamicDataset,
+        gts: DynamicDataset,
+        match_attrs: tuple[str] = ("scene", "sample"),
+    ) -> dict[tuple[str], float]:
         raise NotImplementedError
 
 
 class DefaultMetricWrapper(SingleMetric, AggregateMetric):
-    def __init__(self, name, model, device, require_batch: bool = True) -> None:
+    def __init__(
+        self, name, model, device, require_batch: bool = True, data_type: str = "image"
+    ) -> None:
         super().__init__(name)
         self.model = model.to(device)
         self.require_batch: bool = require_batch
+        self.data_type = data_type
 
-    def execute_single(self, pred: Tensor, gt: Tensor) -> float:
+    def execute_single(self, pred: dict[str, Any], gt: dict[str, Any]) -> float:
+        pred = pred[self.data_type]
+        pred = pred[self.data_type]
+
         if self.require_batch:
             pred = batch_if_not_iterable(pred)
             gt = batch_if_not_iterable(gt)
@@ -98,13 +109,12 @@ class DefaultMetricWrapper(SingleMetric, AggregateMetric):
 
     def execute_aggregate(
         self,
-        preds: NamedImageDataset | Iterable[Tensor] | Tensor,
-        gts: NamedImageDataset | Iterable[Tensor] | Tensor,
-    ) -> pd.DataFrame:
-        def func(pred, gt):
-            return self.execute_single(pred, gt)
-
-        return get_mean_aggregate(func, preds, gts, mean_value=True)
+        preds: DynamicDataset,
+        gts: DynamicDataset,
+    ) -> dict[tuple[str], float]:
+        return get_mean_aggregate(
+            lambda pred, gt: self.execute_single(pred, gt), preds, gts, mean_value=True
+        )
 
 
 class PSNRMetric(DefaultMetricWrapper):
@@ -153,28 +163,31 @@ class FIDMetric(AggregateMetric):
         feature: int = 64,
         normalize: bool = True,
         device=get_device(),
+        data_type: str = "image",
         **kwargs,
     ) -> None:
         super().__init__(name)
-        self.model = FrechetInceptionDistance(feature=feature, normalize=normalize, **kwargs).set_dtype(torch.float64).to(device)
+        self.model = (
+            FrechetInceptionDistance(feature=feature, normalize=normalize, **kwargs)
+            .set_dtype(torch.float64)
+            .to(device)
+        )
+        self.data_type = data_type
 
-    def get_fid(self, preds: Iterable[Tensor], gts: Iterable[Tensor]) -> float:
+    def execute_aggregate(self, preds: DynamicDataset, gts: DynamicDataset) -> float:
         self.model.reset()
 
         for gt in gts:
+            gt = gt[self.data_type]
             gt = batch_if_not_iterable(gt).double()
             self.model.update(gt, real=True)
 
         for pred in preds:
+            pred = pred[self.data_type]
             pred = batch_if_not_iterable(pred).double()
             self.model.update(pred, real=False)
 
         return self.model.compute().item()
-    
-    def execute_aggregate(
-        self, preds: NamedImageDataset, gts: NamedImageDataset
-    ) -> pd.DataFrame:
-        return self.get_fid((pred for _, pred in preds), (gt for _, gt in gts))
 
 
 default_aggregate_metrics = (PSNRMetric(), SSIMMetric(), LPIPSMetric(), FIDMetric())
@@ -186,30 +199,28 @@ default_single_metrics = (
 )
 
 
-def benchmark_aggregate_metrics(
-    preds: NamedImageDataset,
-    gts: NamedImageDataset,
-    metrics: list[AggregateMetric] = default_aggregate_metrics,
-) -> pd.DataFrame:
+def run_benchmark_suite(
+    preds: DynamicDataset,
+    gts: DynamicDataset,
+    aggregate_metrics: list[AggregateMetric] = default_aggregate_metrics,
+    single_metrics: list[SingleMetric] = default_single_metrics,
+    match_attrs: tuple[str] = ("scene", "sample"),
+):
+    metrics = {}
+
     with torch.no_grad():
-        results = {
-            metric.name: [metric.execute_aggregate(preds, gts)] for metric in metrics
+        metrics["aggregate"] = {
+            aggregate_metric.name: aggregate_metric.execute_aggregate(
+                preds, gts, match_attrs=match_attrs
+            )
+            for aggregate_metric in aggregate_metrics
         }
-        return pd.DataFrame.from_dict(results, orient="columns")
+        metrics["single"] = {
+            single_metric.name: single_metric.execute_map(
+                preds, gts, match_attrs=match_attrs
+            )
+            for single_metric in single_metrics
+        }
 
+    return metrics
 
-def benchmark_single_metrics(
-    preds: NamedImageDataset,
-    gts: NamedImageDataset,
-    metrics: list[SingleMetric] = default_single_metrics,
-) -> pd.DataFrame:
-    if len(metrics) == 0:
-        return []
-
-    with torch.no_grad():
-        if len(metrics) == 1:
-            return metrics[0].execute_map(preds, gts)
-
-        df = pd.concat([metric.execute_map(preds, gts) for metric in metrics], axis=1)
-        df.columns = [metric.name for metric in metrics]
-        return df

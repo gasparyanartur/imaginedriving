@@ -318,6 +318,9 @@ class DataGetter(ABC):
     def get_data(self, dataset_path: Path, info: SampleInfo):
         raise NotImplementedError
 
+    @abstractmethod
+    def get_data_suffix(self):
+        raise NotImplementedError
 
 class PandasetInfoGetter(InfoGetter):
     def get_sample_names_in_scene(
@@ -342,6 +345,9 @@ class PandasetImageDataGetter(DataGetter):
         path = self.get_sample_path(dataset_path, info)
         img = read_image(path, self.tf_pipeline)
         return img
+
+    def get_data_suffix(self) -> str:
+        return pandaset_img_suffix
 
 
 class DynamicDataset(Dataset):  # Dataset / Scene / Sample
@@ -374,6 +380,10 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
             sample[data_type] = data
 
         return sample
+
+    def iter_attrs(self, attrs: Iterable[str]) -> Generator[tuple[any]]:
+        for sample in self:
+            yield tuple(sample[attr] for attr in attrs) 
 
     def get_matching(
         self, other: "DynamicDataset", match_attrs: Iterable[str] = ("scene", "sample")
