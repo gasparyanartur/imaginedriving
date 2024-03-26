@@ -352,12 +352,18 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         info_getter: InfoGetter,
         data_getters: dict[str, DataGetter],
     ):
-        self.sample_infos: list[SampleInfo] = info_getter.parse_tree(dataset_path, data_tree)
+        self.sample_infos: list[SampleInfo] = info_getter.parse_tree(
+            dataset_path, data_tree
+        )
         self.data_getters = data_getters
         self.dataset_path = dataset_path
 
     def __len__(self) -> int:
         return len(self.sample_infos)
+
+    def __iter__(self) -> Generator[dict[str, Any]]:
+        for i in range(len(self)):
+            yield self[i]
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         info = self.sample_infos[idx]
@@ -368,3 +374,20 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
             sample[data_type] = data
 
         return sample
+
+    def get_matching(
+        self, other: "DynamicDataset", match_attrs: Iterable[str] = ("scene", "sample")
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        match_dict = {}
+        for sample_self in self:
+            sample_query = tuple(sample_self[attr] for attr in match_attrs)
+            match_dict[sample_query] = sample_self
+
+        matches = []
+        for sample_other in other:
+            sample_query = tuple(sample_other[attr] for attr in match_attrs)
+            if sample_query in match_dict:
+                sample_self = match_dict[sample_query]
+                matches.append((sample_self, sample_other))
+
+        return matches
