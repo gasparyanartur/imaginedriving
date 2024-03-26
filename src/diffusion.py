@@ -5,9 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import logging
 
-import PIL
 import torch
-import torchvision.transforms.v2 as tvtf2
 from torch import Tensor
 
 from diffusers import StableDiffusionXLImg2ImgPipeline
