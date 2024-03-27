@@ -12,8 +12,8 @@ from src.benchmark import benchmark_single_metrics
 if __name__ == "__main__":
     parser = ArgumentParser("diffusion")
 
-    parser.add_argument("src_dir", type=Path)
-    parser.add_argument("gt_dir", type=path)
+    parser.add_argument("data_dir", type=Path)
+    parser.add_argument("output_dir", type=Path)
     parser.add_argument("experiment_config_path", type=Path)
     parser.add_argument("base_experiment_dir", type=Path)
     parser.add_argument("-s", "--show_img", action="store_true")

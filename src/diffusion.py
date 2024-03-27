@@ -25,7 +25,6 @@ from src.data import (
     DirectoryDataset,
     DynamicDataset,
 )
-from src.benchmark import benchmark_single_metrics, benchmark_aggregate_metrics
 from src.configuration import save_yaml
 
 
@@ -121,14 +120,16 @@ class SDXLFull(ImgToImgModel):
         base_kwargs: dict[str, any] = None,
         refiner_kwargs: dict[str, any] = None,
     ):
-        img = batch_if_not_iterable(img)
+        image = sample["image"]
+
+        image = batch_if_not_iterable(image)
         base_gen = batch_if_not_iterable(base_gen)
         refiner_gen = batch_if_not_iterable(refiner_gen)
-        validate_same_len(img, base_gen, refiner_gen)
+        validate_same_len(image, base_gen, refiner_gen)
 
         base_kwargs = base_kwargs or {}
-        img = self.base_pipe(
-            image=sample["image"],
+        image = self.base_pipe(
+            image=image,
             generator=base_gen,
             output_type="latent" if self.use_refiner else "pt",
             strength=base_strength,
@@ -144,8 +145,8 @@ class SDXLFull(ImgToImgModel):
 
         if self.use_refiner:
             refiner_kwargs = refiner_kwargs or {}
-            img = self.refiner_pipe(
-                image=img,
+            image = self.refiner_pipe(
+                image=image,
                 generator=refiner_gen,
                 output_type="pt",
                 strength=refiner_strength,
@@ -159,7 +160,7 @@ class SDXLFull(ImgToImgModel):
                 **refiner_kwargs,
             ).images
 
-        return {"image": img}
+        return {"image": image}
 
     @property
     def vae(self) -> AutoencoderKL:
@@ -243,13 +244,12 @@ ImgToImgModel.load_model = load_img2img_model
 def diffusion_from_config_to_dir(
     src_dataset: DynamicDataset,
     dst_dir: Path,
-    model_config: dict[str, Any],
-    device=get_device(),
+    config: dict[str, Any],
     model: ImgToImgModel = None,
 ):
-    if model_config is not None:
-        model_config_params = model_config["model_config_params"]
-        model_forward_params = model_config["model_forward_params"]
+    if config is not None:
+        model_config_params = config["model_config_params"]
+        model_forward_params = config["model_forward_params"]
     else:
         model_config_params = {}
         model_forward_params = {}
@@ -259,14 +259,6 @@ def diffusion_from_config_to_dir(
 
     dst_dir.mkdir(exist_ok=True, parents=True)
     model.diffuse_to_dir(src_dataset, dst_dir, **model_forward_params)
-
-    dst_dataset = DirectoryDataset.from_directory(dst_dir, device=device)
-    benchmark_single_metrics(dst_dataset, src_dataset).to_csv(
-        dst_dir / "single-metrics.csv"
-    )
-    benchmark_aggregate_metrics(dst_dataset, src_dataset).to_csv(
-        dst_dir / "aggregate-metrics.csv"
-    )
-    save_yaml(dst_dir / "config.yml", model_config)
+    save_yaml(config, dst_dir / "config.yml")
 
     logging.info(f"Finished diffusion.")
