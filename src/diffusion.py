@@ -22,8 +22,8 @@ from src.utils import (
 )
 from src.data import (
     save_image,
-    DirectoryDataset,
     DynamicDataset,
+    suffixes
 )
 from src.configuration import save_yaml
 
@@ -39,11 +39,11 @@ class ModelId:
     sdxl_turbo = "stabilityai/sdxl-turbo"
 
 
-class ImgToImgModel(ABC):
+class DiffusionModel(ABC):
     load_model = None
 
     @abstractmethod
-    def img_to_img(self, sample: dict[str, Any], *args, **kwargs) -> dict[str, Any]:
+    def diffuse_sample(self, sample: dict[str, Any], *args, **kwargs) -> dict[str, Any]:
         raise NotImplementedError
 
     def diffuse_to_dir(
@@ -52,11 +52,9 @@ class ImgToImgModel(ABC):
         dst_dir.mkdir(exist_ok=True, parents=True)
 
         for sample in src_dataset:
-            diff_img = self.img_to_img(sample, **kwargs)["image"]
+            diff_img = self.diffuse_sample(sample, **kwargs)["rgb"]
             dst_path = dst_dir / sample["dataset"] / sample["scene"] / sample["sample"]
-            dst_path = dst_path.with_suffix(
-                src_dataset.data_getters["image"].get_data_suffix()
-            )
+            dst_path = dst_path.with_suffix(suffixes["rgb", src_dataset.name])
             dst_path.parent.mkdir(exist_ok=True, parents=True)
             save_image(dst_path, diff_img)
 
@@ -69,7 +67,7 @@ class ImgToImgModel(ABC):
         raise NotImplementedError
 
 
-class SDXLFull(ImgToImgModel):
+class SDXLFull(DiffusionModel):
     def __init__(
         self,
         base_model_id: str = ModelId.sdxl_base,
@@ -100,7 +98,7 @@ class SDXLFull(ImgToImgModel):
             else None
         )
 
-    def img_to_img(
+    def diffuse_sample(
         self,
         sample: dict[str, Any],
         base_strength: float = 0.2,
@@ -120,7 +118,7 @@ class SDXLFull(ImgToImgModel):
         base_kwargs: dict[str, any] = None,
         refiner_kwargs: dict[str, any] = None,
     ):
-        image = sample["image"]
+        image = sample["rgb"]
 
         image = batch_if_not_iterable(image)
         base_gen = batch_if_not_iterable(base_gen)
@@ -160,7 +158,7 @@ class SDXLFull(ImgToImgModel):
                 **refiner_kwargs,
             ).images
 
-        return {"image": image}
+        return {"rgb": image}
 
     @property
     def vae(self) -> AutoencoderKL:
@@ -221,7 +219,7 @@ def upcast_vae(vae):
     return vae
 
 
-def load_img2img_model(**kwargs: dict[str, Any]) -> ImgToImgModel:
+def load_img2img_model(**kwargs: dict[str, Any]) -> DiffusionModel:
     logging.info(f"Loading diffusion model...")
 
     match kwargs.get("model_name"):
@@ -238,18 +236,18 @@ def load_img2img_model(**kwargs: dict[str, Any]) -> ImgToImgModel:
     return model
 
 
-ImgToImgModel.load_model = load_img2img_model
+DiffusionModel.load_model = load_img2img_model
 
 
 def diffusion_from_config_to_dir(
     src_dataset: DynamicDataset,
     dst_dir: Path,
-    config: dict[str, Any],
-    model: ImgToImgModel = None,
+    model_config: dict[str, Any],
+    model: DiffusionModel = None,
 ):
-    if config is not None:
-        model_config_params = config["model_config_params"]
-        model_forward_params = config["model_forward_params"]
+    if model_config is not None:
+        model_config_params = model_config["model_config_params"]
+        model_forward_params = model_config["model_forward_params"]
     else:
         model_config_params = {}
         model_forward_params = {}
@@ -259,6 +257,6 @@ def diffusion_from_config_to_dir(
 
     dst_dir.mkdir(exist_ok=True, parents=True)
     model.diffuse_to_dir(src_dataset, dst_dir, **model_forward_params)
-    save_yaml(config, dst_dir / "config.yml")
+    save_yaml(model_config, dst_dir / "config.yml")
 
     logging.info(f"Finished diffusion.")

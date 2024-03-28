@@ -3,7 +3,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 from src.configuration import setup_project, read_yaml, save_yaml
-from src.diffusion import ImgToImgModel
+from src.diffusion import DiffusionModel
 from src.utils import show_img, get_device
 from src.data import read_image, save_image, NamedImageDataset, DirectoryDataset
 from src.benchmark import benchmark_single_metrics
@@ -38,7 +38,7 @@ if __name__ == "__main__":
 
     logging.info("Running experiments...")
     prev_model_config_params = None
-    model: ImgToImgModel = None
+    model: DiffusionModel = None
     base_experiment_dir.mkdir(exist_ok=True, parents=True)
 
     device = get_device()
@@ -52,10 +52,10 @@ if __name__ == "__main__":
         model_config_params = experiment["model_config_params"]
         if model_config_params != prev_model_config_params:
             prev_model_config_params = model_config_params
-            model = ImgToImgModel.load_model(model_config_params)
+            model = DiffusionModel.load_model(model_config_params)
 
         model_forward_params = experiment["model_forward_params"]
-        diffused_img = model.img_to_img(img, **model_forward_params)["image"]
+        diffused_img = model.diffuse_sample(img, **model_forward_params)["rgb"]
 
         if flag_show_img:
             show_img((img, diffused_img))

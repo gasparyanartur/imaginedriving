@@ -3,7 +3,7 @@ from pathlib import Path
 
 from src.configuration import setup_project, read_yaml
 from src.diffusion import diffusion_from_config_to_dir
-from src.data import DynamicDataset, read_data_tree, PandasetInfoGetter, PandasetImageDataGetter
+from src.data import DynamicDataset, read_data_tree, PandasetInfoGetter, RGBDataGetter
 from src.utils import get_device
 
 
@@ -24,11 +24,16 @@ if __name__ == "__main__":
     if not dataset_path.exists():
         raise ValueError(f"Could not find dataset_path: {dataset_path}")
 
+
     config = read_yaml(config_path)
-    data_tree = read_data_tree(config["data_tree"])
+
+    for dataset_name, dataset in config["datasets"].items():
+        dataset_path = dataset["path"]
+        data_tree = read_data_tree(dataset["data_tree"])
+        info_getter = 
 
     info_getter = PandasetInfoGetter()
-    data_getters = {"image": PandasetImageDataGetter()}
+    data_getters = {"rgb": RGBDataGetter(info_getter, {"data_type": "rgb"})}
     src_dataset = DynamicDataset(dataset_path, data_tree, info_getter, data_getters)
 
     diffusion_from_config_to_dir(src_dataset, output_path, config)

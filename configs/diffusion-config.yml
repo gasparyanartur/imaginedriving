@@ -1,11 +1,23 @@
-data_tree: 
-  pandaset: 
-    001-003: "*"
+datasets:
+  source_images:
+    dataset: pandaset
+    path: "/proj/adas-data/data/pandaset"
+    info_getter: {}
+    data_getters:
+      rgb:
+        camera: "front_camera"
 
-model_config_params:
-  model_name: sdxlbase
-  base_model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+    data_tree: 
+      pandaset: 
+        001-003: "*"
 
-model_forward_params: 
-  base_strength: 0.1
-  base_num_steps: 50
+model:
+  model_config_params:
+    model_name: sdxlbase
+    base_model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+
+  model_forward_params: 
+    base_strength: 0.1
+    base_num_steps: 50
+
+output_dir: /proj/nlp4adas/master-thesis-shared/output/diffusion

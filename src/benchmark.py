@@ -90,7 +90,7 @@ class AggregateMetric(Metric, ABC):
 
 class DefaultMetricWrapper(SingleMetric, AggregateMetric):
     def __init__(
-        self, name, model, device, require_batch: bool = True, data_type: str = "image"
+        self, name, model, device, require_batch: bool = True, data_type: str = "rgb"
     ) -> None:
         super().__init__(name)
         self.model = model.to(device)
@@ -163,7 +163,7 @@ class FIDMetric(AggregateMetric):
         feature: int = 64,
         normalize: bool = True,
         device=get_device(),
-        data_type: str = "image",
+        data_type: str = "rgb",
         **kwargs,
     ) -> None:
         super().__init__(name)
