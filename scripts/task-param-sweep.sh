@@ -7,42 +7,32 @@
 #SBATCH -A Berzelius-2024-1
 #SBATCH --job-name=param-sweep
 #SBATCH --array=0-10
-max_config_files="10"       # Don't exceed the number of arrays
+array_start=0
+array_end=10
 
-if [ -z ${SOURCE_DIR} ]; then
-    echo "SOURCE_DIR variable is empty. Exiting." ;
-    exit 1;
-fi
+image_path=${IMAGE_PATH:-"/proj/nlp4adas/containers/nerf-thesis-0.4.sif/"}
+source_dir=${SOURCE_DIR:-"/proj/adas-data/data/pandaset"}
+dest_dir=${DEST_DIR:-"/proj/nlp4adas/master-thesis-shared/output/param_sweep"}
+config_dir=${CONFIG_DIR:-"configs/paramsweep-config.yml"}
 
-if [ -z ${DEST_DIR} ]; then
-    echo "DEST_DIR variable is empty. Exiting." ;
-    exit 1;
-fi
 
 if [ -z ${SLURM_ARRAY_TASK_ID} ]; then
     echo "SLURM_ARRAY_TASK_ID variable is empty. Exiting." ;
     exit 1;
 fi
 
-if [ -z ${CONFIGS_DIR} ]; then
-    echo "CONFIGS_DIR variable is empty. Exiting." ;
-    exit 1;
-fi
 
-config_array=($(find ${CONFIGS_DIR} -name '*.yml'))
+config_array=($(find $configs_dir -name '*.yml'))
 n_paths=${#config_array[@]}
 
-if [ "$n_paths" -gt ${max_config_files} ]; then
-    echo "Too many configurations found in ${CONFIGS_DIR}. Expected ${max_config_files}, found ${n_paths}. Exiting." ;
+if [ $n_paths -gt $array_end ]; then
+    echo "Too many configurations found in $config_dir. Expected $array_end, found $n_paths. Exiting." ;
     exit 1;
 fi
 
-if [ "$SLURM_ARRAY_TASK_ID" -gt ${max_config_files} ]; then
-    echo "Array Task ID ${SLURM_ARRAY_TASK_ID} exceeds number of paths ${n_paths}. Exiting." ;
+if [ $SLURM_ARRAY_TASK_ID -gt $array_end ]; then
+    echo "Array Task ID $SLURM_ARRAY_TASK_ID exceeds number of paths $n_paths. Exiting." ;
     exit 0;
 fi
 
-config_path=${config_array[$SLURM_ARRAY_TASK_ID]}
-config_name=$(basename -s ".yml" ${config_path})
-
-singularity exec --nv ~/base/containers/nerf-thesis-latest.sif/ python scripts/run_diffusion.py ${SOURCE_DIR} ${DEST_DIR}/${config_name} -m ${config_path}
+singularity exec --nv $image_path python scripts/run_diffusion_sweep.py $source_dir $dest_dir $config_dir -id $SLURM_ARRAY_TASK_ID $array_start $array_end
