@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 from torch import Tensor
 from torchvision.transforms import v2 as tvtf2
 import torchvision
+import logging
 
 from src.configuration import read_yaml
 
@@ -152,7 +153,7 @@ class InfoGetter(ABC):
 
     @abstractmethod
     def get_sample_names_in_scene(
-        self, dataset_path: Path, scene: str
+        self, dataset_path: Path, scene: str, specs: dict[str, Any] = None
     ) -> Generator[str]:
         raise NotImplementedError
 
@@ -183,32 +184,51 @@ class PandasetInfoGetter(InfoGetter):
     def __init__(self) -> None:
         super().__init__("pandaset")
 
-    def get_sample_names_in_scene(
-        self, dataset_path: Path, scene: str
-    ) -> Generator[str]:
-        cam_path = dataset_path / scene / "camera" / "front_camera"
-        for sample_path in cam_path.glob(f"*{suffixes["rgb", "pandaset"]}"):
-            yield sample_path.stem
+    def _get_sample_dir_path(self, dataset_path, scene, specs=None):
+        if specs is None:
+            data_type = None
+            camera = None
 
-    def get_path(self, dataset_path: Path, info: SampleInfo, specs: dict[str, Any]) -> Path:
-        if not "data_type" in specs:
-            raise ValueError
+        else:
+            data_type = specs.get("data_type")
+            camera = specs.get("camera")
 
-        data_type = specs.get("data_type", "")
+        if data_type is None:
+            data_type = "rgb"
 
         match data_type:
             case "rgb":
-                suffix = suffixes[("rgb", "pandaset")]
+                if camera is None:
+                    camera = "front_camera"
+
+                return dataset_path / scene / "camera" / camera
+
+            case "lidar":
+                return dataset_path / scene / "lidar"
 
             case _:
-                raise ValueError
+                raise NotImplementedError
 
-        camera = specs.get("camera", "front_camera")
+    def get_sample_names_in_scene(
+        self, dataset_path: Path, scene: str, specs: dict[str, Any] = None
+    ) -> Generator[str]:
+        sample_dir_path = self._get_sample_dir_path(dataset_path, scene, specs)
+        
+        data_type = "rgb" if specs is None else specs.get("data_type", "rgb")
+        suffix = suffixes[data_type, self.dataset_name]
 
-        path = dataset_path / info.scene / "camera" / camera / info.sample
-        path = path.with_suffix(suffix)
+        for sample_path in sample_dir_path.glob(f"*{suffix}"):
+            yield sample_path.stem
 
-        return path    
+    def get_path(self, dataset_path: Path, info: SampleInfo, specs: dict[str, Any]) -> Path:
+        assert isinstance(info.sample, str)
+
+        sample_dir_path = self._get_sample_dir_path(dataset_path, info.scene, specs)
+        data_type = "rgb" if specs is None else specs.get("data_type", "rgb")
+        suffix = suffixes[data_type, self.dataset_name]
+
+        sample_path = (sample_dir_path / info.sample).with_suffix(suffix)
+        return sample_path
 
 class NeuRADInfoGetter(InfoGetter):
     def __init__(self):
@@ -258,7 +278,7 @@ class NeuRADInfoGetter(InfoGetter):
         sample_dir_path = self._get_sample_dir_path(dataset_path, scene, specs)
         
         data_type = "rgb" if specs is None else specs.get("data_type", "rgb")
-        suffix = suffixes[data_type, "neurad"]
+        suffix = suffixes[data_type, self.dataset_name]
 
         for sample_path in sample_dir_path.glob(f"*{suffix}"):
             yield sample_path.stem
@@ -268,19 +288,17 @@ class NeuRADInfoGetter(InfoGetter):
 
         sample_dir_path = self._get_sample_dir_path(dataset_path, info.scene, specs)
         data_type = "rgb" if specs is None else specs.get("data_type", "rgb")
-        suffix = suffixes[data_type, "neurad"]
+        suffix = suffixes[data_type, self.dataset_name]
 
         sample_path = (sample_dir_path / info.sample).with_suffix(suffix)
         return sample_path
 
-    def from_da
 
 class DataGetter(ABC):
     def __init__(self, info_getter: InfoGetter, data_spec: dict[str, Any]) -> None:
         super().__init__()
         self.info_getter = info_getter
         self.data_spec = data_spec
-
 
     def get_data_path(self, dataset_path: Path, info: SampleInfo) -> Path:
         return self.info_getter.get_path(dataset_path, info, self.data_spec)
@@ -302,12 +320,12 @@ class RGBDataGetter(DataGetter):
     def get_data(self, dataset_path: Path, info: SampleInfo) -> Tensor:
         return read_image(self.get_data_path(dataset_path, info), self.tf_pipeline)
 
-info_getter_builders: dict[str, Callable[[str], InfoGetter]] = {
+info_getter_builders: dict[str, Callable[[], InfoGetter]] = {
     "pandaset": PandasetInfoGetter,
     "neurad": NeuRADInfoGetter
 }
 
-data_getter_builders: dict[str, Callable[[str], DataGetter]] = {
+data_getter_builders: dict[str, Callable[[InfoGetter, dict[str, Any]], DataGetter]] = {
     "rgb": RGBDataGetter
 }
 
@@ -327,20 +345,44 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         self.data_getters = data_getters
         self.dataset_path = dataset_path
 
-    def from_config(self, config: dict[str, Any]):
-        dataset_path = config["path"]
+    @classmethod
+    def from_config(cls, config: Path | dict[str, Any]):
+        if isinstance(config, Path):
+            config = read_yaml(config)
+
+        dataset_path = Path(config["path"])
         data_tree = read_data_tree(config["data_tree"])
-        info_getter_factory = info_getter_builders[config["dataset"]](config["dataset"])
-        info_getter = info_getter_builders(data_tree["dataset"])
+        dataset_name = config["dataset"]
+
+        info_getter_factory = info_getter_builders[dataset_name]
+        info_getter = info_getter_factory()
         
-        for name, spec in config["data_getters"]:
-            
+        data_getters = {}
 
+        for data_type, spec in config["data_getters"].items():
+            data_getter_factory = data_getter_builders[data_type]
+            data_getter = data_getter_factory(info_getter, spec)
 
+            data_getters[data_type] = data_getter
+
+        return DynamicDataset(dataset_path, data_tree, info_getter, data_getters)
 
     @property
     def name(self) -> str:
-        return self.info_getter
+        return self.info_getter.dataset_name
+
+    def iter_range(self, id: int = 0, id_start: int = 0, id_stop: int = 0, verbose: bool = True):
+        assert id_start <= id <= id_stop
+
+        skip = id_stop - id_start + 1
+        start = id - id_start
+        stop = len(self)
+
+        for i in range(start, stop, skip):
+            if verbose:
+                logging.info(f"Sample {i}/{stop} (skip: {skip})")
+
+            yield self[i]
 
     def __len__(self) -> int:
         return len(self.sample_infos)

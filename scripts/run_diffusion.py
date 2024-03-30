@@ -13,28 +13,23 @@ if __name__ == "__main__":
     parser.add_argument("dataset_path", type=Path)
     parser.add_argument("output_path", type=Path)
     parser.add_argument("config_path", type=Path)
+    parser.add_argument("-id", "--id_range", nargs=3, type=int, default=None)
 
     args = parser.parse_args()
     dataset_path = args.dataset_path
     output_path = args.output_path
     config_path = args.config_path
+    id_range = args.id_range
 
     setup_project()
 
     if not dataset_path.exists():
         raise ValueError(f"Could not find dataset_path: {dataset_path}")
 
-
     config = read_yaml(config_path)
+    dataset_config = config["datasets"]["source_images"]
+    model_config = config["model"]
+    src_dataset = DynamicDataset.from_config(dataset_config)
 
-    for dataset_name, dataset in config["datasets"].items():
-        dataset_path = dataset["path"]
-        data_tree = read_data_tree(dataset["data_tree"])
-        info_getter = 
-
-    info_getter = PandasetInfoGetter()
-    data_getters = {"rgb": RGBDataGetter(info_getter, {"data_type": "rgb"})}
-    src_dataset = DynamicDataset(dataset_path, data_tree, info_getter, data_getters)
-
-    diffusion_from_config_to_dir(src_dataset, output_path, config)
+    diffusion_from_config_to_dir(src_dataset, output_path, model_config, id_range=id_range)
     

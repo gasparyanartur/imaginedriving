@@ -47,15 +47,17 @@ class DiffusionModel(ABC):
         raise NotImplementedError
 
     def diffuse_to_dir(
-        self, src_dataset: DynamicDataset, dst_dir: Path, **kwargs
+        self, src_dataset: DynamicDataset, dst_dir: Path, id_range: tuple[int, int, int] = None, **kwargs
     ) -> None:
         dst_dir.mkdir(exist_ok=True, parents=True)
 
-        for sample in src_dataset:
-            diff_img = self.diffuse_sample(sample, **kwargs)["rgb"]
+        id_range = id_range or (0, 0, 0)
+        for sample in src_dataset.iter_range(*id_range, verbose=True):
             dst_path = dst_dir / sample["dataset"] / sample["scene"] / sample["sample"]
             dst_path = dst_path.with_suffix(suffixes["rgb", src_dataset.name])
             dst_path.parent.mkdir(exist_ok=True, parents=True)
+
+            diff_img = self.diffuse_sample(sample, **kwargs)["rgb"]
             save_image(dst_path, diff_img)
 
     @abstractproperty
@@ -244,6 +246,7 @@ def diffusion_from_config_to_dir(
     dst_dir: Path,
     model_config: dict[str, Any],
     model: DiffusionModel = None,
+    id_range: tuple[int, int, int] = None
 ):
     if model_config is not None:
         model_config_params = model_config["model_config_params"]
@@ -256,7 +259,7 @@ def diffusion_from_config_to_dir(
         model = load_img2img_model(**model_config_params)
 
     dst_dir.mkdir(exist_ok=True, parents=True)
-    model.diffuse_to_dir(src_dataset, dst_dir, **model_forward_params)
-    save_yaml(model_config, dst_dir / "config.yml")
+    model.diffuse_to_dir(src_dataset, dst_dir, id_range=id_range, **model_forward_params)
+    save_yaml(dst_dir / "config.yml", model_config)
 
     logging.info(f"Finished diffusion.")
