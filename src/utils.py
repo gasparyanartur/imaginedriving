@@ -1,9 +1,11 @@
-from pathlib import Path
 from collections.abc import Iterable
+from pathlib import Path
+import os
+
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch import Tensor
-import numpy as np
 
 
 def get_device():
@@ -125,3 +127,23 @@ def recurse_param_combinations(names: list[str], values: list[tuple[Any]], idxs:
         combs.extend(recurse_param_combinations(names, values, new_idxs, memory))
     
     return combs
+
+
+def set_env(key: str, val: any) -> None:
+    os.environ[key] = str(val)
+
+
+def get_env(key: str) -> str | Path:
+    val = os.environ.get(key)
+
+    if val and (val[0] == "/") and (val_path := Path(val)).exists():
+        return val_path
+
+    return val
+
+
+def set_if_no_key(config, key, val):
+    if not config.get(key):
+        config[key] = val
+
+    return val

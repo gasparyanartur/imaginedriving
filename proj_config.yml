@@ -1,7 +1,0 @@
-project_name: ImagineDriving
-
-PROJ_DIR: null      # null: $(cwd)
-CACHE_DIR: null     # null: $(PROJ_DIR)/.cache
-
-dataset_paths:
-  pandaset: /proj/adas-data/data/pandaset

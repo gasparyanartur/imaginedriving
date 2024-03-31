@@ -3,8 +3,7 @@ from pathlib import Path
 import torch
 
 from src.diffusion import load_img2img_model, encode_img, decode_img
-from src.configuration import setup_project
-from src.data import read_image, save_image
+from src.data import read_image, save_image, setup_project
 
 
 if __name__ == "__main__":

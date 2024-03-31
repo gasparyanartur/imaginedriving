@@ -2,8 +2,10 @@ from typing import Any
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
 from collections.abc import Iterable, Generator, Callable
+import os
 from pathlib import Path
 import json
+import yaml
 
 import torch
 from torch.utils.data import Dataset
@@ -12,15 +14,52 @@ from torchvision.transforms import v2 as tvtf2
 import torchvision
 import logging
 
-from src.configuration import read_yaml
+from src.utils import get_env, set_env, set_if_no_key
 
 
 base_img_pipeline = tvtf2.Compose([tvtf2.ToDtype(torch.float32, scale=True)])
 
-suffixes = {
-    ("rgb", "pandaset"): ".jpg",
-    ("rgb", "neurad"): ".jpg"
-}
+suffixes = {("rgb", "pandaset"): ".jpg", ("rgb", "neurad"): ".jpg"}
+
+
+def get_dataset_from_path(path: Path) -> str:
+    return path.stem
+
+
+def save_yaml(path: Path, data: dict[str, Any]):
+    with open(path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False)
+
+
+def setup_project(config_path: Path = None):
+    logging.getLogger().setLevel(logging.INFO)
+
+    if not torch.cuda.is_available():
+        logging.warning(
+            f"CUDA not detected. Running on CPU. The code is not supported for CPU and will most likely give incorrect results. Proceed with caution."
+        )
+
+    proj_dir = get_env("PROJ_DIR") or Path.cwd()
+
+    if config_path is None:
+        config_path = get_env("PROJ_CONF_PATH")
+
+        if config_path is None:
+            config_path = proj_dir / "proj_config.yml"
+
+            if not config_path.exists():
+                raise ValueError(f"No config path specified")
+
+    config = read_yaml(config_path)
+
+    proj_dir = set_if_no_key(config, "PROJ_DIR", proj_dir)
+    cache_dir = set_if_no_key(config, "CACHE_DIR", proj_dir / ".cache")
+    cache_dir = config["CACHE_DIR"]
+
+    set_env("HF_HUB_CACHE", cache_dir / "hf")  # Huggingface cache dir
+    set_env("MPLCONFIGDIR", cache_dir / "mpl")  # Matplotlib cache dir
+
+    return config
 
 
 def img_float_to_img(img: Tensor):
@@ -89,10 +128,16 @@ def iter_numeric_names(start_name: str | int, end_name: str | int, fixed_len: in
         yield num
 
 
+def read_yaml(path: Path):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
 def read_data_tree(
     data_tree: dict | Path, scene_name_len: int = 3, sample_name_len: int = 2
 ):
-    if isinstance(data_tree, Path):
+    if isinstance(data_tree, (str, Path)):
+        data_tree = Path(data_tree)
         data_tree = read_yaml(data_tree)
 
     dataset_dict = {}
@@ -186,21 +231,15 @@ class PandasetInfoGetter(InfoGetter):
 
     def _get_sample_dir_path(self, dataset_path, scene, specs=None):
         if specs is None:
-            data_type = None
-            camera = None
+            data_type = "rgb"
+            camera = "front_camera"
 
         else:
-            data_type = specs.get("data_type")
-            camera = specs.get("camera")
-
-        if data_type is None:
-            data_type = "rgb"
+            data_type = specs.get("data_type", "rgb")
+            camera = specs.get("camera", "front_camera")
 
         match data_type:
             case "rgb":
-                if camera is None:
-                    camera = "front_camera"
-
                 return dataset_path / scene / "camera" / camera
 
             case "lidar":
@@ -213,14 +252,16 @@ class PandasetInfoGetter(InfoGetter):
         self, dataset_path: Path, scene: str, specs: dict[str, Any] = None
     ) -> Generator[str]:
         sample_dir_path = self._get_sample_dir_path(dataset_path, scene, specs)
-        
+
         data_type = "rgb" if specs is None else specs.get("data_type", "rgb")
         suffix = suffixes[data_type, self.dataset_name]
 
         for sample_path in sample_dir_path.glob(f"*{suffix}"):
             yield sample_path.stem
 
-    def get_path(self, dataset_path: Path, info: SampleInfo, specs: dict[str, Any]) -> Path:
+    def get_path(
+        self, dataset_path: Path, info: SampleInfo, specs: dict[str, Any]
+    ) -> Path:
         assert isinstance(info.sample, str)
 
         sample_dir_path = self._get_sample_dir_path(dataset_path, info.scene, specs)
@@ -230,60 +271,46 @@ class PandasetInfoGetter(InfoGetter):
         sample_path = (sample_dir_path / info.sample).with_suffix(suffix)
         return sample_path
 
+
 class NeuRADInfoGetter(InfoGetter):
     def __init__(self):
         super().__init__("neurad")
 
-    def __init__(self) -> None:
-        super().__init__()
-
-    def _get_sample_dir_path(self, dataset_path, scene, specs=None) -> Path:
+    def _get_sample_dir_path(self, dataset_path: Path, scene: str, specs: dict[str, Any] = None) -> Path:
         if specs is None:
-            shift = None
-            split = None
-            data_type = None
-            camera = None
+            shift = "0meter"
+            data_type = "rgb"
+            split = "test"
+            camera = "front_camera"
 
         else:
-            shift = specs.get("shift")
-            data_type = specs.get("data_type")
-            split = specs.get("split")
-            camera = specs.get("camera")
-
-        if shift is None:
-            shift = next((dataset_path / scene).iterdir()).stem
-            
-        if split is None:
-            split = next(next((dataset_path / scene).iterdir())).stem
-
-        if data_type is None:
-            data_type = "rgb"
-        
-        if camera is None:
-            camera = "front_camera"
+            shift = specs.get("shift", "0meter")
+            data_type = specs.get("data_type", "rgb")
+            split = specs.get("split", "test")
+            camera = specs.get("camera", "front_camera")
 
         match data_type:
             case "rgb":
-                data_type_name = "rgb"
+                return dataset_path / scene / shift / split / data_type / camera
+                
             case _:
-                raise ValueError
+                raise NotImplementedError
 
-        return (
-            dataset_path / scene / shift / split / data_type_name / camera
-        )
 
     def get_sample_names_in_scene(
         self, dataset_path: Path, scene: str, specs: dict[str, Any] = None
     ) -> Generator[str]:
         sample_dir_path = self._get_sample_dir_path(dataset_path, scene, specs)
-        
+
         data_type = "rgb" if specs is None else specs.get("data_type", "rgb")
         suffix = suffixes[data_type, self.dataset_name]
 
         for sample_path in sample_dir_path.glob(f"*{suffix}"):
             yield sample_path.stem
 
-    def get_path(self, dataset_path: Path, info: SampleInfo, specs: dict[str, Any]) -> Path:
+    def get_path(
+        self, dataset_path: Path, info: SampleInfo, specs: dict[str, Any]
+    ) -> Path:
         assert isinstance(info.sample, str)
 
         sample_dir_path = self._get_sample_dir_path(dataset_path, info.scene, specs)
@@ -309,7 +336,12 @@ class DataGetter(ABC):
 
 
 class RGBDataGetter(DataGetter):
-    def __init__(self, info_getter: InfoGetter, data_spec: dict[str, Any], tf_pipeline=base_img_pipeline):
+    def __init__(
+        self,
+        info_getter: InfoGetter,
+        data_spec: dict[str, Any],
+        tf_pipeline=base_img_pipeline,
+    ):
         if "data_type" not in data_spec:
             data_spec["data_type"] = "rgb"
 
@@ -320,9 +352,10 @@ class RGBDataGetter(DataGetter):
     def get_data(self, dataset_path: Path, info: SampleInfo) -> Tensor:
         return read_image(self.get_data_path(dataset_path, info), self.tf_pipeline)
 
+
 info_getter_builders: dict[str, Callable[[], InfoGetter]] = {
     "pandaset": PandasetInfoGetter,
-    "neurad": NeuRADInfoGetter
+    "neurad": NeuRADInfoGetter,
 }
 
 data_getter_builders: dict[str, Callable[[InfoGetter, dict[str, Any]], DataGetter]] = {
@@ -356,7 +389,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
 
         info_getter_factory = info_getter_builders[dataset_name]
         info_getter = info_getter_factory()
-        
+
         data_getters = {}
 
         for data_type, spec in config["data_getters"].items():
@@ -371,7 +404,9 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
     def name(self) -> str:
         return self.info_getter.dataset_name
 
-    def iter_range(self, id: int = 0, id_start: int = 0, id_stop: int = 0, verbose: bool = True):
+    def iter_range(
+        self, id: int = 0, id_start: int = 0, id_stop: int = 0, verbose: bool = True
+    ):
         assert id_start <= id <= id_stop
 
         skip = id_stop - id_start + 1
@@ -421,7 +456,3 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
                 matches.append((sample_self, sample_other))
 
         return matches
-
-
-def get_dataset_from_path(path: Path) -> str:
-    return path.stem

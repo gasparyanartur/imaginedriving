@@ -25,7 +25,7 @@ from src.data import (
     DynamicDataset,
     suffixes
 )
-from src.configuration import save_yaml
+from src.data import save_yaml
 
 
 default_prompt = "dashcam recording, urban driving scene, video, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"

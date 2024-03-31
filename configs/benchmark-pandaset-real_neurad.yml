@@ -1,0 +1,29 @@
+project_name: ImagineDriving
+
+PROJ_DIR: null      # null: $(cwd)
+CACHE_DIR: null     # null: $(PROJ_DIR)/.cache
+
+datasets:
+  gts:
+    dataset: pandaset
+    path: "/proj/adas-data/data/pandaset"
+    data_getters:
+      rgb:
+        camera: front_camera
+    data_tree: 
+      pandaset: 
+        001-003: "*"
+
+  preds:
+    dataset: neurad
+    path: /proj/nlp4adas/master-thesis-shared/renders/neurad/pandaset
+    data_getters:
+      rgb:
+        camera: front_camera
+        shift: 0meter
+        split: test
+    data_tree:
+      neurad:
+        001-003: "*"
+
+output_dir: /proj/nlp4adas/master-thesis-shared/benchmarks/pandaset-real_neural

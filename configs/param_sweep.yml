@@ -1,8 +1,12 @@
+project_name: ImagineDriving
+
+PROJ_DIR: null      # null: $(cwd)
+CACHE_DIR: null     # null: $(PROJ_DIR)/.cache
+
 datasets:
   source_images:
     dataset: pandaset
     path: "/proj/adas-data/data/pandaset"
-    info_getter: {}
     data_getters:
       rgb:
         camera: "front_camera"
@@ -58,4 +62,4 @@ experiments:
       base_strength: 0.5
       base_num_steps: 50
 
-output_dir: /proj/nlp4adas/master-thesis-shared/output/sweep
+output_dir: /proj/nlp4adas/master-thesis-shared/output/param_sweep

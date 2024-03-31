@@ -1,5 +1,5 @@
 from typing import Any
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, abstractproperty
 from collections.abc import Iterable
 import logging
 
@@ -15,12 +15,14 @@ from src.utils import batch_if_not_iterable, get_device
 
 def get_mean_aggregate(
     single_function,
-    preds: DynamicDataset | Iterable[Tensor] | Tensor,
-    gts: DynamicDataset | Iterable[Tensor] | Tensor,
+    preds: DynamicDataset,
+    gts: DynamicDataset,
     mean_value: bool = True,
     match_attrs=("scene", "sample"),
+    data_type="rgb",
+    device=get_device(),
 ) -> float:
-    running_value = torch.zeros(1, dtype=torch.float32, device=preds.device)
+    running_value = torch.zeros(1, dtype=torch.float32, device=device)
     count = 0
 
     if isinstance(preds, DynamicDataset) or isinstance(gts, DynamicDataset):
@@ -47,13 +49,13 @@ def get_mean_aggregate(
     return running_value.item()
 
 
-class Metric(ABC):
+class BaseMetric(ABC):
     def __init__(self, name) -> None:
         super().__init__()
         self.name = name
 
 
-class SingleMetric(Metric, ABC):
+class SingleMetric(BaseMetric, ABC):
     @abstractmethod
     def execute_single(self, pred: dict[str, Any], gt: dict[str, Any]) -> float:
         raise NotImplementedError
@@ -62,7 +64,7 @@ class SingleMetric(Metric, ABC):
         self,
         preds: DynamicDataset,
         gts: DynamicDataset,
-        match_attrs: tuple[str] = ("scene", "sample"),
+        match_attrs=("scene", "sample"),
     ) -> dict[tuple[str], float]:
         if not isinstance(preds, DynamicDataset) and not isinstance(
             gts, DynamicDataset
@@ -77,7 +79,7 @@ class SingleMetric(Metric, ABC):
         return metrics
 
 
-class AggregateMetric(Metric, ABC):
+class AggregateMetric(BaseMetric, ABC):
     @abstractmethod
     def execute_aggregate(
         self,
@@ -90,16 +92,18 @@ class AggregateMetric(Metric, ABC):
 
 class DefaultMetricWrapper(SingleMetric, AggregateMetric):
     def __init__(
-        self, name, model, device, require_batch: bool = True, data_type: str = "rgb"
+        self, name: str, model, device=get_device(), require_batch: bool = True, data_type: str = "rgb"
     ) -> None:
         super().__init__(name)
         self.model = model.to(device)
         self.require_batch: bool = require_batch
         self.data_type = data_type
 
-    def execute_single(self, pred: dict[str, Any], gt: dict[str, Any]) -> float:
-        pred = pred[self.data_type]
-        pred = pred[self.data_type]
+    def execute_single(
+        self, pred: dict[str, Any], gt: dict[str, Any], device=get_device()
+    ) -> float:
+        pred = pred[self.data_type].to(device)
+        gt = gt[self.data_type].to(device)
 
         if self.require_batch:
             pred = batch_if_not_iterable(pred)
@@ -111,29 +115,50 @@ class DefaultMetricWrapper(SingleMetric, AggregateMetric):
         self,
         preds: DynamicDataset,
         gts: DynamicDataset,
+        match_attrs: tuple[str] = ("scene", "sample"),
     ) -> dict[tuple[str], float]:
         return get_mean_aggregate(
-            lambda pred, gt: self.execute_single(pred, gt), preds, gts, mean_value=True
+            lambda pred, gt: self.execute_single(pred, gt),
+            preds,
+            gts,
+            mean_value=True,
+            data_type=self.data_type,
+            match_attrs=match_attrs,
         )
 
 
 class PSNRMetric(DefaultMetricWrapper):
     def __init__(
-        self, name="psnr", data_range=(0, 1), device=get_device(), **kwargs
+        self,
+        name="psnr",
+        data_range=(0, 1),
+        device=get_device(),
+        data_type: str = "rgb",
+        **kwargs,
     ) -> None:
         super().__init__(
-            name, PeakSignalNoiseRatio(data_range=data_range), device=device, **kwargs
+            name,
+            PeakSignalNoiseRatio(data_range=data_range),
+            device=device,
+            data_type=data_type,
+            **kwargs,
         )
 
 
 class SSIMMetric(DefaultMetricWrapper):
     def __init__(
-        self, name="ssim", data_range=(0, 1), device=get_device(), **kwargs
+        self,
+        name="ssim",
+        data_range=(0, 1),
+        device=get_device(),
+        data_type: str = "rgb",
+        **kwargs,
     ) -> None:
         super().__init__(
             name,
             model=StructuralSimilarityIndexMeasure(data_range=data_range),
             device=device,
+            data_type=data_type,
             **kwargs,
         ),
 
@@ -145,6 +170,7 @@ class LPIPSMetric(DefaultMetricWrapper):
         net_type: str = "squeeze",
         normalize=True,
         device=get_device(),
+        data_type: str = "rgb",
         **kwargs,
     ) -> None:
         super().__init__(
@@ -153,6 +179,7 @@ class LPIPSMetric(DefaultMetricWrapper):
                 net_type=net_type, normalize=normalize, **kwargs
             ),
             device=device,
+            data_type=data_type
         )
 
 
@@ -174,16 +201,23 @@ class FIDMetric(AggregateMetric):
         )
         self.data_type = data_type
 
-    def execute_aggregate(self, preds: DynamicDataset, gts: DynamicDataset) -> float:
+    def execute_aggregate(
+        self,
+        preds: DynamicDataset,
+        gts: DynamicDataset,
+        match_attrs=("scene",),
+        device=get_device(),
+    ) -> float:
         self.model.reset()
 
-        for gt in gts:
-            gt = gt[self.data_type]
+        matching_gts = preds.get_matching(gts, match_attrs=match_attrs)
+        for _, gt in matching_gts:
+            gt = gt[self.data_type].to(device)
             gt = batch_if_not_iterable(gt).double()
             self.model.update(gt, real=True)
 
         for pred in preds:
-            pred = pred[self.data_type]
+            pred = pred[self.data_type].to(device)
             pred = batch_if_not_iterable(pred).double()
             self.model.update(pred, real=False)
 
@@ -204,23 +238,22 @@ def run_benchmark_suite(
     gts: DynamicDataset,
     aggregate_metrics: list[AggregateMetric] = default_aggregate_metrics,
     single_metrics: list[SingleMetric] = default_single_metrics,
-    match_attrs: tuple[str] = ("scene", "sample"),
 ):
     metrics = {}
 
     with torch.no_grad():
         metrics["aggregate"] = {
-            aggregate_metric.name: aggregate_metric.execute_aggregate(
-                preds, gts, match_attrs=match_attrs
-            )
+            aggregate_metric.name: aggregate_metric.execute_aggregate(preds, gts)
             for aggregate_metric in aggregate_metrics
         }
-        metrics["single"] = {
-            single_metric.name: single_metric.execute_map(
-                preds, gts, match_attrs=match_attrs
-            )
-            for single_metric in single_metrics
-        }
+
+        # Go from query: metrics to query[1]/query[2]: ...: sample: metrics
+        metrics["single"] = {}
+
+        for single_metric in single_metrics:
+            values = single_metric.execute_map(preds, gts)
+            new_values = {"/".join(query): metric for query, metric in values.items()}
+
+            metrics["single"][single_metric.name] = new_values
 
     return metrics
-
