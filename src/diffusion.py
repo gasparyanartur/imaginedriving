@@ -5,9 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import logging
 
-import PIL
 import torch
-import torchvision.transforms.v2 as tvtf2
 from torch import Tensor
 
 from diffusers import StableDiffusionXLImg2ImgPipeline
@@ -22,9 +20,12 @@ from src.utils import (
     validate_same_len,
     batch_if_not_iterable,
 )
-from src.data import read_image, save_image, NamedImageDataset, DirectoryDataset
-from src.benchmark import benchmark_single_metrics, benchmark_aggregate_metrics
-from src.configuration import save_yaml
+from src.data import (
+    save_image,
+    DynamicDataset,
+    suffixes
+)
+from src.data import save_yaml
 
 
 default_prompt = "dashcam recording, urban driving scene, video, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
@@ -38,20 +39,26 @@ class ModelId:
     sdxl_turbo = "stabilityai/sdxl-turbo"
 
 
-class ImgToImgModel(ABC):
+class DiffusionModel(ABC):
     load_model = None
 
     @abstractmethod
-    def img_to_img(self, img: Tensor, *args, **kwargs) -> dict[str, Any]:
+    def diffuse_sample(self, sample: dict[str, Any], *args, **kwargs) -> dict[str, Any]:
         raise NotImplementedError
 
-    def diffuse_to_dir(self, src_dataset: NamedImageDataset, dst_dir: Path, **kwargs) -> None:
+    def diffuse_to_dir(
+        self, src_dataset: DynamicDataset, dst_dir: Path, id_range: tuple[int, int, int] = None, **kwargs
+    ) -> None:
         dst_dir.mkdir(exist_ok=True, parents=True)
 
-        for name, img in src_dataset:
-            diff_img = self.img_to_img(img, **kwargs)["image"]
-            diff_img_name = (dst_dir / name).with_suffix(".jpg")
-            save_image(diff_img_name, diff_img)
+        id_range = id_range or (0, 0, 0)
+        for sample in src_dataset.iter_range(*id_range, verbose=True):
+            dst_path = dst_dir / sample["dataset"] / sample["scene"] / sample["sample"]
+            dst_path = dst_path.with_suffix(suffixes["rgb", src_dataset.name])
+            dst_path.parent.mkdir(exist_ok=True, parents=True)
+
+            diff_img = self.diffuse_sample(sample, **kwargs)["rgb"]
+            save_image(dst_path, diff_img)
 
     @abstractproperty
     def vae(self):
@@ -60,8 +67,9 @@ class ImgToImgModel(ABC):
     @abstractproperty
     def image_processor(self):
         raise NotImplementedError
-        
-class SDXLFull(ImgToImgModel):
+
+
+class SDXLFull(DiffusionModel):
     def __init__(
         self,
         base_model_id: str = ModelId.sdxl_base,
@@ -79,18 +87,22 @@ class SDXLFull(ImgToImgModel):
             use_safetensors=True,
         ).to(device)
 
-        self.refiner_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-            refiner_model_id,
-            text_encoder_2=self.base_pipe.text_encoder_2,
-            vae=self.base_pipe.vae,
-            torch_dtype=torch.float16,
-            use_safetensors=True,
-            variant="fp16",
-        ).to(device) if self.use_refiner else None
+        self.refiner_pipe = (
+            StableDiffusionXLImg2ImgPipeline.from_pretrained(
+                refiner_model_id,
+                text_encoder_2=self.base_pipe.text_encoder_2,
+                vae=self.base_pipe.vae,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+                variant="fp16",
+            ).to(device)
+            if self.use_refiner
+            else None
+        )
 
-    def img_to_img(
+    def diffuse_sample(
         self,
-        img: Tensor,
+        sample: dict[str, Any],
         base_strength: float = 0.2,
         refiner_strength: float = 0.2,
         base_denoising_start: int = None,
@@ -108,20 +120,16 @@ class SDXLFull(ImgToImgModel):
         base_kwargs: dict[str, any] = None,
         refiner_kwargs: dict[str, any] = None,
     ):
-        print(f"VAE CONFIG")
-        print(self.vae.config)
-        print()
-        print(f"IMAGE PROCESSOR CONFIG")
-        print(self.image_processor.config)
+        image = sample["rgb"]
 
-        img = batch_if_not_iterable(img)
+        image = batch_if_not_iterable(image)
         base_gen = batch_if_not_iterable(base_gen)
         refiner_gen = batch_if_not_iterable(refiner_gen)
-        validate_same_len(img, base_gen, refiner_gen)
+        validate_same_len(image, base_gen, refiner_gen)
 
         base_kwargs = base_kwargs or {}
-        img = self.base_pipe(
-            image=img,
+        image = self.base_pipe(
+            image=image,
             generator=base_gen,
             output_type="latent" if self.use_refiner else "pt",
             strength=base_strength,
@@ -132,13 +140,13 @@ class SDXLFull(ImgToImgModel):
             target_size=target_size,
             prompt=prompt,
             negative_prompt=negative_prompt,
-            **base_kwargs
+            **base_kwargs,
         ).images
 
         if self.use_refiner:
             refiner_kwargs = refiner_kwargs or {}
-            img = self.refiner_pipe(
-                image=img,
+            image = self.refiner_pipe(
+                image=image,
                 generator=refiner_gen,
                 output_type="pt",
                 strength=refiner_strength,
@@ -149,10 +157,10 @@ class SDXLFull(ImgToImgModel):
                 target_size=target_size,
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                **refiner_kwargs
+                **refiner_kwargs,
             ).images
 
-        return {"image": img}
+        return {"rgb": image}
 
     @property
     def vae(self) -> AutoencoderKL:
@@ -213,7 +221,7 @@ def upcast_vae(vae):
     return vae
 
 
-def load_img2img_model(**kwargs: dict[str, Any]) -> ImgToImgModel:
+def load_img2img_model(**kwargs: dict[str, Any]) -> DiffusionModel:
     logging.info(f"Loading diffusion model...")
 
     match kwargs.get("model_name"):
@@ -222,7 +230,7 @@ def load_img2img_model(**kwargs: dict[str, Any]) -> ImgToImgModel:
             refiner_model_id = None
 
             model = SDXLFull(base_model_id, refiner_model_id)
-        
+
         case _:
             raise NotImplementedError
 
@@ -230,27 +238,28 @@ def load_img2img_model(**kwargs: dict[str, Any]) -> ImgToImgModel:
     return model
 
 
-ImgToImgModel.load_model = load_img2img_model
+DiffusionModel.load_model = load_img2img_model
 
 
-def diffusion_from_config_to_dir(src_dataset: NamedImageDataset, dst_dir: Path, model_config: dict[str, Any], device=get_device(), model: ImgToImgModel = None):
+def diffusion_from_config_to_dir(
+    src_dataset: DynamicDataset,
+    dst_dir: Path,
+    model_config: dict[str, Any],
+    model: DiffusionModel = None,
+    id_range: tuple[int, int, int] = None
+):
     if model_config is not None:
-        model_config_params = model_config["model_config_params"] 
+        model_config_params = model_config["model_config_params"]
         model_forward_params = model_config["model_forward_params"]
     else:
         model_config_params = {}
         model_forward_params = {}
 
-
     if model is None:
         model = load_img2img_model(**model_config_params)
 
     dst_dir.mkdir(exist_ok=True, parents=True)
-    model.diffuse_to_dir(src_dataset, dst_dir, **model_forward_params)
-
-    dst_dataset = DirectoryDataset.from_directory(dst_dir, device=device)
-    benchmark_single_metrics(dst_dataset, src_dataset).to_csv(dst_dir / "single-metrics.csv")
-    benchmark_aggregate_metrics(dst_dataset, src_dataset).to_csv(dst_dir / "aggregate-metrics.csv")
+    model.diffuse_to_dir(src_dataset, dst_dir, id_range=id_range, **model_forward_params)
     save_yaml(dst_dir / "config.yml", model_config)
 
     logging.info(f"Finished diffusion.")

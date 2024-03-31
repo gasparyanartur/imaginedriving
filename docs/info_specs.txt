@@ -1,0 +1,17 @@
+{
+    "data_type": sample_path,  # (optional) "rgb" (default)
+}
+
+# if data_type == rgb
+{
+    "data_type": rgb
+    "camera": "front_camera"        # (optional) front_camera (default)
+    "split": "test"                 # (optional) test(default)
+}
+
+# Pandaset specific:
+...
+
+
+# NeuRAD specific:
+    "split"

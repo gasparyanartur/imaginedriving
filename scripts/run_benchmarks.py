@@ -1,45 +1,29 @@
 import argparse
 from pathlib import Path
 
-from src.data import DirectoryDataset
-from src.benchmark import benchmark_single_metrics, benchmark_aggregate_metrics
+from src.data import save_json, read_data_tree, DynamicDataset, setup_project
+from src.benchmark import run_benchmark_suite
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("run_benchmarks")
 
-    parser.add_argument("pred_dir", type=Path)
-    parser.add_argument("gt_dir", type=Path)
-    parser.add_argument("--save_dir", type=Path, default=None)
-    parser.add_argument("--silent", action="store_true")
+    parser.add_argument("config_path", type=Path)
 
     args = parser.parse_args()
+    config_path = args.config_path
 
-    pred_dataset = DirectoryDataset.from_directory(args.pred_dir) 
-    gt_dataset = DirectoryDataset.from_directory(args.gt_dir)
+    config = setup_project(config_path)
 
-    single_metrics = benchmark_single_metrics(pred_dataset, gt_dataset)
-    aggregate_metrics = benchmark_aggregate_metrics(pred_dataset, gt_dataset)
+    dataset_config = config["datasets"]
+    preds_config = dataset_config["preds"]
+    gts_config = dataset_config["gts"]
 
-    if not args.silent:
-        print()
-        print(f"Running benchmarks:")
-        print(f"\tpred: {args.pred_dir}")
-        print(f"\tgt: {args.gt_dir}")
-        print()
-        print("========================")
-        print("===== Sin. Metrics =====")
-        print("========================")
-        print(single_metrics)
-        print()
-        print("========================")
-        print("===== Agg. Metrics =====")
-        print("========================")
-        print(aggregate_metrics)
-        print()
+    output_dir = Path(config["output_dir"])
+    output_dir.mkdir(exist_ok=True, parents=True)
 
-    if args.save_dir:
-        args.save_dir.mkdir(exist_ok=True, parents=True)
+    preds_dataset = DynamicDataset.from_config(preds_config)
+    gts_dataset = DynamicDataset.from_config(gts_config)
 
-        single_metrics.to_csv(args.save_dir / "single_metrics.csv") 
-        aggregate_metrics.to_csv(args.save_dir / "aggregate_metrics.csv") 
+    metrics = run_benchmark_suite(preds_dataset, gts_dataset)
+    save_json(output_dir / "metrics.json", metrics) 
