@@ -1,18 +1,62 @@
 from pathlib import Path
 from argparse import ArgumentParser
+import logging
+import os
 
 import torch
+import transformers
 from transformers import AutoTokenizer, AutoModelForTextEncoding
+from transformers import AutoTokenizer, PretrainedConfig
+import diffusers
+from diffusers.utils import check_min_version, is_wandb_available
+import datasets
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration, set_seed
+from huggingface_hub import create_repo, upload_folder
+import wandb
 
 from src.data import setup_project
 
 
+check_min_version("0.23.0.dev0")
+
+logger = get_logger(__name__)
+
+
+
+def import_model_class_from_model_name_or_path(
+    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
+):
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path, subfolder=subfolder, revision=revision
+    )
+    model_class = text_encoder_config.architectures[0]
+
+    if model_class == "CLIPTextModel":
+        from transformers import CLIPTextModel
+
+        return CLIPTextModel
+    elif model_class == "CLIPTextModelWithProjection":
+        from transformers import CLIPTextModelWithProjection
+
+        return CLIPTextModelWithProjection
+    else:
+        raise ValueError(f"{model_class} is not supported.")
+
+
+
+
 def parse_args():
-    parser = ArgumentParser("train_model", description="Finetune a given model on a dataset")
+    parser = ArgumentParser(
+        "train_model", description="Finetune a given model on a dataset"
+    )
     parser.add_argument("config_path", type=Path)
-    
+
+
     args = parser.parse_args()
     return args
+
 
 def embed_prompt(prompt: str, tokenizers, text_encoders):
     prompt_embeds_list = []
@@ -38,11 +82,14 @@ def embed_prompt(prompt: str, tokenizers, text_encoders):
             prompt_embeds = prompt_embeds.hidden_states[-2]
             bs_embed, seq_len, _ = prompt_embeds.shape
             prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
-    
+
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
 
-    return {"prompt_embeds": prompt_embeds.cpu(), "pooled_prompt_embeds": pooled_prompt_embeds.cpu()}        
+    return {
+        "prompt_embeds": prompt_embeds.cpu(),
+        "pooled_prompt_embeds": pooled_prompt_embeds.cpu(),
+    }
 
 
 def compute_vae_encodings(batch, vae):
@@ -55,6 +102,7 @@ def compute_vae_encodings(batch, vae):
         model_input = vae.encode(pixel_values).latent_dist.sample()
     model_input = model_input * vae.config.scaling_factor
     return {"model_input": model_input.cpu()}
+
 
 def generate_timestep_weights(args, num_timesteps):
     weights = torch.ones(num_timesteps)
@@ -97,16 +145,89 @@ def generate_timestep_weights(args, num_timesteps):
     return weights
 
 
-
 def main(args):
+    # ========================
+    # ===   Setup script   ===
+    # ========================
+
+
     config_path = args.config_path
     config = setup_project(config_path)
-    
+
+    output_dir = Path(config["output_dir"])
+    logging_dir = output_dir / "logs"
+
+    model_config = config["model"]
+
+    accelerator_project_config = ProjectConfiguration(
+        project_dir=output_dir, logging_dir=logging_dir
+    )
+    accelerator = Accelerator(
+        mixed_precision=model_config["mixed_precision"],
+        log_with=model_config["log_with"],
+        project_config=accelerator_project_config
+    )
+
+   # Make one log on every process with the configuration for debugging.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_local_main_process:
+        datasets.utils.logging.set_verbosity_warning()
+        transformers.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
+    else:
+        datasets.utils.logging.set_verbosity_error()
+        transformers.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
+
+    # If passed along, set the training seed now.
+    if (seed := model_config.get("seed")) is not None:
+        set_seed(seed)
+
+    # Handle the repository creation
+    if accelerator.is_main_process:
+        output_dir.mkdir(exist_ok=True, parents=True)
+        logging_dir.mkdir(exist_ok=True)
+
+        if model_config["push_to_hub"]:
+            #repo_id = create_repo(
+            #    repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+            #).repo_id
+            raise NotImplementedError
+
+    # Sanity checks
+    assert is_wandb_available()
+
+    # =======================
+    # ===   Load models   ===
+    # =======================
+
+    model_id = model_config["pretrained_model_name_or_path"]
+    tokenizer_one = AutoTokenizer.from_pretrained(
+        model_id, subfolder="tokenizer", use_fast=False
+    )
+    tokenizer_two = AutoTokenizer.from_pretrained(
+        model_id, subfolder="tokenizer_2", use_fast=False
+    )
+
+    # ======================
+    # ===   Setup data   ===
+    # ======================
+
+    # TODO
     prompt = config["prompt"]
     prompt_embed = embed_prompt(prompt)
-    
 
-    print(args)
+    # =======================
+    # ===   Train model   ===
+    # =======================
+    
+    # TODO
+    ...
 
 
 if __name__ == "__main__":

@@ -1,0 +1,53 @@
+project_name: ImagineDriving
+
+PROJ_DIR: null      # null: $(cwd)
+CACHE_DIR: null     # null: $(PROJ_DIR)/.cache
+
+datasets:
+  train_data:
+    dataset: pandaset
+    path: "/proj/adas-data/data/pandaset"
+    data_getters:
+      rgb:
+        camera: "front_camera"
+
+    data_tree: 
+      pandaset: 
+        001-003: "*"
+
+  val_data: 
+    train_data:
+    dataset: pandaset
+    path: "/proj/adas-data/data/pandaset"
+    data_getters:
+      rgb:
+        camera: "front_camera"
+
+    data_tree: 
+      pandaset: 
+        004: "*"
+
+prompt: "dashcam recording, urban driving scene, video, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
+negative_prompt: "face, human features, unrealistic, artifacts, blurry, noisy image, NeRF, oil-painting, art, drawing, poor geometry, oversaturated, undersaturated, distorted, bad image, bad photo"
+
+model:
+  model_name: sdxlbase
+  model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+  vae_id: "madebyollin/sdxl-vae-fp16-fix"    # https://github.com/huggingface/diffusers/pull/4038
+  revision: null
+  variant: null
+  max_train_samples: null
+  resolution: 1024
+  seed: 0
+  train_batch_size: 16
+  learning_rate: 0.0001
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.01
+  adam_epsilon: 1e-8
+  max_grad_norm: 1.0
+  mixed_precision: null
+  rank: 4
+  log_with: wandb
+
+output_dir: /proj/nlp4adas/master-thesis-shared/models/finetune-sdxl
