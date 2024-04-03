@@ -47,7 +47,7 @@ model:
   adam_epsilon: 1e-8
   max_grad_norm: 1.0
   mixed_precision: null
-  rank: 4
+  lora_rank: 4
   log_with: wandb
 
 output_dir: /proj/nlp4adas/master-thesis-shared/models/finetune-sdxl
