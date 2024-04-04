@@ -7,17 +7,18 @@ from pathlib import Path
 import json
 import yaml
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torch import Tensor
-from torchvision.transforms import v2 as tvtf2
+from torchvision.transforms import v2 as transform
 import torchvision
 import logging
 
 from src.utils import get_env, set_env, set_if_no_key
 
 
-base_img_pipeline = tvtf2.Compose([tvtf2.ToDtype(torch.float32, scale=True)])
+default_img_pipeline = transform.Compose([transform.ToDtype(torch.float32, scale=True)])
 
 suffixes = {("rgb", "pandaset"): ".jpg", ("rgb", "neurad"): ".jpg"}
 
@@ -83,7 +84,7 @@ def load_img_paths_from_dir(dir_path: Path):
 
 
 def read_image(
-    img_path: Path, tf_pipeline: tvtf2.Compose = base_img_pipeline
+    img_path: Path, tf_pipeline: transform.Compose = default_img_pipeline
 ) -> Tensor:
     img = torchvision.io.read_image(str(img_path))
     img = tf_pipeline(img)
@@ -335,22 +336,49 @@ class DataGetter(ABC):
         raise NotImplementedError
 
 
+
 class RGBDataGetter(DataGetter):
     def __init__(
         self,
         info_getter: InfoGetter,
         data_spec: dict[str, Any],
-        tf_pipeline=base_img_pipeline,
     ):
         if "data_type" not in data_spec:
             data_spec["data_type"] = "rgb"
 
         self.info_getter = info_getter
         self.data_spec = data_spec
-        self.tf_pipeline = tf_pipeline
+
+        rgb_dtype = self.data_spec.get("dtype", torch.float32)
+        rescale = self.data_spec.get("rescale", True)
+        width = self.data_spec.get("width", 1920)
+        height = self.data_spec.get("height", 1080)
+
+        if width is None:
+            width = height
+
+        elif height is None:
+            height = width
+
+        self.base_transform = transform.Compose(
+            [
+                transform.ToDtype(rgb_dtype, scale=rescale),
+                transform.Resize((height, width))
+            ]
+        )
+        self.extra_transform: transform.Compose = None
+
+    def set_extra_transforms(self, *transforms: transform.Transform) -> None:
+        self.extra_transform = transform.Compose(transforms)
 
     def get_data(self, dataset_path: Path, info: SampleInfo) -> Tensor:
-        return read_image(self.get_data_path(dataset_path, info), self.tf_pipeline)
+        rgb = read_image(self.get_data_path(dataset_path, info), self.base_transform)
+
+        if self.extra_transform:
+            rgb = self.extra_transform(rgb)
+
+        return rgb
+
 
 
 info_getter_builders: dict[str, Callable[[], InfoGetter]] = {
@@ -377,6 +405,27 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         self.info_getter = info_getter
         self.data_getters = data_getters
         self.dataset_path = dataset_path
+
+        self.reset_index()
+
+    def reset_index(self):
+        self.idxs = np.arange(len(self.sample_infos))
+
+    def shuffle_index(self):
+        np.random.shuffle(self.idxs)
+
+    def limit_size(self, size: float | int):
+        if size is None:
+            size = self.true_len
+
+        elif isinstance(size, float):
+            size = int(self.true_len * size)
+
+        self.idxs = self.idxs[:size]
+
+    @property
+    def true_len(self):
+        return len(self.sample_infos)
 
     @classmethod
     def from_config(cls, config: Path | dict[str, Any]):
@@ -420,13 +469,15 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
             yield self[i]
 
     def __len__(self) -> int:
-        return len(self.sample_infos)
+        return len(self.idxs)
 
     def __iter__(self) -> Generator[dict[str, Any]]:
         for i in range(len(self)):
             yield self[i]
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        i = self.idxs[idx]
+
         info = self.sample_infos[idx]
         sample = asdict(info)
 

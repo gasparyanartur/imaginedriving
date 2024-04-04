@@ -42,7 +42,6 @@ model:
   revision: null
   variant: null
   max_train_samples: null
-  resolution: 1024
   seed: 0
   train_batch_size: 16
   learning_rate: 0.0001
