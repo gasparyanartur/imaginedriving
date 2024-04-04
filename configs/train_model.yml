@@ -10,6 +10,8 @@ datasets:
     data_getters:
       rgb:
         camera: "front_camera"
+        height: 1080
+        width: 1920
 
     data_tree: 
       pandaset: 
@@ -22,18 +24,21 @@ datasets:
     data_getters:
       rgb:
         camera: "front_camera"
+        height: 1080
+        width: 1920
 
     data_tree: 
       pandaset: 
         004: "*"
 
-prompt: "dashcam recording, urban driving scene, video, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
-negative_prompt: "face, human features, unrealistic, artifacts, blurry, noisy image, NeRF, oil-painting, art, drawing, poor geometry, oversaturated, undersaturated, distorted, bad image, bad photo"
 
 model:
   model_name: sdxlbase
   model_id: "stabilityai/stable-diffusion-xl-base-1.0"
   vae_id: "madebyollin/sdxl-vae-fp16-fix"    # https://github.com/huggingface/diffusers/pull/4038
+
+  prompt: "dashcam video, self-driving car, urban driving scene"
+  negative_prompt: ""
   revision: null
   variant: null
   max_train_samples: null
