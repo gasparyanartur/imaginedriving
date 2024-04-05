@@ -1,34 +1,16 @@
 name: env-diffusion
 channels:
   - conda-forge 
+  - anaconda
   - pytorch 
   - nvidia 
-  - huggingface 
-  - xformers 
-  - anaconda
 dependencies:
   - python=3.11
   - pytorch=2.2.0
-  - torchvision
-  - lightning
-  - torchmetrics
   - pytorch-cuda
-  - transformers
-  - accelerate
-  - diffusers
-  - safetensors
-  - matplotlib
-  - scipy
-  - pandas
+  - nb_conda_kernels
   - jupyter
   - jupyterlab
-  - nb_conda_kernels
-  - tqdm
-  - pyyaml
   - pip
   - pip:
-    - peft
-    - torchmetrics[image]
-    - torch-fidelity
-    - clip-interrogator
-    - wandb
+      - uv

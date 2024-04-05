@@ -27,6 +27,8 @@ RUN cd /tmp && \
 COPY environment.yml .
 RUN mamba env update -f environment.yml 
 
+SHELL ["/bin/bash", "-c"]
+
 # Create nonroot user, setup env
 RUN useradd -m -d /home/user -g root -G sudo -u 1000 user
 RUN usermod -aG sudo user
@@ -42,7 +44,14 @@ ENV PATH="${PATH}:/home/user/.local/bin"
 
 RUN echo "source activate env-diffusion" > ~/.bashrc
 ENV PATH /opt/mambaforge/envs/env-diffusion/bin:$PATH
+ENV CONDA_PREFIX /opt/mambaforge/envs/env-diffusion
 
 SHELL ["/bin/bash", "-c"]
+
+COPY requirements-base.txt .
+COPY requirements-extra.txt .
+RUN pip install --user -r requirements-base.txt
+RUN pip install --user -r requirements-extra.txt
+
 
 WORKDIR /workspace
