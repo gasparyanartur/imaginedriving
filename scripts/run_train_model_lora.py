@@ -8,7 +8,7 @@ import math
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import transformers
 import torchvision.transforms.v2 as transforms
 from transformers import AutoTokenizer, PretrainedConfig
@@ -211,6 +211,35 @@ def preprocess_rgb(
         "crop_top_lefts": crop_top_lefts,
         "pixel_values": all_rgbs,
     }
+
+
+class TrainLoraDataset(Dataset):
+    def __init__(self, dataset: DynamicDataset, prompt_embeds_one, prompt_embeds_two, resizer, flipper, cropper, target_size, center_crop, device) -> None:
+        super().__init__()
+
+        self.dataset = dataset
+        self.prompt_embeds_one = prompt_embeds_one
+        self.prompt_embeds_two = prompt_embeds_two
+        self.resizer = resizer
+        self.flipper = flipper
+        self.cropper = cropper
+        self.target_size = target_size
+        self.center_crop = center_crop
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        sample = self.dataset[idx]
+        
+        sample_pp = {
+            "prompt_embeds_one": self.prompt_embeds_one,
+            "prompt_embeds_two": self.prompt_embeds_two,
+            **preprocess_rgb(sample, self.resizer, self.flipper, self.cropper, self.target_size, self.center_crop), 
+        }
+        
+        return sample_pp
+
 
 
 @dataclass(init=True)
@@ -629,6 +658,37 @@ def main(args):
     def collate_fn(batch: Iterable[dict[str, Any]]) -> dict[str, Iterable[Any]]:
         # TODO
 
+        pixel_values = []
+        original_sizes = []
+        crop_top_lefts = []
+        prompt_embeds_ones = []
+        prompt_embeds_twos = []
+
+        for sample in batch:
+            pixel_values.append(batch["pixel_values"])
+            original_sizes.append(batch["original_sizes"])
+            crop_top_lefts.append(batch["crop_top_left"])
+            prompt_embeds_ones.append(batch["prompt_embeds_one"])
+            prompt_embeds_twos.append(batch["prompt_embeds_two"])
+
+        pixel_values = torch.stack(pixel_values).to(memory_format=torch.contiguous_format, dtype=torch.float32)
+        prompt_embeds_ones = torch.stack(prompt_embeds_ones)
+        prompt_embeds_twos = torch.stack(prompt_embeds_twos)
+
+
+        result = {
+            "pixel_values": pixel_values,
+            "input_ids_one": input_ids_one,
+            "input_ids_two": input_ids_two,
+            "original_sizes": original_sizes,
+            "crop_top_lefts": crop_top_lefts,
+        }
+
+        filenames = [example["filenames"] for example in batch if "filenames" in example]
+        if filenames:
+            result["filenames"] = filenames
+        return result
+        
         result = {
             "pixel_values": None,
             "prompt_embeds_one": None,
