@@ -1,15 +1,19 @@
-FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:11.4.3-cudnn8-devel-ubuntu20.04
 
-ENV PYTHONNOUSERSITE=True
+
+# Set environment variables.
 ## Set non-interactive to prevent asking for user inputs blocking image creation.
 ENV DEBIAN_FRONTEND=noninteractive
 ## Set timezone as it is required by some packages.
 ENV TZ=Europe/Berlin
 ## CUDA Home, required to find CUDA in some packages.
 ENV CUDA_HOME="/usr/local/cuda"
+
+ENV PYTHONNOUSERSITE=True
+## CUDA Home, required to find CUDA in some packages.
 ENV PATH=/opt/mambaforge/bin:$PATH
-ENV HF_HOME=/proj/nlp4adas/master-thesis-shared/nerf-thesis/.cache
-ENV MPLCONFIGDIR=/proj/nlp4adas/master-thesis-shared/nerf-thesis/.cache
+ENV HF_HOME=/staging/agp/masterthesis/nerf-thesis-shared/cache/.cache
+ENV MPLCONFIGDIR=/staging/agp/masterthesis/nerf-thesis-shared/cache/.cache
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
