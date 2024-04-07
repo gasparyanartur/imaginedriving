@@ -1,22 +1,18 @@
+ARG OS_VERSION=20.04
+ARG CUDA_VERSION=11.8.0
+ARG CU_VERSION=118
+ARG USER_ID=1000
+ARG PYTHON_VERSION=3.11
 
 
 # Define base image.
-FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
-ENV CUDA_VERSION=11.8.0
-ENV OS_VERSION=22.04
-ENV USER_ID=1000
-ENV PYTHON_VERSION=3.11
-ENV PYTHON_VERSION_FULL=3.11.8
-#ARG CUDA_VERSION
-#ARG OS_VERSION
-#ARG USER_ID
-#ARG PYTHON_VERSION
-#ARG PYTHON_VERSION_FULL
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${OS_VERSION}
 
-# Variables used at build time.
-## CUDA architectures, required by Colmap and tiny-cuda-nn.
-## NOTE: All commonly used GPU architectures are included and supported here. To speedup the image build process remove all architectures but the one of your explicit GPU. Find details here: https://developer.nvidia.com/cuda-gpus (8.6 translates to 86 in the line below) or in the docs.
-ARG CUDA_ARCHITECTURES=90;89;86;80;75;70;61;52;37
+ARG OS_VERSION
+ARG CUDA_VERSION
+ARG CU_VERSION
+ARG USER_ID
+ARG PYTHON_VERSION
 
 # Set environment variables.
 ## Set non-interactive to prevent asking for user inputs blocking image creation.
@@ -28,7 +24,12 @@ ENV CUDA_HOME="/usr/local/cuda"
 
 # Install required apt packages and clear cache afterwards.
 RUN apt-get update \
+    && apt-get install -y software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get install -y --no-install-recommends \
+    python${PYTHON_VERSION} \
+    python${PYTHON_VERSION}-dev \
+    python${PYTHON_VERSION}-distutils \
     build-essential \
     cmake \
     curl \
@@ -38,33 +39,10 @@ RUN apt-get update \
     sudo \
     vim-tiny \
     wget \
-    python${PYTHON_VERSION} \
-    #$python{PYTHON_VERSION}-dev \
-    #$python3-pip \
-    && rm -rf /var/lib/apt/lists/*
-
-#RUN apt-get update && \
-#    apt-get install -y --no-install-recommends zlib1g-dev libbz2-dev xz-utils
-
-#RUN wget https://www.python.org/ftp/python/${PYTHON_VERSION_FULL}/Python-${PYTHON_VERSION_FULL}.tgz \
-#    && tar xzf Python-$PYTHON_VERSION_FULL.tgz \
-#    && cd Python-$PYTHON_VERSION_FULL \ 
-#    && ./configure \
-#    && make -j $(nproc) \
-#    && make install \
-#    && rm -rf Python-$PYTHON_VERSION_FULL.tgz Python-$PYTHON_VERSION_FULL 
-
-#RUN #apt install -y --no-install-recommends python3-pip python3-dev \
-#    && python${PYTHON_VER} -m pip install --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org pip setuptools
-
-
-
-#    ${PYTHON_VER} \
-#    ${PYTHON_VER}-dev \
-#    python3-pip \
-
-RUN apt-get update && apt-get install -y python3-dev python3-pip
-
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get autoremove
+    
 
 # Create non root user and setup environment.
 RUN useradd -m -d /home/user -g root -G sudo -u ${USER_ID} user
@@ -82,17 +60,22 @@ WORKDIR /home/user
 ENV PATH="${PATH}:/home/user/.local/bin"
 SHELL ["/bin/bash", "-c"]
 
+ARG TORCH_VERSION=2.2.0
+ARG TORCHVISION_VERSION=0.17.0 
 
-# Upgrade pip and install packages.
-RUN python${PYTHON_VERSION} -m pip install --upgrade pip setuptools pathtools promise pybind11
 # Install pytorch and submodules
-RUN CUDA_VER=${CUDA_VERSION%.*} && CUDA_VER=${CUDA_VER//./} && python${PYTHON_VERSION} -m pip install \
-    torch==2.2.0+cu${CUDA_VER} \
-    torchvision==0.17.0+cu${CUDA_VER} \
-        --extra-index-url https://download.pytorch.org/whl/cu${CUDA_VER}
-
 COPY requirements.txt .
-RUN CUDA_VER=${CUDA_VERSION%.*} && CUDA_VER=${CUDA_VER//./} && python${PYTHON_VERSION} -m pip install -r requirements.txt
+RUN python${PYTHON_VERSION} -m pip install --upgrade \
+        pip \
+        setuptools \
+        pathtools \
+        promise \
+        pybind11 \
+    && python${PYTHON_VERSION} -m pip install \
+        torch==${TORCH_VERSION}+cu${CU_VERSION} \
+        torchvision==${TORCHVISION_VERSION}+cu${CU_VERSION} \
+        --extra-index-url https://download.pytorch.org/whl/cu${CU_VERSION} \
+    && python${PYTHON_VERSION} -m pip install -r requirements.txt
 
 # Bash as default entrypoint.
 CMD /bin/bash -l
