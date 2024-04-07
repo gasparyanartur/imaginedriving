@@ -1,5 +1,21 @@
-FROM nvidia/cuda:11.4.3-cudnn8-devel-ubuntu20.04
+ARG CUDA_VERSION=11.8.0
+ARG OS_VERSION=22.04
+ARG USER_ID=1000
+ARG PYTHON_VERSION=3.11
+ARG PYTHON_VERSION_FULL=3.11.8
 
+# Define base image.
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${OS_VERSION}
+ARG CUDA_VERSION
+ARG OS_VERSION
+ARG USER_ID
+ARG PYTHON_VERSION
+ARG PYTHON_VERSION_FULL
+
+# Variables used at build time.
+## CUDA architectures, required by Colmap and tiny-cuda-nn.
+## NOTE: All commonly used GPU architectures are included and supported here. To speedup the image build process remove all architectures but the one of your explicit GPU. Find details here: https://developer.nvidia.com/cuda-gpus (8.6 translates to 86 in the line below) or in the docs.
+ARG CUDA_ARCHITECTURES=90;89;86;80;75;70;61;52;37
 
 # Set environment variables.
 ## Set non-interactive to prevent asking for user inputs blocking image creation.
@@ -9,52 +25,76 @@ ENV TZ=Europe/Berlin
 ## CUDA Home, required to find CUDA in some packages.
 ENV CUDA_HOME="/usr/local/cuda"
 
-ENV PYTHONNOUSERSITE=True
-## CUDA Home, required to find CUDA in some packages.
-ENV PATH=/opt/mambaforge/bin:$PATH
-ENV HF_HOME=/staging/agp/masterthesis/nerf-thesis-shared/cache/.cache
-ENV MPLCONFIGDIR=/staging/agp/masterthesis/nerf-thesis-shared/cache/.cache
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# Install required apt packages and clear cache afterwards.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    curl \
+    ffmpeg \
     git \
-    nano \
+    qtbase5-dev \
+    sudo \
+    vim-tiny \
     wget \
-    curl
+    python${PYTHON_VERSION} \
+    #$python{PYTHON_VERSION}-dev \
+    #$python3-pip \
+    && rm -rf /var/lib/apt/lists/*
 
-# Mambaforge
-RUN cd /tmp && \
-    curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-$(uname)-$(uname -m).sh" && \
-    bash Mambaforge-$(uname)-$(uname -m).sh -fp /opt/mambaforge -b && \
-    rm Mambaforge*sh
+#RUN apt-get update && \
+#    apt-get install -y --no-install-recommends zlib1g-dev libbz2-dev xz-utils
 
-COPY environment.yml .
-RUN mamba env update -f environment.yml 
+#RUN wget https://www.python.org/ftp/python/${PYTHON_VERSION_FULL}/Python-${PYTHON_VERSION_FULL}.tgz \
+#    && tar xzf Python-$PYTHON_VERSION_FULL.tgz \
+#    && cd Python-$PYTHON_VERSION_FULL \ 
+#    && ./configure \
+#    && make -j $(nproc) \
+#    && make install \
+#    && rm -rf Python-$PYTHON_VERSION_FULL.tgz Python-$PYTHON_VERSION_FULL 
 
-SHELL ["/bin/bash", "-c"]
+#RUN #apt install -y --no-install-recommends python3-pip python3-dev \
+#    && python${PYTHON_VER} -m pip install --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org pip setuptools
 
-# Create nonroot user, setup env
-RUN useradd -m -d /home/user -g root -G sudo -u 1000 user
+
+
+#    ${PYTHON_VER} \
+#    ${PYTHON_VER}-dev \
+#    python3-pip \
+
+RUN apt-get update && apt-get install -y python3-dev python3-pip
+
+
+# Create non root user and setup environment.
+RUN useradd -m -d /home/user -g root -G sudo -u ${USER_ID} user
 RUN usermod -aG sudo user
-# User password
+# Set user password
 RUN echo "user:user" | chpasswd
-# Ensure sudo group users are not asked for password
+# Ensure sudo group users are not asked for a password when using sudo command by ammending sudoers file
 RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
-#Switch to new user and workdir
-USER 1000
+
+# Switch to new uer and workdir.
+USER ${USER_ID}
 WORKDIR /home/user
-# Add local user binary folder to Path variable
+
+# Add local user binary folder to PATH variable.
 ENV PATH="${PATH}:/home/user/.local/bin"
-
-RUN echo "source activate env-diffusion" > ~/.bashrc
-ENV PATH /opt/mambaforge/envs/env-diffusion/bin:$PATH
-ENV CONDA_PREFIX /opt/mambaforge/envs/env-diffusion
-
 SHELL ["/bin/bash", "-c"]
 
-COPY requirements-base.txt .
-COPY requirements-extra.txt .
-RUN pip install --user -r requirements-base.txt
-RUN pip install --user -r requirements-extra.txt
 
+# Upgrade pip and install packages.
+RUN python${PYTHON_VERSION} -m pip install --upgrade pip setuptools pathtools promise pybind11
+# Install pytorch and submodules
+RUN CUDA_VER=${CUDA_VERSION%.*} && CUDA_VER=${CUDA_VER//./} && python${PYTHON_VERSION} -m pip install \
+    torch==2.2.0+cu${CUDA_VER} \
+    torchvision==0.17.0+cu${CUDA_VER} \
+        --extra-index-url https://download.pytorch.org/whl/cu${CUDA_VER}
+
+COPY requirements.txt .
+RUN CUDA_VER=${CUDA_VERSION%.*} && CUDA_VER=${CUDA_VER//./} && python${PYTHON_VERSION} -m pip install -r requirements.txt
+
+# Bash as default entrypoint.
+CMD /bin/bash -l
+
+SHELL ["/bin/bash", "-c"]
 WORKDIR /workspace
