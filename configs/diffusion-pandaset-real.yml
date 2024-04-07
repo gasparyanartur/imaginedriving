@@ -13,6 +13,8 @@ datasets:
         height: 1080
         width: 1920
 
+      meta: {}
+
     data_tree: 
       pandaset: 
         001-003: "*"

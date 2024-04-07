@@ -8,6 +8,7 @@ import math
 
 import numpy as np
 import torch
+from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 import transformers
 import torchvision.transforms.v2 as transforms
@@ -84,38 +85,39 @@ def parse_args():
     return args
 
 
-def embed_prompt(prompt: str, tokenizers, text_encoders):
+def tokenize_prompt(tokenizer, prompt):
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    return text_input_ids
+
+
+# Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
+def encode_prompt(text_encoders, text_input_ids_list=None):
     prompt_embeds_list = []
-    captions = [prompt]
 
-    with torch.no_grad():
-        for tokenizer, text_encoder in zip(tokenizers, text_encoders):
-            text_inputs = tokenizer(
-                captions,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            text_input_ids = text_inputs.input_ids
-            prompt_embeds = text_encoder(
-                text_input_ids.to(text_encoder.device),
-                output_hidden_states=True,
-            )
+    for i, text_encoder in enumerate(text_encoders):
+        text_input_ids = text_input_ids_list[i]
 
-            # We are only ALWAYS interested in the pooled output of the final text encoder
-            pooled_prompt_embeds = prompt_embeds[0]
-            prompt_embeds = prompt_embeds.hidden_states[-2]
-            bs_embed, seq_len, _ = prompt_embeds.shape
-            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
+        prompt_embeds = text_encoder(
+            text_input_ids.to(text_encoder.device), output_hidden_states=True, return_dict=False
+        )
+
+        # We are only ALWAYS interested in the pooled output of the final text encoder
+        pooled_prompt_embeds = prompt_embeds[0]
+        prompt_embeds = prompt_embeds[-1][-2]
+        bs_embed, seq_len, _ = prompt_embeds.shape
+        prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
+        prompt_embeds_list.append(prompt_embeds)
 
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
-
-    return {
-        "prompt_embeds": prompt_embeds.cpu(),
-        "pooled_prompt_embeds": pooled_prompt_embeds.cpu(),
-    }
+    return prompt_embeds, pooled_prompt_embeds
 
 
 def compute_vae_encodings(batch, vae):
@@ -178,16 +180,16 @@ def compute_time_ids(original_size, crops_coords_top_left, target_size, device, 
     return add_time_ids
 
 
-def preprocess_rgb(
-    batch, resizer, flipper, cropper, target_size, center_crop: bool = False
+def preprocess_rgbs(
+    rgbs, target_size: tuple[int, int], resizer, flipper, cropper, center_crop: bool
 ):
-    all_rgbs = []
+    rgbs_pp = []
     original_sizes = []
+    target_sizes = []
     crop_top_lefts = []
 
-    th, tw = target_size
-
-    for rgb in batch["rgb"]:
+    for rgb in rgbs:
+        th, tw = target_size
         h0, w0 = rgb.shape[-2:]
 
         rgb = resizer(rgb)
@@ -202,44 +204,48 @@ def preprocess_rgb(
             cy, cx, h, w = cropper.get_params(rgb, target_size)
             rgb = transforms.functional.crop(rgb, cy, cx, h, w)
 
-        original_sizes.append((h0, w0))
-        crop_top_lefts.append((cy, cx))
-        all_rgbs.append(rgb)
+        original_size = h0, w0
+        crop_top_left = cy, cx
+
+        original_sizes.append(original_size)
+        crop_top_lefts.append(crop_top_left)
+        rgbs_pp.append(rgb)
+        target_sizes.append(target_size)
+
+    return {"rgb": rgbs_pp, "original_size": original_sizes, "crop_top_left": crop_top_lefts, "target_size": target_sizes}
+
+
+def preprocess_prompts(prompt: list[str], tokenizers):
+    assert 1 <= len(tokenizers) <= 2
+
+    if isinstance(prompt, str):
+        prompt = [prompt]
+
+    input_ids_one = tokenize_prompt(tokenizers[0], prompt)
+    input_ids_two = tokenize_prompt(tokenizers[1], prompt) if len(tokenizers) > 1 else None
 
     return {
-        "original_sizes": original_sizes,
-        "crop_top_lefts": crop_top_lefts,
-        "pixel_values": all_rgbs,
+        "input_ids_one": input_ids_one,
+        "input_ids_two": input_ids_two
     }
 
 
-class TrainLoraDataset(Dataset):
-    def __init__(self, dataset: DynamicDataset, prompt_embeds_one, prompt_embeds_two, resizer, flipper, cropper, target_size, center_crop, device) -> None:
-        super().__init__()
+def preprocess_batch(
+    batch, resizer, flipper, cropper, tokenizers, target_size, center_crop: bool = False
+):
+    # Ignore negative prompt :)
 
-        self.dataset = dataset
-        self.prompt_embeds_one = prompt_embeds_one
-        self.prompt_embeds_two = prompt_embeds_two
-        self.resizer = resizer
-        self.flipper = flipper
-        self.cropper = cropper
-        self.target_size = target_size
-        self.center_crop = center_crop
+    rgbs = preprocess_rgbs(batch["rgb"], target_size, resizer, flipper, cropper, center_crop)
+    prompts = preprocess_prompts(batch["prompt"]["positive_prompt"], tokenizers)
 
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        sample = self.dataset[idx]
-        
-        sample_pp = {
-            "prompt_embeds_one": self.prompt_embeds_one,
-            "prompt_embeds_two": self.prompt_embeds_two,
-            **preprocess_rgb(sample, self.resizer, self.flipper, self.cropper, self.target_size, self.center_crop), 
-        }
-        
-        return sample_pp
-
+    return {
+        "original_size": rgbs["original_size"],
+        "crop_top_left": rgbs["crop_top_left"],
+        "target_size": rgbs["target_size"],
+        "rgb": rgbs["rgb"],
+        "input_ids_one": prompts["input_ids_one"],
+        "input_ids_two": prompts["input_ids_two"]
+    }
 
 
 @dataclass(init=True)
@@ -623,10 +629,6 @@ def main(args):
     # ===   Setup data   ===
     # ======================
 
-    prompt = config["prompt"]
-    prompt_embed = embed_prompt(
-        prompt, (tokenizer_one, tokenizer_two), (text_encoder_one, text_encoder_two)
-    )
 
     dataset_config = config["datasets"]
     train_dataset_config = dataset_config["train_data"]
@@ -655,53 +657,9 @@ def main(args):
             train_resizer, train_flipper, train_cropper
         )
 
-    def collate_fn(batch: Iterable[dict[str, Any]]) -> dict[str, Iterable[Any]]:
-        # TODO
-
-        pixel_values = []
-        original_sizes = []
-        crop_top_lefts = []
-        prompt_embeds_ones = []
-        prompt_embeds_twos = []
-
-        for sample in batch:
-            pixel_values.append(batch["pixel_values"])
-            original_sizes.append(batch["original_sizes"])
-            crop_top_lefts.append(batch["crop_top_left"])
-            prompt_embeds_ones.append(batch["prompt_embeds_one"])
-            prompt_embeds_twos.append(batch["prompt_embeds_two"])
-
-        pixel_values = torch.stack(pixel_values).to(memory_format=torch.contiguous_format, dtype=torch.float32)
-        prompt_embeds_ones = torch.stack(prompt_embeds_ones)
-        prompt_embeds_twos = torch.stack(prompt_embeds_twos)
-
-
-        result = {
-            "pixel_values": pixel_values,
-            "input_ids_one": input_ids_one,
-            "input_ids_two": input_ids_two,
-            "original_sizes": original_sizes,
-            "crop_top_lefts": crop_top_lefts,
-        }
-
-        filenames = [example["filenames"] for example in batch if "filenames" in example]
-        if filenames:
-            result["filenames"] = filenames
-        return result
-        
-        result = {
-            "pixel_values": None,
-            "prompt_embeds_one": None,
-            "prompt_embeds_two": None,
-            "original_sizes": None,
-            "crop_top_lefts": None
-        }
-        return None
-    
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
-        collate_fn=collate_fn,
         batch_size=model_config.train_batch_size,
         num_workers=model_config.dataloader_num_workers
     )

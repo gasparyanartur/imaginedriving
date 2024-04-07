@@ -12,6 +12,9 @@ datasets:
         camera: front_camera
         height: 1080
         width: 1920
+
+      meta: {}
+
     data_tree: 
       pandaset: 
         001-003: "*"
@@ -26,6 +29,9 @@ datasets:
         split: test
         height: 1080
         width: 1920
+
+      meta: {}
+
     data_tree:
       neurad:
         001-003: "*"

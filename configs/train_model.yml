@@ -13,6 +13,12 @@ datasets:
         height: 1080
         width: 1920
 
+      static-prompt: 
+        positive-prompt: "dashcam video, self-driving car, urban driving scene"
+        negative-prompt: ""
+
+      meta: {}
+
     data_tree: 
       pandaset: 
         001-003: "*"
@@ -26,6 +32,12 @@ datasets:
         camera: "front_camera"
         height: 1080
         width: 1920
+      
+      static-prompt: 
+        positive-prompt: "dashcam video, self-driving car, urban driving scene"
+        negative-prompt: ""
+
+      meta: {}
 
     data_tree: 
       pandaset: 
@@ -37,8 +49,6 @@ model:
   model_id: "stabilityai/stable-diffusion-xl-base-1.0"
   vae_id: "madebyollin/sdxl-vae-fp16-fix"    # https://github.com/huggingface/diffusers/pull/4038
 
-  prompt: "dashcam video, self-driving car, urban driving scene"
-  negative_prompt: ""
   revision: null
   variant: null
   max_train_samples: null

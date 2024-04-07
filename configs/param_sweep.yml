@@ -13,6 +13,8 @@ datasets:
         height: 1080
         width: 1920
 
+      meta: {}
+
     data_tree: 
       pandaset: 
         001-003: [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21]

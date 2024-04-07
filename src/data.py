@@ -336,6 +336,40 @@ class DataGetter(ABC):
         raise NotImplementedError
 
 
+class MetaDataGetter(DataGetter):
+    def __init__(
+        self,
+        info_getter: InfoGetter,
+        data_spec: dict[str, Any],
+    ):
+        super().__init__(info_getter, data_spec)
+
+    def get_data(self, dataset_path: Path, info: SampleInfo):
+        result = {
+            "path": self.get_data_path(dataset_path, info)
+            **asdict(info)
+        }
+        return result
+
+
+class PromptDataGetter(DataGetter):
+    def __init__(
+        self,
+        info_getter: InfoGetter,
+        data_spec: dict[str, Any],
+    ):
+        super().__init__(info_getter, data_spec)
+        
+        match self.data_spec.get("type", "static"):
+            case "static":
+                self.positive_prompt = self.data_spec.get("positive-prompt", "")
+                self.negative_prompt = self.data_spec.get("negative-prompt", "")
+
+            case _:
+                raise NotImplementedError
+
+    def get_data(self, dataset_path: Path, info: SampleInfo):
+        return {"positive-prompt": self.positive_prompt, "negative-prompt": self.negative_prompt}
 
 class RGBDataGetter(DataGetter):
     def __init__(
@@ -343,11 +377,10 @@ class RGBDataGetter(DataGetter):
         info_getter: InfoGetter,
         data_spec: dict[str, Any],
     ):
-        if "data_type" not in data_spec:
-            data_spec["data_type"] = "rgb"
+        super().__init__(info_getter, data_spec)
 
-        self.info_getter = info_getter
-        self.data_spec = data_spec
+        if "data_type" not in self.data_spec:
+            self.data_spec["data_type"] = "rgb"
 
         rgb_dtype = self.data_spec.get("dtype", torch.float32)
         rescale = self.data_spec.get("rescale", True)
@@ -380,14 +413,15 @@ class RGBDataGetter(DataGetter):
         return rgb
 
 
-
 info_getter_builders: dict[str, Callable[[], InfoGetter]] = {
     "pandaset": PandasetInfoGetter,
     "neurad": NeuRADInfoGetter,
 }
 
 data_getter_builders: dict[str, Callable[[InfoGetter, dict[str, Any]], DataGetter]] = {
-    "rgb": RGBDataGetter
+    "rgb": RGBDataGetter,
+    "meta": MetaDataGetter,
+    "prompt": PromptDataGetter
 }
 
 
@@ -398,6 +432,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         data_tree: dict[str, Any],
         info_getter: InfoGetter,
         data_getters: dict[str, DataGetter],
+        data_transforms: dict[str, Any] = None
     ):
         self.sample_infos: list[SampleInfo] = info_getter.parse_tree(
             dataset_path, data_tree
@@ -405,6 +440,12 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         self.info_getter = info_getter
         self.data_getters = data_getters
         self.dataset_path = dataset_path
+
+        self.data_transforms = {
+            data_type: (
+                data_transforms[data_type] if data_type in data_transforms else []
+            ) for data_type in data_getters.keys()
+        }
 
         self.reset_index()
 
@@ -478,11 +519,15 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
     def __getitem__(self, idx: int) -> dict[str, Any]:
         i = self.idxs[idx]
 
-        info = self.sample_infos[idx]
+        info = self.sample_infos[i]
         sample = asdict(info)
 
         for data_type, getter in self.data_getters.items():
             data = getter.get_data(self.dataset_path, info)
+            
+            for data_transform in self.data_transforms[data_type]:
+                data = data_transform(data)
+
             sample[data_type] = data
 
         return sample
