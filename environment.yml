@@ -5,10 +5,30 @@ channels:
   - pytorch 
   - nvidia 
 dependencies:
-  - python=3.11
-  - pytorch=2.2.0
-  - pytorch-cuda
+  - python>=3.11
+  - pytorch>=2.0.0
+  - pytorch-gpu>=2.0.0
   - nb_conda_kernels
   - jupyter
   - jupyterlab
   - pip
+  - pip:
+    - lightning
+    - torchmetrics
+    - transformers
+    - accelerate
+    - diffusers
+    - torchmetrics[image]
+    - open3d
+    - opencv-python
+    - safetensors
+    - peft
+    - torch-fidelity
+    - pillow
+    - matplotlib
+    - scipy
+    - pandas
+    - tqdm
+    - pyyaml
+    - clip-interrogator
+    - wandb
