@@ -1,0 +1,60 @@
+Bootstrap: docker
+From: nvidia/cuda:11.8.0-devel-ubuntu22.04
+Stage: spython-base
+
+%files
+requirements.txt .
+%post
+
+## Set non-interactive to prevent asking for user inputs blocking image creation.
+DEBIAN_FRONTEND=noninteractive
+
+## Set timezone as it is required by some packages.
+TZ=Europe/Berlin
+
+# CUDA Home, required to find CUDA in some packages.
+CUDA_HOME="/usr/local/cuda"
+
+CUDA_VERSION=11.8.0
+CUDA_VER=118
+OS_VERSION=22.04
+
+apt-get update \
+&& apt-get install -y software-properties-common \
+&& add-apt-repository ppa:deadsnakes/ppa \
+&& apt-get install -y --no-install-recommends \
+python3.10 \
+python3.10-dev \
+python3.10-distutils \
+build-essential \
+cmake \
+curl \
+ffmpeg \
+git \
+sudo \
+vim-tiny \
+wget \
+python-is-python3 \
+&& curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 \
+&& rm -rf /var/lib/apt/lists/* \
+&& apt-get autoremove
+    
+python3.10 -m pip install --no-cache-dir --upgrade uv \
+&& python3.10 -m uv pip install --python=/usr/bin/python3.10 --no-cache -r requirements.txt
+
+
+mkdir -p /workspace
+cd /workspace
+%environment
+export DEBIAN_FRONTEND=noninteractive
+export TZ=Europe/Berlin
+export CUDA_HOME="/usr/local/cuda"
+export CUDA_VERSION=11.8.0
+export CUDA_VER=118
+export OS_VERSION=22.04
+%runscript
+cd /workspace
+exec /bin/bash /bin/bash -l "$@"
+%startscript
+cd /workspace
+exec /bin/bash /bin/bash -l "$@"

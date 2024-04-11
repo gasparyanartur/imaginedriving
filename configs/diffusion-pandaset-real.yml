@@ -10,6 +10,10 @@ datasets:
     data_getters:
       rgb:
         camera: "front_camera"
+        height: 1080
+        width: 1920
+
+      meta: {}
 
     data_tree: 
       pandaset: 

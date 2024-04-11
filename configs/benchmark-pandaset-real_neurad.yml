@@ -10,6 +10,11 @@ datasets:
     data_getters:
       rgb:
         camera: front_camera
+        height: 1080
+        width: 1920
+
+      meta: {}
+
     data_tree: 
       pandaset: 
         001-003: "*"
@@ -22,6 +27,11 @@ datasets:
         camera: front_camera
         shift: 0meter
         split: test
+        height: 1080
+        width: 1920
+
+      meta: {}
+
     data_tree:
       neurad:
         001-003: "*"

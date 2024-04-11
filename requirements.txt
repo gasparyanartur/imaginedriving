@@ -1,0 +1,25 @@
+--extra-index-url https://download.pytorch.org/whl/cu118 
+torch==2.0.1+cu118 
+torchvision==0.15.2+cu118 
+lightning
+torchmetrics
+transformers
+accelerate
+diffusers
+bitsandbytes
+torchmetrics[image]
+open3d
+opencv-contrib-python
+safetensors
+peft
+torch-fidelity
+pillow
+jupyterlab
+jupyter
+matplotlib
+scipy
+pandas
+tqdm
+pyyaml
+clip-interrogator
+wandb
