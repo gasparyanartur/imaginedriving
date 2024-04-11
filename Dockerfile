@@ -1,56 +1,42 @@
-FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
 
-ENV PYTHONNOUSERSITE=True
 ## Set non-interactive to prevent asking for user inputs blocking image creation.
 ENV DEBIAN_FRONTEND=noninteractive
+
 ## Set timezone as it is required by some packages.
 ENV TZ=Europe/Berlin
-## CUDA Home, required to find CUDA in some packages.
-ENV CUDA_HOME="/usr/local/cuda"
-ENV PATH=/opt/mambaforge/bin:$PATH
-ENV HF_HOME=/proj/nlp4adas/master-thesis-shared/nerf-thesis/.cache
-ENV MPLCONFIGDIR=/proj/nlp4adas/master-thesis-shared/nerf-thesis/.cache
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    git \
-    nano \
-    wget \
-    curl
+# CUDA Home, required to find CUDA in some packages.
+ENV CUDA_HOME="/usr/local/cuda"  
 
-# Mambaforge
-RUN cd /tmp && \
-    curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-$(uname)-$(uname -m).sh" && \
-    bash Mambaforge-$(uname)-$(uname -m).sh -fp /opt/mambaforge -b && \
-    rm Mambaforge*sh
+ENV CUDA_VERSION=11.8.0
+ENV CUDA_VER=118
+ENV OS_VERSION=22.04
 
-COPY environment.yml .
-RUN mamba env update -f environment.yml 
+RUN apt-get update \
+    && apt-get install -y software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get install -y --no-install-recommends \
+        python3.10 \
+        python3.10-dev \
+        python3.10-distutils \
+        build-essential \
+        cmake \
+        curl \
+        ffmpeg \
+        git \
+        sudo \
+        vim-tiny \
+        wget \
+        python-is-python3 \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get autoremove
+    
+COPY requirements.txt .
+RUN python3.10 -m pip install --no-cache-dir --upgrade uv \
+    && python3.10 -m uv pip install --python=/usr/bin/python3.10 --no-cache -r requirements.txt
 
-SHELL ["/bin/bash", "-c"]
-
-# Create nonroot user, setup env
-RUN useradd -m -d /home/user -g root -G sudo -u 1000 user
-RUN usermod -aG sudo user
-# User password
-RUN echo "user:user" | chpasswd
-# Ensure sudo group users are not asked for password
-RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
-#Switch to new user and workdir
-USER 1000
-WORKDIR /home/user
-# Add local user binary folder to Path variable
-ENV PATH="${PATH}:/home/user/.local/bin"
-
-RUN echo "source activate env-diffusion" > ~/.bashrc
-ENV PATH /opt/mambaforge/envs/env-diffusion/bin:$PATH
-ENV CONDA_PREFIX /opt/mambaforge/envs/env-diffusion
-
-SHELL ["/bin/bash", "-c"]
-
-COPY requirements-base.txt .
-COPY requirements-extra.txt .
-RUN pip install --user -r requirements-base.txt
-RUN pip install --user -r requirements-extra.txt
 
 WORKDIR /workspace
+CMD /bin/bash -l

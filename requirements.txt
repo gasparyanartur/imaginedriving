@@ -6,13 +6,16 @@ torchmetrics
 transformers
 accelerate
 diffusers
+bitsandbytes
 torchmetrics[image]
 open3d
-opencv-python
+opencv-contrib-python
 safetensors
 peft
 torch-fidelity
 pillow
+jupyterlab
+jupyter
 matplotlib
 scipy
 pandas
