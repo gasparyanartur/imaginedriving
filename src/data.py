@@ -18,8 +18,7 @@ import logging
 from src.utils import get_env, set_env, set_if_no_key
 
 
-default_img_pipeline = transform.Compose([transform.ToDtype(torch.float32, scale=True)])
-
+norm_img_pipeline = transform.Compose([transform.ConvertImageDtype(torch.float32)])
 suffixes = {("rgb", "pandaset"): ".jpg", ("rgb", "neurad"): ".jpg"}
 
 
@@ -84,7 +83,7 @@ def load_img_paths_from_dir(dir_path: Path):
 
 
 def read_image(
-    img_path: Path, tf_pipeline: transform.Compose = default_img_pipeline
+    img_path: Path, tf_pipeline: transform.Compose = norm_img_pipeline
 ) -> Tensor:
     img = torchvision.io.read_image(str(img_path))
     img = tf_pipeline(img)
