@@ -1,0 +1,31 @@
+project_name: ImagineDriving
+
+PROJ_DIR: null      # null: $(cwd)
+CACHE_DIR: null     # null: $(PROJ_DIR)/.cache
+
+datasets:
+  source_images:
+    dataset: pandaset
+    path: "/staging/agp/datasets/pandaset"
+    data_getters:
+      rgb:
+        camera: "front_camera"
+        height: 1080
+        width: 1920
+
+      meta: {}
+
+    data_tree: 
+      pandaset: 
+        001-003: "*"
+
+model:
+  model_config_params:
+    model_name: sdxlbase
+    base_model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+
+  model_forward_params: 
+    base_strength: 0.1
+    base_num_steps: 50
+
+output_dir: /staging/agp/masterthesis/nerf-thesis-shared/output/diffusion

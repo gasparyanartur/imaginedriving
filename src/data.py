@@ -11,11 +11,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torch import Tensor
-from torchvision.transforms import v2 as transform
+import torchvision
+torchvision.disable_beta_transforms_warning(); from torchvision.transforms import v2 as transform
 import torchvision
 import logging
 
 from src.utils import get_env, set_env, set_if_no_key
+
 
 
 norm_img_pipeline = transform.Compose([transform.ConvertImageDtype(torch.float32)])
@@ -496,6 +498,24 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
     def iter_range(
         self, id: int = 0, id_start: int = 0, id_stop: int = 0, verbose: bool = True
     ):
+        """ Iterate cyclically with a range, such that a specific offset is matched with the right index.
+            Example: (id: 14, id_start: 10, id_stop: 25)
+                id=10 should be assigned i=0, id=11 gets i=1, etc...
+                This continues until id=25, after which it repeats at id=10.
+                We therefore get the map: 
+                {10: 0, 11: 1, 12: 2, 13: 3, 14: 4, ..., 
+                 10: 15, 11: 16, 12: 17, 13: 18, 14: 19, ...}
+                Thus, id=14 will be assigned indexes 4, 19, 34, 49, ..., until the dataset is exhausted.
+
+        Args:
+            id: Offset between the id range and index range. Defaults to 0.
+            id_start: Starting index of the cycle. Defaults to 0.
+            id_stop (int, optional): Final id in the index range before restarting the cycle. Defaults to 0.
+            verbose: Whether or not to log each index. Defaults to True.
+
+        Yields:
+            Sample at specified index.
+        """
         assert id_start <= id <= id_stop
 
         skip = id_stop - id_start + 1

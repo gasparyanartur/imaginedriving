@@ -6,11 +6,15 @@ from src.diffusion import diffusion_from_config_to_dir
 from src.data import DynamicDataset, read_yaml
 
 
+
+
+
+
 if __name__ == "__main__":
     parser = ArgumentParser("diffusion")
 
     parser.add_argument("config_path", type=Path)
-    parser.add_argument("-id", "--id_range", nargs=3, type=int, default=None)
+    parser.add_argument("-id", "--id_range", nargs=3, type=int, default=None, help="(id, id_start, id_stop)")
 
     args = parser.parse_args()
     config_path = args.config_path
