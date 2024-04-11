@@ -6,7 +6,6 @@ torchmetrics
 transformers
 accelerate
 diffusers
-bitsandbytes
 torchmetrics[image]
 open3d
 opencv-contrib-python

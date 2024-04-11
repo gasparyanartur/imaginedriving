@@ -6,10 +6,6 @@ from src.diffusion import diffusion_from_config_to_dir
 from src.data import DynamicDataset, read_yaml
 
 
-
-
-
-
 if __name__ == "__main__":
     parser = ArgumentParser("diffusion")
 
@@ -20,7 +16,7 @@ if __name__ == "__main__":
     config_path = args.config_path
     id_range = args.id_range
 
-    setup_project()
+    setup_project(args.config_path)
 
     config = read_yaml(config_path)
     dataset_config = config["datasets"]["source_images"]

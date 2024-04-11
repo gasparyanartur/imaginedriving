@@ -347,7 +347,7 @@ class MetaDataGetter(DataGetter):
 
     def get_data(self, dataset_path: Path, info: SampleInfo):
         result = {
-            "path": self.get_data_path(dataset_path, info)
+            "path": self.get_data_path(dataset_path, info),
             **asdict(info)
         }
         return result
@@ -396,7 +396,7 @@ class RGBDataGetter(DataGetter):
 
         self.base_transform = transform.Compose(
             [
-                transform.ToDtype(rgb_dtype, scale=rescale),
+                transform.ConvertDtype(rgb_dtype) if rescale else transform.ToDtype(rgb_dtype),
                 transform.Resize((height, width))
             ]
         )
@@ -442,11 +442,10 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         self.data_getters = data_getters
         self.dataset_path = dataset_path
 
-        self.data_transforms = {
-            data_type: (
-                data_transforms[data_type] if data_type in data_transforms else []
-            ) for data_type in data_getters.keys()
-        }
+        self.data_transforms = {**data_transforms} if data_transforms else {}
+        for data_type in data_getters.keys():
+            if data_type not in self.data_transforms:
+                self.data_transforms[data_type] = []
 
         self.reset_index()
 
