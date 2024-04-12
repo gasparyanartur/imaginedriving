@@ -11,15 +11,16 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torch import Tensor
-from torchvision.transforms import v2 as transform
+import torchvision
+torchvision.disable_beta_transforms_warning(); from torchvision.transforms import v2 as transform
 import torchvision
 import logging
 
 from src.utils import get_env, set_env, set_if_no_key
 
 
-default_img_pipeline = transform.Compose([transform.ToDtype(torch.float32, scale=True)])
 
+norm_img_pipeline = transform.Compose([transform.ConvertImageDtype(torch.float32)])
 suffixes = {("rgb", "pandaset"): ".jpg", ("rgb", "neurad"): ".jpg"}
 
 
@@ -84,7 +85,7 @@ def load_img_paths_from_dir(dir_path: Path):
 
 
 def read_image(
-    img_path: Path, tf_pipeline: transform.Compose = default_img_pipeline
+    img_path: Path, tf_pipeline: transform.Compose = norm_img_pipeline
 ) -> Tensor:
     img = torchvision.io.read_image(str(img_path))
     img = tf_pipeline(img)
@@ -346,7 +347,7 @@ class MetaDataGetter(DataGetter):
 
     def get_data(self, dataset_path: Path, info: SampleInfo):
         result = {
-            "path": self.get_data_path(dataset_path, info)
+            "path": self.get_data_path(dataset_path, info),
             **asdict(info)
         }
         return result
@@ -395,7 +396,7 @@ class RGBDataGetter(DataGetter):
 
         self.base_transform = transform.Compose(
             [
-                transform.ToDtype(rgb_dtype, scale=rescale),
+                transform.ConvertDtype(rgb_dtype) if rescale else transform.ToDtype(rgb_dtype),
                 transform.Resize((height, width))
             ]
         )
@@ -441,11 +442,10 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         self.data_getters = data_getters
         self.dataset_path = dataset_path
 
-        self.data_transforms = {
-            data_type: (
-                data_transforms[data_type] if data_type in data_transforms else []
-            ) for data_type in data_getters.keys()
-        }
+        self.data_transforms = {**data_transforms} if data_transforms else {}
+        for data_type in data_getters.keys():
+            if data_type not in self.data_transforms:
+                self.data_transforms[data_type] = []
 
         self.reset_index()
 
@@ -497,6 +497,24 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
     def iter_range(
         self, id: int = 0, id_start: int = 0, id_stop: int = 0, verbose: bool = True
     ):
+        """ Iterate cyclically with a range, such that a specific offset is matched with the right index.
+            Example: (id: 14, id_start: 10, id_stop: 25)
+                id=10 should be assigned i=0, id=11 gets i=1, etc...
+                This continues until id=25, after which it repeats at id=10.
+                We therefore get the map: 
+                {10: 0, 11: 1, 12: 2, 13: 3, 14: 4, ..., 
+                 10: 15, 11: 16, 12: 17, 13: 18, 14: 19, ...}
+                Thus, id=14 will be assigned indexes 4, 19, 34, 49, ..., until the dataset is exhausted.
+
+        Args:
+            id: Offset between the id range and index range. Defaults to 0.
+            id_start: Starting index of the cycle. Defaults to 0.
+            id_stop (int, optional): Final id in the index range before restarting the cycle. Defaults to 0.
+            verbose: Whether or not to log each index. Defaults to True.
+
+        Yields:
+            Sample at specified index.
+        """
         assert id_start <= id <= id_stop
 
         skip = id_stop - id_start + 1

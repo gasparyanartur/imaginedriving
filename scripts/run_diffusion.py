@@ -10,13 +10,13 @@ if __name__ == "__main__":
     parser = ArgumentParser("diffusion")
 
     parser.add_argument("config_path", type=Path)
-    parser.add_argument("-id", "--id_range", nargs=3, type=int, default=None)
+    parser.add_argument("-id", "--id_range", nargs=3, type=int, default=None, help="(id, id_start, id_stop)")
 
     args = parser.parse_args()
     config_path = args.config_path
     id_range = args.id_range
 
-    setup_project()
+    setup_project(args.config_path)
 
     config = read_yaml(config_path)
     dataset_config = config["datasets"]["source_images"]
