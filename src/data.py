@@ -396,7 +396,7 @@ class RGBDataGetter(DataGetter):
 
         self.base_transform = transform.Compose(
             [
-                transform.ConvertDtype(rgb_dtype) if rescale else transform.ToDtype(rgb_dtype),
+                transform.ConvertImageDtype(rgb_dtype) if rescale else transform.ToDtype(rgb_dtype),
                 transform.Resize((height, width))
             ]
         )
@@ -433,7 +433,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         data_tree: dict[str, Any],
         info_getter: InfoGetter,
         data_getters: dict[str, DataGetter],
-        data_transforms: dict[str, Any] = None
+        data_transforms: dict[str, callable[str, int]] = None
     ):
         self.sample_infos: list[SampleInfo] = info_getter.parse_tree(
             dataset_path, data_tree

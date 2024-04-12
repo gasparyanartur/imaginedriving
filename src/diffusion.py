@@ -1,5 +1,5 @@
 from typing import Any
-from abc import ABC, abstractmethod, abstractproperty, property
+from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,10 +34,20 @@ default_negative_prompt = "face, human features, unrealistic, artifacts, blurry,
 
 @dataclass
 class ModelId:
-    sd_15 = "runwayml/stable-diffusion-v1-5"
-    sdxl_base = "stabilityai/stable-diffusion-xl-base-1.0"
-    sdxl_refiner = "stabilityai/stable-diffusion-xl-refiner-1.0"
-    sdxl_turbo = "stabilityai/sdxl-turbo"
+    sd_v1_5 = "runwayml/stable-diffusion-v1-5"
+    sdxl_base_v1_0 = "stabilityai/stable-diffusion-xl-base-1.0"
+    sdxl_refiner_v1_0 = "stabilityai/stable-diffusion-xl-refiner-1.0"
+    sdxl_turbo_v1_0 = "stabilityai/sdxl-turbo"
+
+
+sdxl_models = {ModelId.sdxl_base_v1_0, ModelId.sdxl_refiner_v1_0, ModelId.sdxl_turbo_v1_0}
+sd_models = {ModelId.sd_v1_5}
+
+def is_sdxl_model(model_id: str) -> bool:
+    return model_id in sdxl_models
+
+def is_sdxl_vae(model_id: str) -> bool:
+    return model_id == "madebyollin/sdxl-vae-fp16-fix" or is_sdxl_model(model_id)
 
 
 def prep_model(pipe, device=get_device(), low_mem_mode: bool = False, compile: bool = True):
@@ -99,10 +109,10 @@ class SDPipe(DiffusionModel):
         if configs is None:
             configs = {}
 
-        base_model_id = configs.get("base_model_id", ModelId.sd_15)
+        base_model_id = configs.get("base_model_id", ModelId.sd_v1_5)
         refiner_model_id = configs.get("refiner_model_id", None)
         low_mem_mode = configs.get("low_mem_mode", False)
-        compile_model = configs.get("compile_model", True)
+        compile_model = configs.get("compile_model", False)
 
         self.use_refiner = refiner_model_id is not None
 
@@ -216,7 +226,7 @@ class SDXLPipe(DiffusionModel):
 
         if configs is None:
             configs = {
-                "base_model_id": ModelId.sdxl_base,
+                "base_model_id": ModelId.sdxl_base_v1_0,
                 "refiner_model_id": None
             }
 
@@ -384,7 +394,7 @@ def upcast_vae(vae):
     return vae
 
 
-def load_img2img_model(configs: dict[str, Any]) -> DiffusionModel:
+def load_img2img_model(configs: dict[str, Any], device=get_device()) -> DiffusionModel:
     logging.info(f"Loading diffusion model...")
 
     model_name = configs.get("model_name")
@@ -392,7 +402,7 @@ def load_img2img_model(configs: dict[str, Any]) -> DiffusionModel:
     if not constructor:
         raise NotImplementedError
 
-    model = constructor(configs=configs)
+    model = constructor(configs=configs, device=device)
     logging.info(f"Finished loading diffusion model")
     return model
 
@@ -405,7 +415,8 @@ def diffusion_from_config_to_dir(
     dst_dir: Path,
     model_config: dict[str, Any],
     model: DiffusionModel = None,
-    id_range: tuple[int, int, int] = None
+    id_range: tuple[int, int, int] = None,
+    device=get_device()
 ):
     if model_config is not None:
         model_config_params = model_config["model_config_params"]
@@ -415,7 +426,7 @@ def diffusion_from_config_to_dir(
         model_forward_params = {}
 
     if model is None:
-        model = load_img2img_model(configs=model_config_params)
+        model = load_img2img_model(configs=model_config_params, device=device)
 
     dst_dir.mkdir(exist_ok=True, parents=True)
     model.diffuse_to_dir(src_dataset, dst_dir, id_range=id_range, **model_forward_params)

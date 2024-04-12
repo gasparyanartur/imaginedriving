@@ -5,6 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 import math
+import itertools as it
 
 import numpy as np
 import torch
@@ -18,6 +19,7 @@ from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     StableDiffusionXLPipeline,
+    StableDiffusionPipeline,
     UNet2DConditionModel,
 )
 from diffusers.loaders import LoraLoaderMixin
@@ -46,16 +48,16 @@ from accelerate.utils import (
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
 from huggingface_hub import create_repo, upload_folder
-import wandb
 
 from src.data import setup_project, DynamicDataset
+from src.diffusion import is_sdxl_model, is_sdxl_vae
 
 
-check_min_version("0.23.0.dev0")
-logger = get_logger(__name__)
+check_min_version("0.28.0.dev0")
+logger = get_logger(__name__, log_level="INFO")
 
 
-def import_model_class_from_model_name_or_path(
+def import_text_encoder_class_from_model_name_or_path(
     pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
 ):
     text_encoder_config = PretrainedConfig.from_pretrained(
@@ -63,16 +65,18 @@ def import_model_class_from_model_name_or_path(
     )
     model_class = text_encoder_config.architectures[0]
 
-    if model_class == "CLIPTextModel":
-        from transformers import CLIPTextModel
+    match model_class:
+        case "CLIPTextModel":
+            from transformers import CLIPTextModel
+            return CLIPTextModel
 
-        return CLIPTextModel
-    elif model_class == "CLIPTextModelWithProjection":
-        from transformers import CLIPTextModelWithProjection
+        case "CLIPTextModelWithProjection":
+            from transformers import CLIPTextModelWithProjection
+            return CLIPTextModelWithProjection
 
-        return CLIPTextModelWithProjection
-    else:
-        raise ValueError(f"{model_class} is not supported.")
+        case _:
+            raise ValueError(f"{model_class} is not supported.") 
+ 
 
 
 def parse_args():
@@ -250,10 +254,10 @@ def preprocess_batch(
 
 @dataclass(init=True)
 class TrainLoraConfig:
-    pretrained_model_name_or_path: str = "stabilityai/stable-diffusion-xl-base-1.0"
+    model_id: str = "stabilityai/stable-diffusion-xl-base-1.0"
 
     # Path to pretrained VAE model with better numerical stability.
-    # More details: https://github.com/huggingface/diffusers/pull/4038.
+    # More details: https://githugb.com/huggingface/diffusers/pull/4038.
     vae_id: str = "madebyollin/sdxl-vae-fp16-fix"
 
     report_to: str = "wandb"
@@ -261,9 +265,9 @@ class TrainLoraConfig:
     revision: str = None
     variant: str = None
 
-    lora_rank: int = 4
     train_text_encoder: bool = False
     gradient_checkpointing: bool = False
+    n_epochs: int = 100
 
     # https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     allow_tf32: bool = True
@@ -276,7 +280,12 @@ class TrainLoraConfig:
     adam_beta2: float = 0.999
     adam_weight_decay: float = 1e-2
     adam_epsilon: float = 1e-08
+    
+    # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]'
+    lr_scheduler = "constant"
+    lr_warmup_steps = 500
 
+    lora_rank: int = 4
     prompt: str = "dashcam video, self-driving car, urban driving scene"
     negative_prompt: str = ""
 
@@ -286,7 +295,9 @@ class TrainLoraConfig:
     center_crop: bool = False
     flip_prob: float = 0.5
 
+    push_to_hub: bool = False       # Not Implemented
     hub_token: str = None
+    seed: int = None
 
 
 def main(args):
@@ -298,19 +309,29 @@ def main(args):
     config = setup_project(config_path)
 
     output_dir = Path(config["output_dir"])
-    logging_dir = output_dir / "logs"
+    logging_dir = Path(output_dir, "logs")
 
     model_config = TrainLoraConfig(**config["model"])
+    using_sdxl = is_sdxl_model(model_config.model_id)
 
-    # Sanity checks
-    if model_config.report_to == "wandb" and model_config.hub_token is not None:
-        raise ValueError(
-            "You cannot use both report_to=wandb and hub_token due to a security risk of exposing your token."
-            " Please use `huggingface-cli login` to authenticate with the Hub."
-        )
+    if (model_config.vae_id is not None) and (
+        (using_sdxl and not is_sdxl_vae(model_config.vae_id)) or 
+        (not using_sdxl and is_sdxl_vae(model_config.vae_id))
+    ):
+        raise ValueError(f"Mismatch between model_id and vae_id. Both models need to either be SDXL or SD, but received {model_config.model_id} and {model_config.vae_id}")
 
     if model_config.report_to == "wandb":
-        assert is_wandb_available()
+        if not is_wandb_available():
+            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
+     
+        if model_config.hub_token is not None:
+            raise ValueError(
+                "You cannot use both report_to=wandb and hub_token due to a security risk of exposing your token."
+                " Please use `huggingface-cli login` to authenticate with the Hub."
+            )
+
+        import wandb
+
 
     if torch.backends.mps.is_available() and model_config.mixed_precision == "bf16":
         # due to pytorch#99272, MPS does not yet support bfloat16.
@@ -318,20 +339,18 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
-    # Setup accelerator
-
     accelerator_project_config = ProjectConfiguration(
         project_dir=output_dir, logging_dir=logging_dir
     )
     accelerator_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
+        gradient_accumulation_steps=model_config.gradient_accumulation_steps,
         mixed_precision=model_config.mixed_precision,
         log_with=model_config.report_to,
         project_config=accelerator_project_config,
         kwargs_handlers=[accelerator_kwargs],
     )
 
-    # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -345,24 +364,22 @@ def main(args):
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    # If passed along, set the training seed now.
-    if (seed := model_config.get("seed")) is not None:
-        set_seed(seed)
+    if model_config.seed is not None:
+        set_seed(model_config.seed)
 
-    # Handle the repository creation
     if accelerator.is_main_process:
         output_dir.mkdir(exist_ok=True, parents=True)
         logging_dir.mkdir(exist_ok=True)
 
-        if model_config["push_to_hub"]:
-            # repo_id = create_repo(
-            #    repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
-            # ).repo_id
+        if model_config.push_to_hub:
             raise NotImplementedError
 
     # =======================
     # ===   Load models   ===
     # =======================
+    noise_scheduler = DDPMScheduler.from_pretrained(
+        model_config.model_id, subfolder="scheduler"
+    )
 
     tokenizer_one = AutoTokenizer.from_pretrained(
         model_config.model_id,
@@ -370,24 +387,8 @@ def main(args):
         revision=model_config.revision,
         use_fast=False,
     )
-    tokenizer_two = AutoTokenizer.from_pretrained(
-        model_config.model_id,
-        subfolder="tokenizer_2",
-        revision=model_config.revision,
-        use_fast=False,
-    )
-
-    # import correct text encoder classes
-    text_encoder_cls_one = import_model_class_from_model_name_or_path(
+    text_encoder_cls_one = import_text_encoder_class_from_model_name_or_path(
         model_config.model_id, model_config.revision, subfolder="text_encoder"
-    )
-    text_encoder_cls_two = import_model_class_from_model_name_or_path(
-        model_config.model_id, model_config.revision, subfolder="text_encoder_2"
-    )
-
-    # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        model_config.model_id, subfolder="scheduler"
     )
     text_encoder_one = text_encoder_cls_one.from_pretrained(
         model_config.model_id,
@@ -395,20 +396,43 @@ def main(args):
         revision=model_config.revision,
         variant=model_config.variant,
     )
-    text_encoder_two = text_encoder_cls_two.from_pretrained(
-        model_config.model_id,
-        subfolder="text_encoder_2",
-        revision=model_config.revision,
-        variant=model_config.variant,
-    )
 
-    vae = AutoencoderKL.from_pretrained(
-        model_config.vae_id
-        or model_config.model_id,  # Custom VAE is preferred due to bug
-        subfolder="vae" if model_config.vae_id is None else None,
-        revision=model_config.revision,
-        variant=model_config.variant,
-    )
+    if using_sdxl:
+        tokenizer_two = AutoTokenizer.from_pretrained(
+            model_config.model_id,
+            subfolder="tokenizer_2",
+            revision=model_config.revision,
+            use_fast=False,
+        )
+        text_encoder_cls_two = import_text_encoder_class_from_model_name_or_path(
+            model_config.model_id, model_config.revision, subfolder="text_encoder_2"
+        )
+        text_encoder_two = text_encoder_cls_two.from_pretrained(
+            model_config.model_id,
+            subfolder="text_encoder_2",
+            revision=model_config.revision,
+            variant=model_config.variant,
+        )
+    else:
+        tokenizer_two = None
+        text_encoder_cls_two = None
+        text_encoder_two = None
+
+
+    if model_config.vae_id is None:     # Need VAE fix for stable diffusion XL, see https://github.com/huggingface/diffusers/pull/4038
+        vae = AutoencoderKL.from_pretrained(
+            model_config.model_id,  
+            subfolder="vae",
+            revision=model_config.revision,
+            variant=model_config.variant,
+        ) 
+    else:
+        vae = AutoencoderKL.from_pretrained(
+            model_config.vae_id,
+            subfolder=None,
+            revision=model_config.revision,
+            variant=model_config.variant,
+        )
 
     unet = UNet2DConditionModel.from_pretrained(
         model_config.model_id,
@@ -423,9 +447,10 @@ def main(args):
 
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
-    text_encoder_one.requires_grad_(False)
-    text_encoder_two.requires_grad_(False)
     unet.requires_grad_(False)
+    text_encoder_one.requires_grad_(False)
+    if text_encoder_two:
+        text_encoder_two.requires_grad_(False)
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -435,20 +460,17 @@ def main(args):
     elif model_config.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # Move unet, vae and text_encoder to device and cast to weight_dtype
-    # The VAE is in float32 to avoid NaN losses.
     unet.to(accelerator.device, dtype=weight_dtype)
+    text_encoder_one.to(accelerator.device, dtype=weight_dtype)
 
-    if model_config.vae_id is None:
+    if using_sdxl and model_config.vae_id is None:      # The VAE in SDXL is in float32 to avoid NaN losses.
         vae.to(accelerator.device, dtype=torch.float32)
     else:
         vae.to(accelerator.device, dtype=weight_dtype)
 
-    text_encoder_one.to(accelerator.device, dtype=weight_dtype)
-    text_encoder_two.to(accelerator.device, dtype=weight_dtype)
-
-    # now we will add new LoRA weights to the attention layers
-    # Set correct lora layers
+    if text_encoder_two:
+        text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+        
     unet_lora_config = LoraConfig(
         r=model_config.lora_rank,
         lora_alpha=model_config.lora_rank,
@@ -457,9 +479,7 @@ def main(args):
     )
     unet.add_adapter(unet_lora_config)
 
-    # The text encoder comes from 🤗 transformers, we will also attach adapters to it.
     if model_config.train_text_encoder:
-        # ensure that dtype is float32, even if rest of the model that isn't trained is loaded in fp16
         text_lora_config = LoraConfig(
             r=model_config.lora_rank,
             lora_alpha=model_config.lora_rank,
@@ -467,7 +487,9 @@ def main(args):
             target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
         )
         text_encoder_one.add_adapter(text_lora_config)
-        text_encoder_two.add_adapter(text_lora_config)
+        
+        if text_encoder_two:
+            text_encoder_two.add_adapter(text_lora_config)
 
     # ============================
     # === Prepare optimization ===
@@ -488,26 +510,22 @@ def main(args):
             text_encoder_two_lora_layers_to_save = None
 
             for model in models:
-                if isinstance(unwrap_model(model), type(unwrap_model(unet))):
-                    unet_lora_layers_to_save = convert_state_dict_to_diffusers(
-                        get_peft_model_state_dict(model)
-                    )
+                unwrapped_model = unwrap_model(model)
+                state_model_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
+
+                if isinstance(unwrapped_model, type(unwrap_model(unet))):
+                    unet_lora_layers_to_save = state_model_dict
+
                 elif isinstance(
-                    unwrap_model(model), type(unwrap_model(text_encoder_one))
+                    unwrapped_model, type(unwrap_model(text_encoder_one))
                 ):
-                    text_encoder_one_lora_layers_to_save = (
-                        convert_state_dict_to_diffusers(
-                            get_peft_model_state_dict(model)
-                        )
-                    )
-                elif isinstance(
-                    unwrap_model(model), type(unwrap_model(text_encoder_two))
+                    text_encoder_one_lora_layers_to_save = state_model_dict
+
+                elif text_encoder_two and isinstance(
+                    unwrapped_model, type(unwrap_model(text_encoder_two))
                 ):
-                    text_encoder_two_lora_layers_to_save = (
-                        convert_state_dict_to_diffusers(
-                            get_peft_model_state_dict(model)
-                        )
-                    )
+                    text_encoder_two_lora_layers_to_save = state_model_dict
+
                 else:
                     raise ValueError(f"unexpected save model: {model.__class__}")
 
@@ -515,27 +533,35 @@ def main(args):
                 if weights:
                     weights.pop()
 
-            StableDiffusionXLPipeline.save_lora_weights(
-                output_dir,
-                unet_lora_layers=unet_lora_layers_to_save,
-                text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
-                text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
-            )
+            if using_sdxl:
+                StableDiffusionXLPipeline.save_lora_weights(
+                    save_directory=output_dir,
+                    unet_lora_layers=unet_lora_layers_to_save,
+                    text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
+                    text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
+                )
+
+            else:
+                StableDiffusionPipeline.save_lora_weights(
+                    save_directory=output_dir, 
+                    unet_lora_layers=unet_lora_layers_to_save, text_encoder_lora_layers=text_encoder_one_lora_layers_to_save
+                )
 
     def load_model_hook(models, input_dir):
         unet_ = None
         text_encoder_one_ = None
         text_encoder_two_ = None
 
-        while len(models) > 0:
-            model = models.pop()
-
+        while (model := models.pop()):
             if isinstance(model, type(unwrap_model(unet))):
                 unet_ = model
+
             elif isinstance(model, type(unwrap_model(text_encoder_one))):
                 text_encoder_one_ = model
-            elif isinstance(model, type(unwrap_model(text_encoder_two))):
+
+            elif text_encoder_two and isinstance(model, type(unwrap_model(text_encoder_two))):
                 text_encoder_two_ = model
+
             else:
                 raise ValueError(f"unexpected save model: {model.__class__}")
 
@@ -563,19 +589,22 @@ def main(args):
                 lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_one_
             )
 
-            _set_state_dict_into_text_encoder(
-                lora_state_dict,
-                prefix="text_encoder_2.",
-                text_encoder=text_encoder_two_,
-            )
+            if using_sdxl:
+                _set_state_dict_into_text_encoder(
+                    lora_state_dict,
+                    prefix="text_encoder_2.",
+                    text_encoder=text_encoder_two_,
+                )
 
-        # Make sure the trainable params are in float32. This is again needed since the base models
-        # are in `weight_dtype`. More details:
-        # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
+        # Make sure the trainable params are in float32.
         if model_config.mixed_precision == "fp16":
             models = [unet_]
             if model_config.train_text_encoder:
-                models.extend([text_encoder_one_, text_encoder_two_])
+                models.append(text_encoder_one_)
+                
+                if text_encoder_two:
+                    models.append(text_encoder_two_)
+
             cast_training_params(models, dtype=torch.float32)
 
     accelerator.register_save_state_pre_hook(save_model_hook)
@@ -585,7 +614,9 @@ def main(args):
         unet.enable_gradient_checkpointing()
         if model_config.train_text_encoder:
             text_encoder_one.gradient_checkpointing_enable()
-            text_encoder_two.gradient_checkpointing_enable()
+
+            if text_encoder_two:
+                text_encoder_two.gradient_checkpointing_enable()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -608,14 +639,14 @@ def main(args):
             models.extend([text_encoder_one, text_encoder_two])
         cast_training_params(models, dtype=torch.float32)
 
-    params_to_optimize = list(filter(lambda p: p.requires_grad, unet.parameters()))
-    if args.train_text_encoder:
-        params_to_optimize = (
-            params_to_optimize
-            + list(filter(lambda p: p.requires_grad, text_encoder_one.parameters()))
-            + list(filter(lambda p: p.requires_grad, text_encoder_two.parameters()))
-        )
 
+    models_to_optimize = [unet]
+    if model_config.train_text_encoder:
+        models_to_optimize.append(text_encoder_one)
+        if text_encoder_two:
+            models_to_optimize.append(text_encoder_two)
+
+    params_to_optimize = it.chain(filter(lambda p: p.requires_grad, model.parameters()) for model in models_to_optimize)
     optimizer_class = torch.optim.AdamW
     optimizer = optimizer_class(
         params_to_optimize,
@@ -652,7 +683,6 @@ def main(args):
     )
 
     with accelerator.main_process_first():
-        train_dataset.shuffle_index()
         train_dataset.data_getters["rgb"].set_extra_transforms(
             train_resizer, train_flipper, train_cropper
         )
@@ -664,20 +694,56 @@ def main(args):
         num_workers=model_config.dataloader_num_workers
     )
 
-    # =======================
-    # ===   Train model   ===
-    # =======================
+    # ==========================
+    # ===   Setup training   ===
+    # ==========================
 
     # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / model_config.gradient_accumulation_steps)
+    max_train_steps = model_config.n_epochs * num_update_steps_per_epoch
+
+    lr_scheduler = get_scheduler(
+        model_config.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=model_config.lr_warmup_steps * model_config.gradient_accumulation_steps,
+        num_training_steps=max_train_steps * model_config.gradient_accumulation_steps,
+    )
+
+    # Prepare everything with our `accelerator`.
+    if model_config.train_text_encoder:
+        if text_encoder_two:        
+            unet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                unet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler
+            )
+
+        else:
+            unet, text_encoder_one, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                unet, text_encoder_one, optimizer, train_dataloader, lr_scheduler
+            )
+
+    else:
+        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, optimizer, train_dataloader, lr_scheduler
+        )
+
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
+    max_train_steps = model_config.n_epochs * num_update_steps_per_epoch
 
+    # Afterwards we recalculate our number of training epochs
+    n_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 
-    # TODO
-    ...
+    # Some configurations require autocast to be disabled.
+    enable_autocast = True
+    if torch.backends.mps.is_available() or (
+        accelerator.mixed_precision == "fp16" or accelerator.mixed_precision == "bf16"
+    ):
+        enable_autocast = False
+
+    # ===================
+    # === Train model ===
+    # ===================
+
 
 
 if __name__ == "__main__":

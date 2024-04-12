@@ -9,6 +9,8 @@ from torch import Tensor
 
 
 def get_device():
+    # TODO: Make compatible with multi-gpu if possible
+
     try:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     except Exception:
