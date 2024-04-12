@@ -1,5 +1,5 @@
 from typing import Any
-from abc import ABC, abstractmethod, abstractproperty
+from abc import ABC, abstractmethod, abstractproperty, property
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +40,23 @@ class ModelId:
     sdxl_turbo = "stabilityai/sdxl-turbo"
 
 
+def prep_model(pipe, device=get_device(), low_mem_mode: bool = False, compile: bool = True):
+    if compile:
+        try:
+            pipe.unet = torch.compile(pipe.unet, fullgraph=True)
+        except AttributeError:
+            logging.warn(f"No unet found in Pipe. Skipping compiling")
+    
+    
+    if low_mem_mode: 
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe = pipe.to(device)
+
+
+    return pipe
+
+
 class DiffusionModel(ABC):
     load_model = None
 
@@ -61,11 +78,13 @@ class DiffusionModel(ABC):
             diff_img = self.diffuse_sample(sample, **kwargs)["rgb"]
             save_image(dst_path, diff_img)
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def vae(self):
         raise NotImplementedError
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def image_processor(self):
         raise NotImplementedError
 
@@ -78,14 +97,13 @@ class SDPipe(DiffusionModel):
     ) -> None:
         super().__init__()
         if configs is None:
-            configs = {
-                "base_model_id": ModelId.sd_15,
-                "refiner_model_id": None
-            }
+            configs = {}
 
-        base_model_id = configs.get("base_model_id")
-        refiner_model_id = configs.get("refiner_model_id")
-        low_mem_mode = configs.get("low_mem_mode")
+        base_model_id = configs.get("base_model_id", ModelId.sd_15)
+        refiner_model_id = configs.get("refiner_model_id", None)
+        low_mem_mode = configs.get("low_mem_mode", False)
+        compile_model = configs.get("compile_model", True)
+
         self.use_refiner = refiner_model_id is not None
 
         if self.use_refiner:
@@ -98,11 +116,8 @@ class SDPipe(DiffusionModel):
             variant="fp16",
             use_safetensors=True,
         )
-
-        if low_mem_mode: 
-            self.base_pipe.enable_model_cpu_offload()
-        else:
-            self.base_pipe = self.base_pipe.to(device)
+        self.base_pipe = prep_model(self.base_pipe, low_mem_mode=low_mem_mode, device=device, compile=compile_model)
+        
 
         if self.use_refiner:
             self.refiner_pipe = (
@@ -115,11 +130,7 @@ class SDPipe(DiffusionModel):
                     variant="fp16",
                 )
             )
-
-            if low_mem_mode:
-                self.refiner_pipe.enable_model_cpu_offload()
-            else:
-                self.refiner_pipe = self.refiner_pipe.to(device)     
+            self.refiner_pipe = prep_model(self.refiner_pipe, low_mem_mode=low_mem_mode, device=device, compile=compile_model)
 
     def diffuse_sample(
         self,
@@ -199,6 +210,9 @@ class SDXLPipe(DiffusionModel):
         device: torch.device = get_device(),
     ) -> None:
         super().__init__()
+        # TODO: add model compilation
+        # TODO: Combine with regular SD pipe
+        raise NotImplementedError
 
         if configs is None:
             configs = {
