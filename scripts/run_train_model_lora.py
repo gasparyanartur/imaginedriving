@@ -3,7 +3,7 @@ from pathlib import Path
 from argparse import ArgumentParser
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import math
 import itertools as it
 import tqdm
@@ -270,13 +270,14 @@ def preprocess_batch(
 
 @dataclass(init=True)
 class TrainLoraConfig:
-    model_id: str = "stabilityai/stable-diffusion-xl-base-1.0"
+    model_id: str = "runwayml/stable-diffusion-v1-5"
+    #model_id: str = "stabilityai/stable-diffusion-xl-base-1.0"
 
     # Path to pretrained VAE model with better numerical stability.
     # More details: https://githugb.com/huggingface/diffusers/pull/4038.
-    vae_id: str = "madebyollin/sdxl-vae-fp16-fix"
+    #vae_id: str = "madebyollin/sdxl-vae-fp16-fix"
+    vae_id: str = None
 
-    report_to: str = "wandb"
     mixed_precision: str = None
     revision: str = None
     variant: str = None
@@ -319,9 +320,9 @@ class TrainLoraConfig:
     center_crop: bool = False
     flip_prob: float = 0.5
 
-    push_to_hub: bool = False  # Not Implemented
-    hub_token: str = None
     seed: int = None
+
+
 
 
 def main(args):
@@ -335,6 +336,13 @@ def main(args):
     output_dir = Path(config["output_dir"])
     logging_dir = Path(output_dir, "logs")
 
+    report_to: str = config.get("report_to", "wandb")
+    name: str = config.get("name", "train-sd")
+    group: str = config.get("group", "finetune-lora")
+    project: str = config.get("project", "master-thesis")
+    push_to_hub: bool = config.get("push_to_hub", False)  # Not Implemented
+    hub_token: str | None = config.get("hub_token", None)
+
     model_config = TrainLoraConfig(**config["model"])
     using_sdxl = is_sdxl_model(model_config.model_id)
 
@@ -346,19 +354,28 @@ def main(args):
             f"Mismatch between model_id and vae_id. Both models need to either be SDXL or SD, but received {model_config.model_id} and {model_config.vae_id}"
         )
 
-    if model_config.report_to == "wandb":
+    if report_to == "wandb":
         if not is_wandb_available():
             raise ImportError(
                 "Make sure to install wandb if you want to use it for logging during training."
             )
 
-        if model_config.hub_token is not None:
+        if hub_token is not None:
             raise ValueError(
                 "You cannot use both report_to=wandb and hub_token due to a security risk of exposing your token."
                 " Please use `huggingface-cli login` to authenticate with the Hub."
             )
 
         import wandb
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", project),
+            dir=os.environ.get("WANDB_DIR", str(logging_dir)),
+            group=os.environ.get("WANDB_GROUP", group),
+            name=os.environ.get("WANDB_NAME", name),
+            reinit=True,
+            config=asdict(model_config)
+        )
+
 
     if torch.backends.mps.is_available() and model_config.mixed_precision == "bf16":
         # due to pytorch#99272, MPS does not yet support bfloat16.
@@ -373,7 +390,7 @@ def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=model_config.gradient_accumulation_steps,
         mixed_precision=model_config.mixed_precision,
-        log_with=model_config.report_to,
+        log_with=report_to,
         project_config=accelerator_project_config,
         kwargs_handlers=[accelerator_kwargs],
     )
@@ -398,7 +415,7 @@ def main(args):
         output_dir.mkdir(exist_ok=True, parents=True)
         logging_dir.mkdir(exist_ok=True)
 
-        if model_config.push_to_hub:
+        if push_to_hub:
             raise NotImplementedError
 
     # =======================
@@ -815,7 +832,7 @@ def main(args):
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {model_config.num_train_epochs}")
+    logger.info(f"  Num Epochs = {n_epochs}")
     logger.info(
         f"  Instantaneous batch size per device = {model_config.train_batch_size}"
     )
@@ -830,11 +847,31 @@ def main(args):
     first_epoch = 0
 
     if model_config.resume_from_checkpoint:
-        # TODO: Implement resuming
-        raise NotImplementedError
+        if model_config.resume_from_checkpoint != "latest":
+            path = os.path.basename(model_config.resume_from_checkpoint)
+        else:
+            # Get the most recent checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
+
+        if path is None:
+            accelerator.print(
+                f"Checkpoint '{model_config.resume_from_checkpoint}' does not exist. Starting a new training run."
+            )
+            initial_global_step = 0
+        else:
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(Path(args.output_dir, path))
+            global_step = int(path.split("-")[1])
+
+            initial_global_step = global_step
+            first_epoch = global_step // num_update_steps_per_epoch
 
     else:
         initial_global_step = 0
+
 
     progress_bar = tqdm.tqdm(
         range(0, max_train_steps),
@@ -844,7 +881,7 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
-    for epoch in range(first_epoch, model_config.num_train_epochs):
+    for epoch in range(first_epoch, n_epochs):
         unet.train()
         if model_config.train_text_encoder:
             text_encoder_one.train()
@@ -971,6 +1008,7 @@ def main(args):
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(params_to_optimize, model_config.max_grad_norm)
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -1121,16 +1159,11 @@ def main(args):
             del text_encoder_2_lora_layers
 
         torch.cuda.empty_cache()
-            
-        
 
         # Final inference
         # Make sure vae.dtype is consistent with the unet.dtype
         if model_config.mixed_precision == "fp16":
             vae.to(weight_dtype)
-
-
-
 
         if using_sdxl:
             pipeline = StableDiffusionXLPipeline.from_pretrained(
