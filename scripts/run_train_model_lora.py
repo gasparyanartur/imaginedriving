@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 import math
 import itertools as it
+import tqdm
 
 import numpy as np
 import torch
@@ -267,6 +268,7 @@ class TrainLoraConfig:
 
     train_text_encoder: bool = False
     gradient_checkpointing: bool = False
+    resume_from_checkpoint: bool = False
     n_epochs: int = 100
 
     # https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -743,6 +745,35 @@ def main(args):
     # ===================
     # === Train model ===
     # ===================
+    total_batch_size = model_config.train_batch_size * accelerator.num_processes * model_config.gradient_accumulation_steps
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {model_config.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {model_config.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {model_config.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {max_train_steps}")
+    global_step = 0
+    first_epoch = 0
+
+    if model_config.resume_from_checkpoint:
+        # TODO: Implement resuming
+        raise NotImplementedError
+
+    else:
+        initial_global_step = 0
+
+    
+    progress_bar = tqdm.tqdm(
+        range(0, max_train_steps),
+        initial=initial_global_step,
+        desc="Steps",
+        # Only show the progress bar once on each machine.
+        disable=not accelerator.is_local_main_process,
+    )
+
+    for epoch in range(first_epoch, model_config.num_train_epochs):
 
 
 
