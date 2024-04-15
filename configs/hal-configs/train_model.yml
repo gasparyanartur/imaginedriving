@@ -1,0 +1,80 @@
+project_name: ImagineDriving
+
+PROJ_DIR: null      # null: $(cwd)
+CACHE_DIR: null     # null: $(PROJ_DIR)/.cache
+
+datasets:
+  train_data:
+    dataset: pandaset
+    path: "/staging/agp/datasets/pandaset"
+    data_getters:
+      rgb:
+        camera: "front_camera"
+        #height: 1080
+        #width: 1920
+        height: 270
+        width: 480
+
+
+      prompt: 
+        type: static
+        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        negative_prompt: ""
+
+      meta: {}
+
+    data_tree: 
+      pandaset: 
+        #001-005: "*"
+        #001-005: "*"
+        001: "*"
+
+  val_data: 
+    train_data:
+    dataset: pandaset
+    path: "/staging/agp/datasets/pandaset"
+    data_getters:
+      rgb:
+        camera: "front_camera"
+        #height: 1080
+        #width: 1920
+        height: 264
+        width: 480
+      
+      prompt: 
+        type: static
+        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        negative_prompt: ""
+
+      meta: {}
+
+    data_tree: 
+      pandaset: 
+        006: 
+          - 01
+          - 02
+          - 03
+          - 04
+
+
+model:
+  model_id: "runwayml/stable-diffusion-v1-5"
+  revision: null
+  variant: null
+  max_train_samples: null
+  seed: 0
+  train_batch_size: 4
+  learning_rate: 0.0001
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.01
+  adam_epsilon: 0.00000001
+  max_grad_norm: 1.0
+  mixed_precision: null
+  lora_rank: 4
+
+  image_width: 480
+  image_height: 264
+
+output_dir: /staging/agp/masterthesis/nerf-thesis-shared/output/finetune/sd_v1-5
+log_with: wandb
