@@ -13,9 +13,10 @@ datasets:
         height: 1080
         width: 1920
 
-      static-prompt: 
-        positive-prompt: "dashcam video, self-driving car, urban driving scene"
-        negative-prompt: ""
+      prompt: 
+        type: static
+        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        negative_prompt: ""
 
       meta: {}
 
@@ -33,9 +34,10 @@ datasets:
         height: 1080
         width: 1920
       
-      static-prompt: 
-        positive-prompt: "dashcam video, self-driving car, urban driving scene"
-        negative-prompt: ""
+      prompt: 
+        type: static
+        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        negative_prompt: ""
 
       meta: {}
 
@@ -55,10 +57,10 @@ model:
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_weight_decay: 0.01
-  adam_epsilon: 1e-8
+  adam_epsilon: 0.00000001
   max_grad_norm: 1.0
   mixed_precision: null
   lora_rank: 4
-  log_with: wandb
 
 output_dir: /home/s0001900/dev/output/finetune/sd_v1-5
+log_with: wandb

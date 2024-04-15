@@ -363,14 +363,14 @@ class PromptDataGetter(DataGetter):
         
         match self.data_spec.get("type", "static"):
             case "static":
-                self.positive_prompt = self.data_spec.get("positive-prompt", "")
-                self.negative_prompt = self.data_spec.get("negative-prompt", "")
+                self.positive_prompt = self.data_spec.get("positive_prompt", "")
+                self.negative_prompt = self.data_spec.get("negative_prompt", "")
 
             case _:
                 raise NotImplementedError
 
     def get_data(self, dataset_path: Path, info: SampleInfo):
-        return {"positive-prompt": self.positive_prompt, "negative-prompt": self.negative_prompt}
+        return {"positive_prompt": self.positive_prompt, "negative_prompt": self.negative_prompt}
 
 class RGBDataGetter(DataGetter):
     def __init__(
@@ -433,7 +433,8 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         data_tree: dict[str, Any],
         info_getter: InfoGetter,
         data_getters: dict[str, DataGetter],
-        data_transforms: dict[str, callable[str, int]] = None
+        data_transforms: dict[str, Callable[[str], int]] = None,
+        preprocess_func = None
     ):
         self.sample_infos: list[SampleInfo] = info_getter.parse_tree(
             dataset_path, data_tree
@@ -441,6 +442,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         self.info_getter = info_getter
         self.data_getters = data_getters
         self.dataset_path = dataset_path
+        self.preprocess_func = preprocess_func
 
         self.data_transforms = {**data_transforms} if data_transforms else {}
         for data_type in data_getters.keys():
@@ -547,6 +549,9 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
                 data = data_transform(data)
 
             sample[data_type] = data
+
+        if self.preprocess_func:
+            sample = self.preprocess_func(sample)
 
         return sample
 

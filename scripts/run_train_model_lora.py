@@ -59,7 +59,7 @@ from src.data import setup_project, DynamicDataset
 from src.diffusion import is_sdxl_model, is_sdxl_vae
 
 
-check_min_version("0.28.0.dev0")
+check_min_version("0.27.0")
 logger = get_logger(__name__, log_level="INFO")
 
 
@@ -193,80 +193,95 @@ def compute_time_ids(original_size, crops_coords_top_left, target_size, device, 
     return add_time_ids
 
 
-def preprocess_rgbs(
-    rgbs, target_size: tuple[int, int], resizer, flipper, cropper, center_crop: bool
+def preprocess_rgb(
+    rgb, target_size: tuple[int, int], resizer, flipper, cropper, center_crop: bool
 ):
-    rgbs_pp = []
-    original_sizes = []
-    target_sizes = []
-    crop_top_lefts = []
+    th, tw = target_size
+    h0, w0 = rgb.shape[-2:]
 
-    for rgb in rgbs:
-        th, tw = target_size
-        h0, w0 = rgb.shape[-2:]
+    rgb = resizer(rgb)
+    rgb = flipper(rgb)
 
-        rgb = resizer(rgb)
-        rgb = flipper(rgb)
+    if center_crop:
+        cy = (h0 - th) // 2
+        cx = (w0 - tw) // 2
+        rgb = cropper(rgb)
 
-        if center_crop:
-            cy = (h0 - th) // 2
-            cx = (w0 - tw) // 2
-            rgb = cropper(rgb)
+    else:
+        cy, cx, h, w = cropper.get_params(rgb, target_size)
+        rgb = transforms.functional.crop(rgb, cy, cx, h, w)
 
-        else:
-            cy, cx, h, w = cropper.get_params(rgb, target_size)
-            rgb = transforms.functional.crop(rgb, cy, cx, h, w)
-
-        original_size = h0, w0
-        crop_top_left = cy, cx
-
-        original_sizes.append(original_size)
-        crop_top_lefts.append(crop_top_left)
-        rgbs_pp.append(rgb)
-        target_sizes.append(target_size)
+    original_size = h0, w0
+    crop_top_left = cy, cx
 
     return {
-        "rgb": rgbs_pp,
-        "original_size": original_sizes,
-        "crop_top_left": crop_top_lefts,
-        "target_size": target_sizes,
+        "rgb": rgb,
+        "original_size": original_size,
+        "crop_top_left": crop_top_left,
+        "target_size": target_size,
     }
 
 
-def preprocess_prompts(prompt: list[str], tokenizers):
+def preprocess_prompt(prompt: list[str], tokenizers):
     assert 1 <= len(tokenizers) <= 2
 
     if isinstance(prompt, str):
         prompt = [prompt]
 
-    input_ids_one = tokenize_prompt(tokenizers[0], prompt)
+    input_ids_one = tokenize_prompt(tokenizers[0], prompt)[0]
     input_ids_two = (
-        tokenize_prompt(tokenizers[1], prompt) if len(tokenizers) > 1 else None
+        tokenize_prompt(tokenizers[1], prompt)[0] if len(tokenizers) > 1 else None
     )
 
     return {"input_ids_one": input_ids_one, "input_ids_two": input_ids_two}
 
 
-def preprocess_batch(
+def preprocess_sample(
     batch, resizer, flipper, cropper, tokenizers, target_size, center_crop: bool = False
 ):
     # Ignore negative prompt :)
-
-    rgbs = preprocess_rgbs(
+    rgb = preprocess_rgb(
         batch["rgb"], target_size, resizer, flipper, cropper, center_crop
     )
-    prompts = preprocess_prompts(batch["prompt"]["positive_prompt"], tokenizers)
+    prompt = preprocess_prompt(batch["prompt"]["positive_prompt"], tokenizers)
 
-    return {
-        "original_size": rgbs["original_size"],
-        "crop_top_left": rgbs["crop_top_left"],
-        "target_size": rgbs["target_size"],
-        "rgb": rgbs["rgb"],
-        "input_ids_one": prompts["input_ids_one"],
-        "input_ids_two": prompts["input_ids_two"],
+    sample = {
+        "original_size": rgb["original_size"],
+        "crop_top_left": rgb["crop_top_left"],
+        "target_size": rgb["target_size"],
+        "rgb": rgb["rgb"],
+        "input_ids_one": prompt["input_ids_one"],
         "meta": batch["meta"]
     }
+    if prompt.get("input_ids_two"):
+        sample["input_ids_two"] = prompt["input_ids_two"]
 
+    return sample
+
+
+def collate_fn(batch: list[dict[str, Any]]) -> dict[list[str], Any]:
+    original_size = [sample["original_size"] for sample in batch]
+    crop_top_left = [sample["crop_top_left"] for sample in batch]
+    target_size = [sample["target_size"] for sample in batch]
+    rgb = torch.stack([sample["rgb"] for sample in batch]).to(memory_format=torch.contiguous_format, dtype=torch.float32)
+    meta = [sample["meta"] for sample in batch]
+    input_ids_one = torch.stack([sample["input_ids_one"] for sample in batch])
+
+    input_ids_two = torch.stack([sample["input_ids_two"] for sample in batch]) if "input_ids_two" in batch[0] else None
+
+    batch = {
+        "original_size": original_size,
+        "crop_top_left": crop_top_left,
+        "target_size": target_size,
+        "rgb": rgb,
+        "input_ids_one": input_ids_one,
+        "meta": meta
+    }
+
+    if input_ids_two:
+        batch["input_ids_two"] = input_ids_two
+
+    return batch
 
 @dataclass(init=True)
 class TrainLoraConfig:
@@ -288,6 +303,7 @@ class TrainLoraConfig:
     checkpoint_total_limit: int = None
     resume_from_checkpoint: bool = False
     n_epochs: int = 100
+    max_train_samples: int = None
 
     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
     noise_offset: float = 0
@@ -321,8 +337,6 @@ class TrainLoraConfig:
     flip_prob: float = 0.5
 
     seed: int = None
-
-
 
 
 def main(args):
@@ -678,6 +692,7 @@ def main(args):
     if model_config.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
+    learning_rate = model_config.learning_rate
     if model_config.scale_lr:
         learning_rate = (
             learning_rate
@@ -699,10 +714,12 @@ def main(args):
         if text_encoder_two:
             models_to_optimize.append(text_encoder_two)
 
-    params_to_optimize = it.chain(
-        filter(lambda p: p.requires_grad, model.parameters())
-        for model in models_to_optimize
-    )
+    params_to_optimize = []
+    for model in models_to_optimize:
+        for param in model.parameters():
+            if param.requires_grad:
+                params_to_optimize.append(param)
+
     optimizer_class = torch.optim.AdamW
     optimizer = optimizer_class(
         params_to_optimize,
@@ -724,7 +741,7 @@ def main(args):
     val_dataset = DynamicDataset.from_config(val_dataset_config)
 
     # Preprocessing
-    target_size = (model_config.img_height, model_config.img_width)
+    target_size = (model_config.image_height, model_config.image_width)
     resolution = min(target_size)
 
     train_resizer = transforms.Resize(
@@ -737,16 +754,27 @@ def main(args):
         else transforms.RandomCrop(target_size)
     )
 
+    val_resizer = transforms.Resize(
+        resolution, interpolation=transforms.InterpolationMode.BILINEAR
+    )
+    val_flipper = transforms.RandomHorizontalFlip(p=0.0)
+    val_cropper = transforms.CenterCrop(target_size)
+
+
+    tokenizers = [tokenizer_one]
+    if tokenizer_two:
+        tokenizers.append(tokenizer_two)
+
     with accelerator.main_process_first():
-        train_dataset.data_getters["rgb"].set_extra_transforms(
-            train_resizer, train_flipper, train_cropper
-        )
+        train_dataset.preprocess_func = lambda batch: preprocess_sample(batch, train_resizer, train_flipper, train_cropper, tokenizers, target_size, model_config.center_crop)
+        val_dataset.preprocess_func = lambda batch: preprocess_sample(batch, val_resizer, val_flipper, val_cropper, tokenizers, target_size, True)
 
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
         batch_size=model_config.train_batch_size,
         num_workers=model_config.dataloader_num_workers,
+        collate_fn=collate_fn
     )
 
     val_dataloader = DataLoader(
@@ -754,6 +782,7 @@ def main(args):
         shuffle=False,
         batch_size=model_config.train_batch_size,
         num_workers=model_config.dataloader_num_workers,
+        collate_fn=collate_fn
     )
 
     # ==========================
@@ -807,7 +836,7 @@ def main(args):
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
+        len(train_dataloader) / model_config.gradient_accumulation_steps
     )
     max_train_steps = model_config.n_epochs * num_update_steps_per_epoch
 
@@ -1076,7 +1105,7 @@ def main(args):
                     model_config.model_id,
                     vae=vae,
                     text_encoder=unwrap_model(text_encoder_one),
-                    unet=unwrap_model(unet)
+                    unet=unwrap_model(unet),
                     revision=model_config.revision,
                     variant=model_config.variant,
                     torch_dtype=weight_dtype
@@ -1182,7 +1211,7 @@ def main(args):
                 model_config.model_id,
                 vae=vae,
                 text_encoder=unwrap_model(text_encoder_one),
-                unet=unwrap_model(unet)
+                unet=unwrap_model(unet),
                 revision=model_config.revision,
                 variant=model_config.variant,
                 torch_dtype=weight_dtype
