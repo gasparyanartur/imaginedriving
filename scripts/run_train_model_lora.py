@@ -7,9 +7,11 @@ from dataclasses import dataclass
 import math
 import itertools as it
 import tqdm
+import shutil
 
 import numpy as np
 import torch
+from torch import nn
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 import transformers
@@ -21,6 +23,8 @@ from diffusers import (
     DDPMScheduler,
     StableDiffusionXLPipeline,
     StableDiffusionPipeline,
+    StableDiffusionXLImg2ImgPipeline,
+    StableDiffusionImg2ImgPipeline,
     UNet2DConditionModel,
 )
 from diffusers.loaders import LoraLoaderMixin
@@ -49,6 +53,7 @@ from accelerate.utils import (
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
 from huggingface_hub import create_repo, upload_folder
+from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 from src.data import setup_project, DynamicDataset
 from src.diffusion import is_sdxl_model, is_sdxl_vae
@@ -69,15 +74,16 @@ def import_text_encoder_class_from_model_name_or_path(
     match model_class:
         case "CLIPTextModel":
             from transformers import CLIPTextModel
+
             return CLIPTextModel
 
         case "CLIPTextModelWithProjection":
             from transformers import CLIPTextModelWithProjection
+
             return CLIPTextModelWithProjection
 
         case _:
-            raise ValueError(f"{model_class} is not supported.") 
- 
+            raise ValueError(f"{model_class} is not supported.")
 
 
 def parse_args():
@@ -110,7 +116,9 @@ def encode_prompt(text_encoders, text_input_ids_list=None):
         text_input_ids = text_input_ids_list[i]
 
         prompt_embeds = text_encoder(
-            text_input_ids.to(text_encoder.device), output_hidden_states=True, return_dict=False
+            text_input_ids.to(text_encoder.device),
+            output_hidden_states=True,
+            return_dict=False,
         )
 
         # We are only ALWAYS interested in the pooled output of the final text encoder
@@ -126,7 +134,7 @@ def encode_prompt(text_encoders, text_input_ids_list=None):
 
 
 def compute_vae_encodings(batch, vae):
-    images = batch.pop("pixel_values")
+    images = batch.pop("rgb")
     pixel_values = torch.stack(list(images))
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
     pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)
@@ -217,7 +225,12 @@ def preprocess_rgbs(
         rgbs_pp.append(rgb)
         target_sizes.append(target_size)
 
-    return {"rgb": rgbs_pp, "original_size": original_sizes, "crop_top_left": crop_top_lefts, "target_size": target_sizes}
+    return {
+        "rgb": rgbs_pp,
+        "original_size": original_sizes,
+        "crop_top_left": crop_top_lefts,
+        "target_size": target_sizes,
+    }
 
 
 def preprocess_prompts(prompt: list[str], tokenizers):
@@ -227,12 +240,11 @@ def preprocess_prompts(prompt: list[str], tokenizers):
         prompt = [prompt]
 
     input_ids_one = tokenize_prompt(tokenizers[0], prompt)
-    input_ids_two = tokenize_prompt(tokenizers[1], prompt) if len(tokenizers) > 1 else None
+    input_ids_two = (
+        tokenize_prompt(tokenizers[1], prompt) if len(tokenizers) > 1 else None
+    )
 
-    return {
-        "input_ids_one": input_ids_one,
-        "input_ids_two": input_ids_two
-    }
+    return {"input_ids_one": input_ids_one, "input_ids_two": input_ids_two}
 
 
 def preprocess_batch(
@@ -240,7 +252,9 @@ def preprocess_batch(
 ):
     # Ignore negative prompt :)
 
-    rgbs = preprocess_rgbs(batch["rgb"], target_size, resizer, flipper, cropper, center_crop)
+    rgbs = preprocess_rgbs(
+        batch["rgb"], target_size, resizer, flipper, cropper, center_crop
+    )
     prompts = preprocess_prompts(batch["prompt"]["positive_prompt"], tokenizers)
 
     return {
@@ -249,7 +263,8 @@ def preprocess_batch(
         "target_size": rgbs["target_size"],
         "rgb": rgbs["rgb"],
         "input_ids_one": prompts["input_ids_one"],
-        "input_ids_two": prompts["input_ids_two"]
+        "input_ids_two": prompts["input_ids_two"],
+        "meta": batch["meta"]
     }
 
 
@@ -268,8 +283,13 @@ class TrainLoraConfig:
 
     train_text_encoder: bool = False
     gradient_checkpointing: bool = False
+    checkpointing_steps: int = 500
+    checkpoint_total_limit: int = None
     resume_from_checkpoint: bool = False
     n_epochs: int = 100
+
+    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+    noise_offset: float = 0
 
     # https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     allow_tf32: bool = True
@@ -282,7 +302,9 @@ class TrainLoraConfig:
     adam_beta2: float = 0.999
     adam_weight_decay: float = 1e-2
     adam_epsilon: float = 1e-08
-    
+    snr_gamma: float = None
+    max_grad_norm: float = 1.0
+
     # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]'
     lr_scheduler = "constant"
     lr_warmup_steps = 500
@@ -297,7 +319,7 @@ class TrainLoraConfig:
     center_crop: bool = False
     flip_prob: float = 0.5
 
-    push_to_hub: bool = False       # Not Implemented
+    push_to_hub: bool = False  # Not Implemented
     hub_token: str = None
     seed: int = None
 
@@ -317,15 +339,19 @@ def main(args):
     using_sdxl = is_sdxl_model(model_config.model_id)
 
     if (model_config.vae_id is not None) and (
-        (using_sdxl and not is_sdxl_vae(model_config.vae_id)) or 
-        (not using_sdxl and is_sdxl_vae(model_config.vae_id))
+        (using_sdxl and not is_sdxl_vae(model_config.vae_id))
+        or (not using_sdxl and is_sdxl_vae(model_config.vae_id))
     ):
-        raise ValueError(f"Mismatch between model_id and vae_id. Both models need to either be SDXL or SD, but received {model_config.model_id} and {model_config.vae_id}")
+        raise ValueError(
+            f"Mismatch between model_id and vae_id. Both models need to either be SDXL or SD, but received {model_config.model_id} and {model_config.vae_id}"
+        )
 
     if model_config.report_to == "wandb":
         if not is_wandb_available():
-            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
-     
+            raise ImportError(
+                "Make sure to install wandb if you want to use it for logging during training."
+            )
+
         if model_config.hub_token is not None:
             raise ValueError(
                 "You cannot use both report_to=wandb and hub_token due to a security risk of exposing your token."
@@ -333,7 +359,6 @@ def main(args):
             )
 
         import wandb
-
 
     if torch.backends.mps.is_available() and model_config.mixed_precision == "bf16":
         # due to pytorch#99272, MPS does not yet support bfloat16.
@@ -379,6 +404,9 @@ def main(args):
     # =======================
     # ===   Load models   ===
     # =======================
+    
+    ssim_metric = StructuralSimilarityIndexMeasure(data_range=(0.0, 1.0), reduction="none")
+
     noise_scheduler = DDPMScheduler.from_pretrained(
         model_config.model_id, subfolder="scheduler"
     )
@@ -420,14 +448,15 @@ def main(args):
         text_encoder_cls_two = None
         text_encoder_two = None
 
-
-    if model_config.vae_id is None:     # Need VAE fix for stable diffusion XL, see https://github.com/huggingface/diffusers/pull/4038
+    if (
+        model_config.vae_id is None
+    ):  # Need VAE fix for stable diffusion XL, see https://github.com/huggingface/diffusers/pull/4038
         vae = AutoencoderKL.from_pretrained(
-            model_config.model_id,  
+            model_config.model_id,
             subfolder="vae",
             revision=model_config.revision,
             variant=model_config.variant,
-        ) 
+        )
     else:
         vae = AutoencoderKL.from_pretrained(
             model_config.vae_id,
@@ -465,14 +494,16 @@ def main(args):
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
 
-    if using_sdxl and model_config.vae_id is None:      # The VAE in SDXL is in float32 to avoid NaN losses.
+    if (
+        using_sdxl and model_config.vae_id is None
+    ):  # The VAE in SDXL is in float32 to avoid NaN losses.
         vae.to(accelerator.device, dtype=torch.float32)
     else:
         vae.to(accelerator.device, dtype=weight_dtype)
 
     if text_encoder_two:
         text_encoder_two.to(accelerator.device, dtype=weight_dtype)
-        
+
     unet_lora_config = LoraConfig(
         r=model_config.lora_rank,
         lora_alpha=model_config.lora_rank,
@@ -489,9 +520,10 @@ def main(args):
             target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
         )
         text_encoder_one.add_adapter(text_lora_config)
-        
+
         if text_encoder_two:
             text_encoder_two.add_adapter(text_lora_config)
+
 
     # ============================
     # === Prepare optimization ===
@@ -513,14 +545,14 @@ def main(args):
 
             for model in models:
                 unwrapped_model = unwrap_model(model)
-                state_model_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
+                state_model_dict = convert_state_dict_to_diffusers(
+                    get_peft_model_state_dict(model)
+                )
 
                 if isinstance(unwrapped_model, type(unwrap_model(unet))):
                     unet_lora_layers_to_save = state_model_dict
 
-                elif isinstance(
-                    unwrapped_model, type(unwrap_model(text_encoder_one))
-                ):
+                elif isinstance(unwrapped_model, type(unwrap_model(text_encoder_one))):
                     text_encoder_one_lora_layers_to_save = state_model_dict
 
                 elif text_encoder_two and isinstance(
@@ -545,8 +577,9 @@ def main(args):
 
             else:
                 StableDiffusionPipeline.save_lora_weights(
-                    save_directory=output_dir, 
-                    unet_lora_layers=unet_lora_layers_to_save, text_encoder_lora_layers=text_encoder_one_lora_layers_to_save
+                    save_directory=output_dir,
+                    unet_lora_layers=unet_lora_layers_to_save,
+                    text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
                 )
 
     def load_model_hook(models, input_dir):
@@ -554,14 +587,16 @@ def main(args):
         text_encoder_one_ = None
         text_encoder_two_ = None
 
-        while (model := models.pop()):
+        while model := models.pop():
             if isinstance(model, type(unwrap_model(unet))):
                 unet_ = model
 
             elif isinstance(model, type(unwrap_model(text_encoder_one))):
                 text_encoder_one_ = model
 
-            elif text_encoder_two and isinstance(model, type(unwrap_model(text_encoder_two))):
+            elif text_encoder_two and isinstance(
+                model, type(unwrap_model(text_encoder_two))
+            ):
                 text_encoder_two_ = model
 
             else:
@@ -603,7 +638,7 @@ def main(args):
             models = [unet_]
             if model_config.train_text_encoder:
                 models.append(text_encoder_one_)
-                
+
                 if text_encoder_two:
                     models.append(text_encoder_two_)
 
@@ -641,14 +676,16 @@ def main(args):
             models.extend([text_encoder_one, text_encoder_two])
         cast_training_params(models, dtype=torch.float32)
 
-
     models_to_optimize = [unet]
     if model_config.train_text_encoder:
         models_to_optimize.append(text_encoder_one)
         if text_encoder_two:
             models_to_optimize.append(text_encoder_two)
 
-    params_to_optimize = it.chain(filter(lambda p: p.requires_grad, model.parameters()) for model in models_to_optimize)
+    params_to_optimize = it.chain(
+        filter(lambda p: p.requires_grad, model.parameters())
+        for model in models_to_optimize
+    )
     optimizer_class = torch.optim.AdamW
     optimizer = optimizer_class(
         params_to_optimize,
@@ -661,7 +698,6 @@ def main(args):
     # ======================
     # ===   Setup data   ===
     # ======================
-
 
     dataset_config = config["datasets"]
     train_dataset_config = dataset_config["train_data"]
@@ -693,7 +729,14 @@ def main(args):
         train_dataset,
         shuffle=True,
         batch_size=model_config.train_batch_size,
-        num_workers=model_config.dataloader_num_workers
+        num_workers=model_config.dataloader_num_workers,
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        shuffle=False,
+        batch_size=model_config.train_batch_size,
+        num_workers=model_config.dataloader_num_workers,
     )
 
     # ==========================
@@ -701,26 +744,43 @@ def main(args):
     # ==========================
 
     # Scheduler and math around the number of training steps.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / model_config.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / model_config.gradient_accumulation_steps
+    )
     max_train_steps = model_config.n_epochs * num_update_steps_per_epoch
 
     lr_scheduler = get_scheduler(
         model_config.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=model_config.lr_warmup_steps * model_config.gradient_accumulation_steps,
+        num_warmup_steps=model_config.lr_warmup_steps
+        * model_config.gradient_accumulation_steps,
         num_training_steps=max_train_steps * model_config.gradient_accumulation_steps,
     )
 
     # Prepare everything with our `accelerator`.
     if model_config.train_text_encoder:
-        if text_encoder_two:        
-            unet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                unet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler
+        if text_encoder_two:
+            (
+                unet,
+                text_encoder_one,
+                text_encoder_two,
+                optimizer,
+                train_dataloader,
+                lr_scheduler,
+            ) = accelerator.prepare(
+                unet,
+                text_encoder_one,
+                text_encoder_two,
+                optimizer,
+                train_dataloader,
+                lr_scheduler,
             )
 
         else:
-            unet, text_encoder_one, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                unet, text_encoder_one, optimizer, train_dataloader, lr_scheduler
+            unet, text_encoder_one, optimizer, train_dataloader, lr_scheduler = (
+                accelerator.prepare(
+                    unet, text_encoder_one, optimizer, train_dataloader, lr_scheduler
+                )
             )
 
     else:
@@ -729,7 +789,9 @@ def main(args):
         )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     max_train_steps = model_config.n_epochs * num_update_steps_per_epoch
 
     # Afterwards we recalculate our number of training epochs
@@ -745,14 +807,24 @@ def main(args):
     # ===================
     # === Train model ===
     # ===================
-    total_batch_size = model_config.train_batch_size * accelerator.num_processes * model_config.gradient_accumulation_steps
+    total_batch_size = (
+        model_config.train_batch_size
+        * accelerator.num_processes
+        * model_config.gradient_accumulation_steps
+    )
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {model_config.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {model_config.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {model_config.gradient_accumulation_steps}")
+    logger.info(
+        f"  Instantaneous batch size per device = {model_config.train_batch_size}"
+    )
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+    )
+    logger.info(
+        f"  Gradient Accumulation steps = {model_config.gradient_accumulation_steps}"
+    )
     logger.info(f"  Total optimization steps = {max_train_steps}")
     global_step = 0
     first_epoch = 0
@@ -764,7 +836,6 @@ def main(args):
     else:
         initial_global_step = 0
 
-    
     progress_bar = tqdm.tqdm(
         range(0, max_train_steps),
         initial=initial_global_step,
@@ -774,6 +845,350 @@ def main(args):
     )
 
     for epoch in range(first_epoch, model_config.num_train_epochs):
+        unet.train()
+        if model_config.train_text_encoder:
+            text_encoder_one.train()
+            if text_encoder_two:
+                text_encoder_two.train()
+
+        train_loss = 0.0
+        for step, batch in enumerate(train_dataloader):
+            rgb_dtype = batch.dtype if model_config.model_id is None else weight_dtype
+
+            with accelerator.accumulate(unet):
+                rgbs = batch["rgb"].to(rgb_dtype)
+                model_input = vae.encode(rgbs).latent_dist.sample()
+                model_input = model_input * vae.config.scaling_factor
+                model_input = model_input.to(rgb_dtype)
+
+                noise = torch.randn_like(model_input)
+                if model_config.noise_offset:
+                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                    noise += model_config.noise_offset * torch.randn(
+                        (model_input.shape[0], model_input.shape[1], 1, 1),
+                        device=model_input.device,
+                    )
+
+                bsz = model_input.shape[0]
+                # Sample a random timestep for each image
+                timesteps = torch.randint(
+                    0,
+                    noise_scheduler.config.num_train_timesteps,
+                    (bsz,),
+                    device=model_input.device,
+                    dtype=torch.long,
+                )
+
+                # Add noise to the model input according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_model_input = noise_scheduler.add_noise(
+                    model_input, noise, timesteps
+                )
+
+                add_time_ids = torch.cat(
+                    [
+                        compute_time_ids(s, c, ts, accelerator.device, weight_dtype)
+                        for s, c, ts in zip(
+                            batch["original_size"],
+                            batch["crop_top_left"],
+                            batch["target_size"],
+                        )
+                    ]
+                )
+
+                # Predict the noise residual
+                unet_added_conditions = {"time_ids": add_time_ids}
+                text_encoders = [text_encoder_one]
+                text_input_ids_list = [batch["input_ids_one"]]
+                if text_encoder_two:
+                    text_encoders.append(text_encoder_two)
+                    text_input_ids_list.append(batch["input_ids_two"])
+
+                prompt_embeds, pooled_prompt_embeds = encode_prompt(
+                    text_encoders=text_encoders, text_input_ids_list=text_input_ids_list
+                )
+                unet_added_conditions["text_embeds"] = pooled_prompt_embeds
+                model_pred = unet(
+                    noisy_model_input,
+                    timesteps,
+                    prompt_embeds,
+                    added_cond_kwargs=unet_added_conditions,
+                    return_dict=False,
+                )[0]
+
+                # Get the target for loss depending on the prediction type
+                if model_config.prediction_type is not None:
+                    # set prediction_type of scheduler if defined
+                    noise_scheduler.register_to_config(
+                        prediction_type=model_config.prediction_type
+                    )
+
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(model_input, noise, timesteps)
+                else:
+                    raise ValueError(
+                        f"Unknown prediction type {noise_scheduler.config.prediction_type}"
+                    )
+
+                if model_config.snr_gamma is None:
+                    loss = nn.functional.mse_loss(
+                        model_pred.float(), target.float(), reduction="mean"
+                    )
+                else:
+                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                    # This is discussed in Section 4.2 of the same paper.
+                    snr = compute_snr(noise_scheduler, timesteps)
+                    mse_loss_weights = torch.stack(
+                        [snr, model_config.snr_gamma * torch.ones_like(timesteps)],
+                        dim=1,
+                    ).min(dim=1)[0]
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        mse_loss_weights = mse_loss_weights / snr
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        mse_loss_weights = mse_loss_weights / (snr + 1)
+
+                    loss = nn.functional.mse_loss(
+                        model_pred.float(), target.float(), reduction="none"
+                    )
+                    loss = (
+                        loss.mean(dim=list(range(1, len(loss.shape))))
+                        * mse_loss_weights
+                    )
+                    loss = loss.mean()
+
+                if args.debug_loss and "meta" in batch:
+                    for meta in batch["meta"]:
+                        accelerator.log({"loss_for_" + meta.path: loss}, step=global_step)
+
+                # Gather the losses across all processes for logging (if we use distributed training).
+                avg_loss = accelerator.gather(loss.repeat(model_config.train_batch_size)).mean()
+                train_loss += avg_loss.item() / model_config.gradient_accumulation_steps                    
+
+                # Backpropagate
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(params_to_optimize, model_config.max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+                accelerator.log({"train_loss": train_loss}, step=global_step)
+                train_loss = 0.0
+
+                if accelerator.is_main_process:
+                    if global_step % model_config.checkpointing_steps == 0:
+                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                        if model_config.checkpoints_total_limit is not None:
+                            checkpoints = os.listdir(output_dir)
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                            if len(checkpoints) >= model_config.checkpoints_total_limit:
+                                num_to_remove = len(checkpoints) - model_config.checkpoints_total_limit + 1
+                                removing_checkpoints = checkpoints[0:num_to_remove]
+
+                                logger.info(
+                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                )
+                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                for removing_checkpoint in removing_checkpoints:
+                                    removing_checkpoint = os.path.join(output_dir, removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint)
+
+                        save_path = Path(output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
+
+            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+
+            if global_step >= max_train_steps:
+                break
+
+        if accelerator.is_main_process:
+            # Validation
+
+            logger.info(
+                f"Running validation..."
+            )
+            # create pipeline
+            if using_sdxl:
+                pipeline = StableDiffusionXLPipeline.from_pretrained(
+                    model_config.model_id,
+                    vae=vae,
+                    text_encoder=unwrap_model(text_encoder_one),
+                    text_encoder_2=unwrap_model(text_encoder_two),
+                    unet=unwrap_model(unet),
+                    revision=model_config.revision,
+                    variant=model_config.variant,
+                    torch_dtype=weight_dtype,
+                )
+
+            else:
+                pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
+                    model_config.model_id,
+                    vae=vae,
+                    text_encoder=unwrap_model(text_encoder_one),
+                    unet=unwrap_model(unet)
+                    revision=model_config.revision,
+                    variant=model_config.variant,
+                    torch_dtype=weight_dtype
+                )
+
+            pipeline = pipeline.to(accelerator.device)
+            pipeline.set_progress_bar_config(disable=True)
+
+
+            for step, batch in enumerate(val_dataloader):
+                val_bs = len(batch)
+                random_seeds = list(range(model_config.seed, model_config.seed+val_bs)) if model_config.seed else np.random.randint(0, 10000000, (val_bs,))
+                generator = [torch.Generator(device=accelerator.device).manual_seed(seed) for seed in random_seeds]
+
+                with torch.autocast(
+                    accelerator.device.type,
+                    enabled=enable_autocast,
+                ):
+                    output_imgs = pipeline(prompt=batch["prompt"], generator=generator).images
+
+                # Benchmark
+                log_values = {"ssim": ssim_metric(output_imgs, batch["rgb"])}
+
+                for tracker in accelerator.trackers:
+                    if tracker.name == "tensorboard":
+                        np_images = np.stack([np.asarray(img) for img in output_imgs])
+                        tracker.writer.add_images("val_output", np_images, epoch, dataformats="NHWC")
+
+                    if tracker.name == "wandb":
+                        log_values["val_output"] = [
+                            wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
+                            for (img, meta) in (zip(output_imgs, batch["meta"]))
+                        ]
+
+                accelerator.log(log_values, step=step)
+
+                del pipeline
+                torch.cuda.empty_cache()
+
+     # Save the lora layers
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        unet = unwrap_model(unet)
+        unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
+
+        if model_config.train_text_encoder:
+            text_encoder_one = unwrap_model(text_encoder_one)
+            if text_encoder_two:
+                text_encoder_two = unwrap_model(text_encoder_two)
+
+            text_encoder_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder_one))
+            if text_encoder_two:
+                text_encoder_2_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder_two))
+
+        else:
+            text_encoder_lora_layers = None
+            text_encoder_2_lora_layers = None
+
+        if using_sdxl:
+            StableDiffusionXLPipeline.save_lora_weights(
+                save_directory=output_dir,
+                unet_lora_layers=unet_lora_state_dict,
+                text_encoder_lora_layers=text_encoder_lora_layers,
+                text_encoder_2_lora_layers=text_encoder_2_lora_layers,
+            )
+
+        else:
+            StableDiffusionPipeline.save_lora_weights(
+                save_directory=output_dir,
+                unet_lora_layers=unet_lora_state_dict,
+                text_encoder_lora_layers=text_encoder_lora_layers
+            )
+
+        del unet
+        del text_encoder_one
+        del text_encoder_two
+        del text_encoder_lora_layers
+
+        if text_encoder_two:
+            del text_encoder_2_lora_layers
+
+        torch.cuda.empty_cache()
+            
+        
+
+        # Final inference
+        # Make sure vae.dtype is consistent with the unet.dtype
+        if model_config.mixed_precision == "fp16":
+            vae.to(weight_dtype)
+
+
+
+
+        if using_sdxl:
+            pipeline = StableDiffusionXLPipeline.from_pretrained(
+                model_config.model_id,
+                vae=vae,
+                text_encoder=unwrap_model(text_encoder_one),
+                text_encoder_2=unwrap_model(text_encoder_two),
+                unet=unwrap_model(unet),
+                revision=model_config.revision,
+                variant=model_config.variant,
+                torch_dtype=weight_dtype,
+            )
+
+        else:
+            pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
+                model_config.model_id,
+                vae=vae,
+                text_encoder=unwrap_model(text_encoder_one),
+                unet=unwrap_model(unet)
+                revision=model_config.revision,
+                variant=model_config.variant,
+                torch_dtype=weight_dtype
+            )
+
+        pipeline = pipeline.to(accelerator.device)
+        pipeline.set_progress_bar_config(disable=True)
+
+        for step, batch in enumerate(val_dataloader):
+            val_bs = len(batch)
+            random_seeds = list(range(model_config.seed, model_config.seed+val_bs)) if model_config.seed else np.random.randint(0, 10000000, (val_bs,))
+            generator = [torch.Generator(device=accelerator.device).manual_seed(seed) for seed in random_seeds]
+
+            with torch.autocast(
+                accelerator.device.type,
+                enabled=enable_autocast,
+            ):
+                output_imgs = pipeline(prompt=batch["prompt"], generator=generator).images
+
+            # Benchmark
+            log_values = {"ssim": ssim_metric(output_imgs, batch["rgb"])}
+
+            for tracker in accelerator.trackers:
+                if tracker.name == "tensorboard":
+                    np_images = np.stack([np.asarray(img) for img in output_imgs])
+                    tracker.writer.add_images("test_output", np_images, epoch, dataformats="NHWC")
+
+                if tracker.name == "wandb":
+                    log_values["test_output"] = [
+                        wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
+                        for (img, meta) in (zip(output_imgs, batch["meta"]))
+                    ]
+
+            accelerator.log(log_values, step=step)
+
+            del pipeline
+            torch.cuda.empty_cache()
+
+    accelerator.end_training()
 
 
 
