@@ -15,7 +15,6 @@ datasets:
         height: 536
         width: 960
 
-
       prompt: 
         type: static
         positive_prompt: "dashcam video, self-driving car, urban driving scene"
@@ -27,7 +26,10 @@ datasets:
       pandaset: 
         #001-005: "*"
         #001-005: "*"
-        001: ":8:"
+        #001: "0:4:"
+        001:
+          - 01
+          
 
   val_data: 
     dataset: pandaset
@@ -49,7 +51,10 @@ datasets:
 
     data_tree: 
       pandaset: 
-        001: "6:10:"
+        #001: "0:4:"
+        001:
+          - 01
+          
 
 
 model:
@@ -58,7 +63,7 @@ model:
   variant: null
   max_train_samples: null
   seed: 0
-  train_batch_size: 4
+  train_batch_size: 1
   learning_rate: 0.0003
   adam_beta1: 0.9
   adam_beta2: 0.999

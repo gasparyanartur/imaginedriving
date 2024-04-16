@@ -1037,7 +1037,7 @@ def main(args):
 
                 if config.get("debug_loss", False) and "meta" in batch:
                     for meta in batch["meta"]:
-                        accelerator.log({"loss_for_" + meta.path: loss})
+                        accelerator.log({"loss_for_" + meta.path: loss}, step=global_step)
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(model_config.train_batch_size)).mean()
@@ -1139,10 +1139,15 @@ def main(args):
                 # Benchmark
                 ssim_values = ssim_metric(
                     output_imgs.to(dtype=torch.float32, device=accelerator.device),
-                    batch["rgb"].to(dtype=torch.float32, device=accelerator.device))
+                    batch["rgb"].to(dtype=torch.float32, device=accelerator.device)
+                )
+
+                if len(ssim_values.shape) == 0:
+                    ssim_values = [ssim_values.item()]
+
                 ssim_value_dict = {str(i): float(v) for i, v in enumerate(ssim_values)}
                 log_values = {"val_ssim": ssim_value_dict}
-                accelerator.log(log_values)
+                accelerator.log(log_values, step=global_step)
 
                 for tracker in accelerator.trackers:
                     if tracker.name == "tensorboard":
@@ -1150,10 +1155,16 @@ def main(args):
                         tracker.writer.add_images("val_images", np_images, epoch, dataformats="NHWC")
 
                     if tracker.name == "wandb":
-                        tracker.log_images({"val_images": [
-                            wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
-                            for (img, meta) in (zip(output_imgs, batch["meta"]))
-                        ]})
+                        tracker.log_images({
+                            "ground_truth": [
+                                wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
+                                for (img, meta) in (zip(batch["rgb"], batch["meta"]))
+                            ],
+                            "val_images": [
+                                wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
+                                for (img, meta) in (zip(output_imgs, batch["meta"]))
+                            ]
+                        }, step=global_step)
 
             del pipeline
             torch.cuda.empty_cache()
@@ -1227,7 +1238,7 @@ def main(args):
         pipeline.load_lora_weights(output_dir)
 
         for step, batch in enumerate(val_dataloader):
-            val_bs = len(batch)
+            val_bs = len(batch["rgb"])
             random_seeds = np.arange(val_bs * step, val_bs * (step+1))  
             generator = [torch.Generator(device=accelerator.device).manual_seed(int(seed)) for seed in random_seeds]
 
@@ -1241,9 +1252,14 @@ def main(args):
             ssim_values = ssim_metric(
                 output_imgs.to(dtype=torch.float32, device=accelerator.device),
                 batch["rgb"].to(dtype=torch.float32, device=accelerator.device))
+
+
+            if len(ssim_values.shape) == 0:
+                ssim_values = [ssim_values.item()]
+
             ssim_value_dict = {str(i): float(v) for i, v in enumerate(ssim_values)}
             log_values = {"test_ssim": ssim_value_dict}
-            accelerator.log(log_values)
+            accelerator.log(log_values, step=global_step)
 
             for tracker in accelerator.trackers:
                 if tracker.name == "tensorboard":
@@ -1251,10 +1267,16 @@ def main(args):
                     tracker.writer.add_images("test_images", np_images, epoch, dataformats="NHWC")
 
                 if tracker.name == "wandb":
-                    tracker.log_images({"test_images": [
-                        wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
-                        for (img, meta) in (zip(output_imgs, batch["meta"]))
-                    ]})
+                    tracker.log_images({
+                        "ground_truth": [
+                            wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
+                            for (img, meta) in (zip(batch["rgb"], batch["meta"]))
+                        ],
+                        "test_images": [
+                            wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
+                            for (img, meta) in (zip(output_imgs, batch["meta"]))
+                        ]
+                    }, step=global_step)
 
 
         del pipeline
