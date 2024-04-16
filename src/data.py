@@ -22,6 +22,7 @@ from src.utils import get_env, set_env, set_if_no_key
 
 norm_img_pipeline = transform.Compose([transform.ConvertImageDtype(torch.float32)])
 suffixes = {("rgb", "pandaset"): ".jpg", ("rgb", "neurad"): ".jpg"}
+RANGE_SEP = ":"
 
 
 def get_dataset_from_path(path: Path) -> str:
@@ -150,9 +151,9 @@ def read_data_tree(
                 if scene == "*":
                     sample_list = (None, None, None)
                     
-                elif ":" in scene:
-                    scene_parts = scene.strip().split("")
-                    assert len(scene_parts) == 3
+                elif RANGE_SEP in scene:
+                    sample_list = scene.strip().split(RANGE_SEP)
+                    assert len(sample_list) == 3
 
                     start_range = int(sample_list[0]) if sample_list[0] != '' else None
                     end_range = int(sample_list[1]) if sample_list[1] != '' else None
@@ -230,9 +231,9 @@ class InfoGetter(ABC):
             for scene_name, sample_list in dataset_dict.items():
                 if isinstance(sample_list, tuple) and len(sample_list) == 3:
                     start_range, end_range, skip_range = sample_list
-                    sample_list = self.get_sample_names_in_scene(
+                    sample_list = sorted(self.get_sample_names_in_scene(
                         dataset_path, scene_name
-                    ) 
+                    ))
 
                     if start_range is None:
                         start_range = 0
@@ -243,7 +244,7 @@ class InfoGetter(ABC):
                     if skip_range is None:
                         skip_range = 1
 
-                    sample_list = sample_list[start_range:end_range:skip_range]
+                    sample_list = [sample_list[i] for i in range(start_range, end_range, skip_range)]
 
                 if not isinstance(sample_list, list):
                     raise NotImplementedError
