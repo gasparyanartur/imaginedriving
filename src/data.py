@@ -147,8 +147,21 @@ def read_data_tree(
         scene_dict = {}
         for scene_name, scene in dataset.items():
             if isinstance(scene, str):
-                assert scene == "*"
-                sample_list = None
+                if scene == "*":
+                    sample_list = (None, None, None)
+                    
+                elif ":" in scene:
+                    scene_parts = scene.strip().split("")
+                    assert len(scene_parts) == 3
+
+                    start_range = int(sample_list[0]) if sample_list[0] != '' else None
+                    end_range = int(sample_list[1]) if sample_list[1] != '' else None
+                    skip_range = int(sample_list[2]) if sample_list[2] != '' else None
+
+                    sample_list = (start_range, end_range, skip_range)
+
+                else:
+                    raise NotImplementedError
 
             else:
                 sample_list = []
@@ -215,10 +228,25 @@ class InfoGetter(ABC):
 
         for dataset_name, dataset_dict in data_tree.items():
             for scene_name, sample_list in dataset_dict.items():
-                if sample_list is None:
+                if isinstance(sample_list, tuple) and len(sample_list) == 3:
+                    start_range, end_range, skip_range = sample_list
                     sample_list = self.get_sample_names_in_scene(
                         dataset_path, scene_name
-                    )
+                    ) 
+
+                    if start_range is None:
+                        start_range = 0
+
+                    if end_range is None:
+                        end_range = len(sample_list)
+
+                    if skip_range is None:
+                        skip_range = 1
+
+                    sample_list = sample_list[start_range:end_range:skip_range]
+
+                if not isinstance(sample_list, list):
+                    raise NotImplementedError
 
                 for sample_name in sample_list:
                     info = SampleInfo(dataset_name, scene_name, sample_name)

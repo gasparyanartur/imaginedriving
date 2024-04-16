@@ -73,6 +73,10 @@ model:
   mixed_precision: null
   lora_rank: 4
 
+  center_crop: True
+  flip_prob: 0
+
+
   image_width: 480
   image_height: 264
 

@@ -408,7 +408,7 @@ def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=model_config.gradient_accumulation_steps,
         mixed_precision=model_config.mixed_precision,
-        log_with=report_to,
+        log_with=[report_to],
         project_config=accelerator_project_config,
         kwargs_handlers=[accelerator_kwargs],
     )
@@ -846,6 +846,13 @@ def main(args):
     # Afterwards we recalculate our number of training epochs
     n_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 
+
+    # We need to initialize the trackers we use, and also store our configuration.
+    # The trackers initializes automatically on the main process.
+    if accelerator.is_main_process:
+        accelerator.init_trackers(group, config=asdict(model_config))
+
+
     # Some configurations require autocast to be disabled.
     enable_autocast = True
     if torch.backends.mps.is_available() or (
@@ -1120,7 +1127,7 @@ def main(args):
 
             for step, batch in enumerate(val_dataloader):
                 val_bs = len(batch["rgb"])
-                random_seeds = list(np.random.randint(0, 10000000, (val_bs,)).astype(int))
+                random_seeds = np.arange(val_bs * step, val_bs * (step+1))  
                 generator = [torch.Generator(device=accelerator.device).manual_seed(int(seed)) for seed in random_seeds]
 
                 with torch.autocast(
@@ -1130,23 +1137,23 @@ def main(args):
                     output_imgs = pipeline(image=batch["rgb"], prompt=batch["positive_prompt"], generator=generator, output_type="pt").images
 
                 # Benchmark
-                log_values = {"ssim": ssim_metric(
+                ssim_values = ssim_metric(
                     output_imgs.to(dtype=torch.float32, device=accelerator.device),
                     batch["rgb"].to(dtype=torch.float32, device=accelerator.device))
-                }
+                ssim_value_dict = {str(i): float(v) for i, v in enumerate(ssim_values)}
+                log_values = {"val_ssim": ssim_value_dict}
+                accelerator.log(log_values)
 
                 for tracker in accelerator.trackers:
                     if tracker.name == "tensorboard":
                         np_images = np.stack([np.asarray(img) for img in output_imgs])
-                        tracker.writer.add_images("val_output", np_images, epoch, dataformats="NHWC")
+                        tracker.writer.add_images("val_images", np_images, epoch, dataformats="NHWC")
 
                     if tracker.name == "wandb":
-                        log_values["val_output"] = [
+                        tracker.log_images({"val_images": [
                             wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
                             for (img, meta) in (zip(output_imgs, batch["meta"]))
-                        ]
-
-                accelerator.log(log_values, step=step)
+                        ]})
 
                 del pipeline
                 torch.cuda.empty_cache()
@@ -1202,9 +1209,6 @@ def main(args):
             pipeline = StableDiffusionXLPipeline.from_pretrained(
                 model_config.model_id,
                 vae=vae,
-                text_encoder=unwrap_model(text_encoder_one),
-                text_encoder_2=unwrap_model(text_encoder_two),
-                unet=unwrap_model(unet),
                 revision=model_config.revision,
                 variant=model_config.variant,
                 torch_dtype=weight_dtype,
@@ -1214,19 +1218,17 @@ def main(args):
             pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
                 model_config.model_id,
                 vae=vae,
-                text_encoder=unwrap_model(text_encoder_one),
-                unet=unwrap_model(unet),
                 revision=model_config.revision,
                 variant=model_config.variant,
                 torch_dtype=weight_dtype
             )
 
         pipeline = pipeline.to(accelerator.device)
-        pipeline.set_progress_bar_config(disable=True)
+        pipeline.load_lora_weights(output_dir)
 
         for step, batch in enumerate(val_dataloader):
             val_bs = len(batch)
-            random_seeds = list(range(model_config.seed, model_config.seed+val_bs)) if model_config.seed else np.random.randint(0, 10000000, (val_bs,))
+            random_seeds = np.arange(val_bs * step, val_bs * (step+1))  
             generator = [torch.Generator(device=accelerator.device).manual_seed(seed) for seed in random_seeds]
 
             with torch.autocast(
@@ -1234,23 +1236,26 @@ def main(args):
                 enabled=enable_autocast,
             ):
                 output_imgs = pipeline(image=batch["rgb"], prompt=batch["positive_prompt"], generator=generator, output_type="pt").images
+
             # Benchmark
-            log_values = {"ssim": ssim_metric(
+            ssim_values = ssim_metric(
                 output_imgs.to(dtype=torch.float32, device=accelerator.device),
                 batch["rgb"].to(dtype=torch.float32, device=accelerator.device))
-            }
+            ssim_value_dict = {str(i): float(v) for i, v in enumerate(ssim_values)}
+            log_values = {"test_ssim": ssim_value_dict}
+            accelerator.log(log_values)
+
             for tracker in accelerator.trackers:
                 if tracker.name == "tensorboard":
                     np_images = np.stack([np.asarray(img) for img in output_imgs])
-                    tracker.writer.add_images("test_output", np_images, epoch, dataformats="NHWC")
+                    tracker.writer.add_images("test_images", np_images, epoch, dataformats="NHWC")
 
                 if tracker.name == "wandb":
-                    log_values["test_output"] = [
+                    tracker.log_images({"test_images": [
                         wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
                         for (img, meta) in (zip(output_imgs, batch["meta"]))
-                    ]
+                    ]})
 
-            accelerator.log(log_values, step=step)
 
             del pipeline
             torch.cuda.empty_cache()
