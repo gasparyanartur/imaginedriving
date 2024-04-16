@@ -12,8 +12,8 @@ datasets:
         camera: "front_camera"
         #height: 1080
         #width: 1920
-        height: 270
-        width: 480
+        height: 536
+        width: 960
 
 
       prompt: 
@@ -27,10 +27,9 @@ datasets:
       pandaset: 
         #001-005: "*"
         #001-005: "*"
-        001: "*"
+        001: ":8:"
 
   val_data: 
-    train_data:
     dataset: pandaset
     path: "/staging/agp/datasets/pandaset"
     data_getters:
@@ -38,8 +37,8 @@ datasets:
         camera: "front_camera"
         #height: 1080
         #width: 1920
-        height: 264
-        width: 480
+        height: 536
+        width: 960
       
       prompt: 
         type: static
@@ -50,11 +49,7 @@ datasets:
 
     data_tree: 
       pandaset: 
-        006: 
-          - 01
-          - 02
-          - 03
-          - 04
+        001: "6:10:"
 
 
 model:
@@ -64,7 +59,7 @@ model:
   max_train_samples: null
   seed: 0
   train_batch_size: 4
-  learning_rate: 0.0001
+  learning_rate: 0.0003
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_weight_decay: 0.01
@@ -76,9 +71,8 @@ model:
   center_crop: True
   flip_prob: 0
 
-
-  image_width: 480
-  image_height: 264
+  image_height: 536
+  image_width: 960
 
 output_dir: /staging/agp/masterthesis/nerf-thesis-shared/output/finetune/sd_v1-5
 log_with: wandb

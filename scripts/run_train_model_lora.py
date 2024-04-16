@@ -603,7 +603,7 @@ def main(args):
                     weights.pop()
 
             if using_sdxl:
-                StableDiffusionXLPipeline.save_lora_weights(
+                StableDiffusionXLImg2ImgPipeline.save_lora_weights(
                     save_directory=output_dir,
                     unet_lora_layers=unet_lora_layers_to_save,
                     text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
@@ -611,7 +611,7 @@ def main(args):
                 )
 
             else:
-                StableDiffusionPipeline.save_lora_weights(
+                StableDiffusionImg2ImgPipeline.save_lora_weights(
                     save_directory=output_dir,
                     unet_lora_layers=unet_lora_layers_to_save,
                     text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
@@ -1037,7 +1037,7 @@ def main(args):
 
                 if config.get("debug_loss", False) and "meta" in batch:
                     for meta in batch["meta"]:
-                        accelerator.log({"loss_for_" + meta.path: loss}, step=global_step)
+                        accelerator.log({"loss_for_" + meta.path: loss})
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(model_config.train_batch_size)).mean()
@@ -1099,7 +1099,7 @@ def main(args):
             )
             # create pipeline
             if using_sdxl:
-                pipeline = StableDiffusionXLPipeline.from_pretrained(
+                pipeline = StableDiffusionXLImg2ImgPipeline.from_pretrained(
                     model_config.model_id,
                     vae=vae,
                     text_encoder=unwrap_model(text_encoder_one),
@@ -1155,8 +1155,8 @@ def main(args):
                             for (img, meta) in (zip(output_imgs, batch["meta"]))
                         ]})
 
-                del pipeline
-                torch.cuda.empty_cache()
+            del pipeline
+            torch.cuda.empty_cache()
 
      # Save the lora layers
     accelerator.wait_for_everyone()
@@ -1178,7 +1178,7 @@ def main(args):
             text_encoder_2_lora_layers = None
 
         if using_sdxl:
-            StableDiffusionXLPipeline.save_lora_weights(
+            StableDiffusionXLImg2ImgPipeline.save_lora_weights(
                 save_directory=output_dir,
                 unet_lora_layers=unet_lora_state_dict,
                 text_encoder_lora_layers=text_encoder_lora_layers,
@@ -1186,7 +1186,7 @@ def main(args):
             )
 
         else:
-            StableDiffusionPipeline.save_lora_weights(
+            StableDiffusionImg2ImgPipeline.save_lora_weights(
                 save_directory=output_dir,
                 unet_lora_layers=unet_lora_state_dict,
                 text_encoder_lora_layers=text_encoder_lora_layers
@@ -1206,7 +1206,7 @@ def main(args):
             vae.to(weight_dtype)
 
         if using_sdxl:
-            pipeline = StableDiffusionXLPipeline.from_pretrained(
+            pipeline = StableDiffusionXLImg2ImgPipeline.from_pretrained(
                 model_config.model_id,
                 vae=vae,
                 revision=model_config.revision,
@@ -1229,7 +1229,7 @@ def main(args):
         for step, batch in enumerate(val_dataloader):
             val_bs = len(batch)
             random_seeds = np.arange(val_bs * step, val_bs * (step+1))  
-            generator = [torch.Generator(device=accelerator.device).manual_seed(seed) for seed in random_seeds]
+            generator = [torch.Generator(device=accelerator.device).manual_seed(int(seed)) for seed in random_seeds]
 
             with torch.autocast(
                 accelerator.device.type,
@@ -1257,8 +1257,8 @@ def main(args):
                     ]})
 
 
-            del pipeline
-            torch.cuda.empty_cache()
+        del pipeline
+        torch.cuda.empty_cache()
 
     accelerator.end_training()
 

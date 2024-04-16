@@ -65,6 +65,7 @@ model:
   max_grad_norm: 1.0
   mixed_precision: null
   lora_rank: 4
+  mixed_precision: True
 
 output_dir: /home/s0001900/dev/output/finetune/sd_v1-5
 log_with: wandb
