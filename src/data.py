@@ -500,20 +500,20 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         return len(self.sample_infos)
 
     @classmethod
-    def from_config(cls, config: Path | dict[str, Any]):
-        if isinstance(config, Path):
-            config = read_yaml(config)
+    def from_config(cls, dataset_config: Path | dict[str, Any]):
+        if isinstance(dataset_config, Path):
+            dataset_config = read_yaml(dataset_config)
 
-        dataset_path = Path(config["path"])
-        data_tree = read_data_tree(config["data_tree"])
-        dataset_name = config["dataset"]
+        dataset_path = Path(dataset_config["path"])
+        data_tree = read_data_tree(dataset_config["data_tree"])
+        dataset_name = dataset_config["dataset"]
 
         info_getter_factory = info_getter_builders[dataset_name]
         info_getter = info_getter_factory()
 
         data_getters = {}
 
-        for data_type, spec in config["data_getters"].items():
+        for data_type, spec in dataset_config["data_getters"].items():
             data_getter_factory = data_getter_builders[data_type]
             data_getter = data_getter_factory(info_getter, spec)
 
@@ -569,7 +569,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         i = self.idxs[idx]
 
         info = self.sample_infos[i]
-        sample = asdict(info)
+        sample = {}
 
         for data_type, getter in self.data_getters.items():
             data = getter.get_data(self.dataset_path, info)

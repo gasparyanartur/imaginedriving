@@ -77,11 +77,14 @@ class DiffusionModel(ABC):
     def diffuse_to_dir(
         self, src_dataset: DynamicDataset, dst_dir: Path, id_range: tuple[int, int, int] = None, **kwargs
     ) -> None:
+        assert "meta" in src_dataset.data_getters
+
         dst_dir.mkdir(exist_ok=True, parents=True)
 
         id_range = id_range or (0, 0, 0)
         for sample in src_dataset.iter_range(*id_range, verbose=True):
-            dst_path = dst_dir / sample["dataset"] / sample["scene"] / sample["sample"]
+            meta = sample["meta"]
+            dst_path = dst_dir / meta["dataset"] / meta["scene"] / meta["sample"]
             dst_path = dst_path.with_suffix(suffixes["rgb", src_dataset.name])
             dst_path.parent.mkdir(exist_ok=True, parents=True)
 
@@ -394,15 +397,15 @@ def upcast_vae(vae):
     return vae
 
 
-def load_img2img_model(configs: dict[str, Any], device=get_device()) -> DiffusionModel:
+def load_img2img_model(model_config_params: dict[str, Any], device=get_device()) -> DiffusionModel:
     logging.info(f"Loading diffusion model...")
 
-    model_name = configs.get("model_name")
+    model_name = model_config_params.get("model_name")
     constructor = model_name_to_constructor.get(model_name)
     if not constructor:
         raise NotImplementedError
 
-    model = constructor(configs=configs, device=device)
+    model = constructor(configs=model_config_params, device=device)
     logging.info(f"Finished loading diffusion model")
     return model
 
@@ -426,7 +429,7 @@ def diffusion_from_config_to_dir(
         model_forward_params = {}
 
     if model is None:
-        model = load_img2img_model(configs=model_config_params, device=device)
+        model = load_img2img_model(model_config_params=model_config_params, device=device)
 
     dst_dir.mkdir(exist_ok=True, parents=True)
     model.diffuse_to_dir(src_dataset, dst_dir, id_range=id_range, **model_forward_params)
