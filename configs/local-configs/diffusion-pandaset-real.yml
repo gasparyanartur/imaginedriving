@@ -24,6 +24,7 @@ model:
     model_name: sd_base
     base_model_id: "runwayml/stable-diffusion-v1-5"
     low_mem_mode: True
+    compile_model: False
 
   model_forward_params: 
     base_strength: 0.1

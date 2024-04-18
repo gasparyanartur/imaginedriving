@@ -1,0 +1,71 @@
+project_name: ImagineDriving
+
+PROJ_DIR: null      # null: $(cwd)
+CACHE_DIR: null     # null: $(PROJ_DIR)/.cache
+
+datasets:
+  train_data:
+    dataset: pandaset
+    path: "/home/s0001900/dev/datasets/pandaset"
+    data_getters:
+      rgb:
+        camera: "front_camera"
+        height: 1080
+        width: 1920
+
+      prompt: 
+        type: static
+        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        negative_prompt: ""
+
+      meta: {}
+
+    data_tree: 
+      pandaset: 
+        001-005: "*"
+        001:
+          - 03
+          - 05
+          - 07
+
+  val_data: 
+    train_data:
+    dataset: pandaset
+    path: "/home/s0001900/dev/datasets/pandaset"
+    data_getters:
+      rgb:
+        camera: "front_camera"
+        height: 1080
+        width: 1920
+      
+      prompt: 
+        type: static
+        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        negative_prompt: ""
+
+      meta: {}
+
+    data_tree: 
+      pandaset: 
+        006: "*"
+
+
+model:
+  model_id: "runwayml/stable-diffusion-v1-5"
+  revision: null
+  variant: null
+  max_train_samples: null
+  seed: 0
+  train_batch_size: 16
+  learning_rate: 0.0001
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.01
+  adam_epsilon: 0.00000001
+  max_grad_norm: 1.0
+  mixed_precision: null
+  lora_rank: 4
+  mixed_precision: True
+
+output_dir: /home/s0001900/dev/output/finetune/sd_v1-5
+log_with: wandb
