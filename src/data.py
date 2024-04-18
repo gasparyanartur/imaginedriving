@@ -8,6 +8,7 @@ import json
 import yaml
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from torch import Tensor
@@ -20,8 +21,16 @@ from src.utils import get_env, set_env, set_if_no_key
 
 
 
+
 norm_img_pipeline = transform.Compose([transform.ConvertImageDtype(torch.float32)])
-suffixes = {("rgb", "pandaset"): ".jpg", ("rgb", "neurad"): ".jpg"}
+suffixes = {
+    ("rgb", "pandaset"): ".jpg",
+    ("rgb", "neurad"): ".jpg",
+    ("lidar", "pandaset"): ".pkl.gz", 
+    ("lidar", "neurad"): ".pkl.gz",
+    ("pose", "pandaset"): ".json",
+    ("intrinsics", "pandaset"): ".json"
+}
 RANGE_SEP = ":"
 
 
@@ -276,6 +285,12 @@ class PandasetInfoGetter(InfoGetter):
             case "lidar":
                 return dataset_path / scene / "lidar"
 
+            case "pose":
+                return dataset_path / scene / "camera" / camera
+
+            case "intrinsics":
+                return dataset_path / scene / "camera" / camera
+
             case _:
                 raise NotImplementedError
 
@@ -297,9 +312,19 @@ class PandasetInfoGetter(InfoGetter):
 
         sample_dir_path = self._get_sample_dir_path(dataset_path, info.scene, specs)
         data_type = "rgb" if specs is None else specs.get("data_type", "rgb")
-        suffix = suffixes[data_type, self.dataset_name]
 
-        sample_path = (sample_dir_path / info.sample).with_suffix(suffix)
+        if data_type in {"rgb", "lidar"}:
+            sample_path = (sample_dir_path / info.sample)
+
+        elif data_type == "pose":
+            sample_path = (sample_dir_path / "poses")
+
+        elif data_type == "intrinsics":
+            sample_path = (sample_dir_path / "intrinsics")
+
+        suffix = suffixes[data_type, self.dataset_name]
+        sample_path = sample_path.with_suffix(suffix)
+
         return sample_path
 
 
@@ -353,10 +378,11 @@ class NeuRADInfoGetter(InfoGetter):
 
 
 class DataGetter(ABC):
-    def __init__(self, info_getter: InfoGetter, data_spec: dict[str, Any]) -> None:
+    def __init__(self, info_getter: InfoGetter, data_spec: dict[str, Any], data_type: str) -> None:
         super().__init__()
         self.info_getter = info_getter
         self.data_spec = data_spec
+        self.data_spec["data_type"] = data_type
 
     def get_data_path(self, dataset_path: Path, info: SampleInfo) -> Path:
         return self.info_getter.get_path(dataset_path, info, self.data_spec)
@@ -372,7 +398,7 @@ class MetaDataGetter(DataGetter):
         info_getter: InfoGetter,
         data_spec: dict[str, Any],
     ):
-        super().__init__(info_getter, data_spec)
+        super().__init__(info_getter, data_spec, "meta")
 
     def get_data(self, dataset_path: Path, info: SampleInfo):
         result = {
@@ -388,7 +414,7 @@ class PromptDataGetter(DataGetter):
         info_getter: InfoGetter,
         data_spec: dict[str, Any],
     ):
-        super().__init__(info_getter, data_spec)
+        super().__init__(info_getter, data_spec, "prompt")
         
         match self.data_spec.get("type", "static"):
             case "static":
@@ -407,12 +433,9 @@ class RGBDataGetter(DataGetter):
         info_getter: InfoGetter,
         data_spec: dict[str, Any],
     ):
-        super().__init__(info_getter, data_spec)
+        super().__init__(info_getter, data_spec, "rgb")
 
-        if "data_type" not in self.data_spec:
-            self.data_spec["data_type"] = "rgb"
-
-        rgb_dtype = self.data_spec.get("dtype", torch.float32)
+        dtype = self.data_spec.get("dtype", torch.float32)
         rescale = self.data_spec.get("rescale", True)
         width = self.data_spec.get("width", 1920)
         height = self.data_spec.get("height", 1080)
@@ -425,7 +448,7 @@ class RGBDataGetter(DataGetter):
 
         self.base_transform = transform.Compose(
             [
-                transform.ConvertImageDtype(rgb_dtype) if rescale else transform.ToDtype(rgb_dtype),
+                transform.ConvertImageDtype(dtype) if rescale else transform.ToDtype(dtype),
                 transform.Resize((height, width))
             ]
         )
@@ -443,6 +466,69 @@ class RGBDataGetter(DataGetter):
         return rgb
 
 
+class LidarDataGetter(DataGetter):
+    def __init__(
+        self,
+        info_getter: InfoGetter,
+        data_spec: dict[str, Any],
+    ):
+        super().__init__(info_getter, data_spec, "lidar")
+
+        # TODO
+        dtype = self.data_spec.get("dtype", torch.float32)
+        rescale = self.data_spec.get("rescale", True)
+        width = self.data_spec.get("width", 1920)
+        height = self.data_spec.get("height", 1080)
+
+        if width is None:
+            width = height
+
+        elif height is None:
+            height = width
+
+        
+    def get_data(self, dataset_path: Path, info: SampleInfo) -> Tensor:
+        path = self.get_data_path(dataset_path, info)
+        data = pd.read_pickle(path)
+        
+        return data
+
+
+class PoseDataGetter(DataGetter):
+    def __init__(
+        self,
+        info_getter: InfoGetter,
+        data_spec: dict[str, Any],
+    ):
+        super().__init__(info_getter, data_spec, "pose")
+
+        
+    def get_data(self, dataset_path: Path, info: SampleInfo) -> dict[str, dict[str, float]]:
+        file_path = self.get_data_path(dataset_path, info)
+        poses = load_json(file_path)
+        pose_idx = int(info.sample)
+        pose = poses[pose_idx]
+        return pose
+
+
+class IntrinsicsDataGetter(DataGetter):
+    def __init__(
+        self,
+        info_getter: InfoGetter,
+        data_spec: dict[str, Any],
+    ):
+        super().__init__(info_getter, data_spec, "intrinsics")
+
+        
+    def get_data(self, dataset_path: Path, info: SampleInfo) -> dict[str, dict[str, float]]:
+        file_path = self.get_data_path(dataset_path, info)
+
+        data = load_json(file_path)
+        return data
+
+
+
+
 info_getter_builders: dict[str, Callable[[], InfoGetter]] = {
     "pandaset": PandasetInfoGetter,
     "neurad": NeuRADInfoGetter,
@@ -451,7 +537,10 @@ info_getter_builders: dict[str, Callable[[], InfoGetter]] = {
 data_getter_builders: dict[str, Callable[[InfoGetter, dict[str, Any]], DataGetter]] = {
     "rgb": RGBDataGetter,
     "meta": MetaDataGetter,
-    "prompt": PromptDataGetter
+    "lidar": LidarDataGetter,
+    "prompt": PromptDataGetter,
+    "intrinsics": IntrinsicsDataGetter,
+    "pose": PoseDataGetter
 }
 
 
@@ -514,6 +603,9 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         data_getters = {}
 
         for data_type, spec in dataset_config["data_getters"].items():
+            if data_type not in data_getter_builders:
+                raise NotImplementedError(f"Could not find a builder for {data_type}")
+
             data_getter_factory = data_getter_builders[data_type]
             data_getter = data_getter_factory(info_getter, spec)
 
