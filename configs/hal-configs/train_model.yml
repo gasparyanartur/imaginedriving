@@ -72,6 +72,7 @@ model:
   max_grad_norm: 1.0
   mixed_precision: null
   lora_rank: 4
+  n_epochs: 10000
 
   center_crop: True
   flip_prob: 0
