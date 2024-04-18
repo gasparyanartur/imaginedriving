@@ -34,9 +34,7 @@ RUN apt-get update \
     && apt-get autoremove
     
 COPY requirements.txt .
-RUN python3.10 -m pip install --no-cache-dir --upgrade uv \
-    && python3.10 -m uv pip install --python=/usr/bin/python3.10 --no-cache -r requirements.txt
-
+RUN python3.10 -m pip install --no-cache-dir -r requirements.txt
 
 WORKDIR /workspace
 CMD /bin/bash -l

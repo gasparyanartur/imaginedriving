@@ -22,6 +22,7 @@ from src.utils import get_env, set_env, set_if_no_key
 
 norm_img_pipeline = transform.Compose([transform.ConvertImageDtype(torch.float32)])
 suffixes = {("rgb", "pandaset"): ".jpg", ("rgb", "neurad"): ".jpg"}
+RANGE_SEP = ":"
 
 
 def get_dataset_from_path(path: Path) -> str:
@@ -147,8 +148,21 @@ def read_data_tree(
         scene_dict = {}
         for scene_name, scene in dataset.items():
             if isinstance(scene, str):
-                assert scene == "*"
-                sample_list = None
+                if scene == "*":
+                    sample_list = (None, None, None)
+                    
+                elif RANGE_SEP in scene:
+                    sample_list = scene.strip().split(RANGE_SEP)
+                    assert len(sample_list) == 3
+
+                    start_range = int(sample_list[0]) if sample_list[0] != '' else None
+                    end_range = int(sample_list[1]) if sample_list[1] != '' else None
+                    skip_range = int(sample_list[2]) if sample_list[2] != '' else None
+
+                    sample_list = (start_range, end_range, skip_range)
+
+                else:
+                    raise NotImplementedError
 
             else:
                 sample_list = []
@@ -215,10 +229,25 @@ class InfoGetter(ABC):
 
         for dataset_name, dataset_dict in data_tree.items():
             for scene_name, sample_list in dataset_dict.items():
-                if sample_list is None:
-                    sample_list = self.get_sample_names_in_scene(
+                if isinstance(sample_list, tuple) and len(sample_list) == 3:
+                    start_range, end_range, skip_range = sample_list
+                    sample_list = sorted(self.get_sample_names_in_scene(
                         dataset_path, scene_name
-                    )
+                    ))
+
+                    if start_range is None:
+                        start_range = 0
+
+                    if end_range is None:
+                        end_range = len(sample_list)
+
+                    if skip_range is None:
+                        skip_range = 1
+
+                    sample_list = [sample_list[i] for i in range(start_range, end_range, skip_range)]
+
+                if not isinstance(sample_list, list):
+                    raise NotImplementedError
 
                 for sample_name in sample_list:
                     info = SampleInfo(dataset_name, scene_name, sample_name)
@@ -363,14 +392,14 @@ class PromptDataGetter(DataGetter):
         
         match self.data_spec.get("type", "static"):
             case "static":
-                self.positive_prompt = self.data_spec.get("positive-prompt", "")
-                self.negative_prompt = self.data_spec.get("negative-prompt", "")
+                self.positive_prompt = self.data_spec.get("positive_prompt", "")
+                self.negative_prompt = self.data_spec.get("negative_prompt", "")
 
             case _:
                 raise NotImplementedError
 
     def get_data(self, dataset_path: Path, info: SampleInfo):
-        return {"positive-prompt": self.positive_prompt, "negative-prompt": self.negative_prompt}
+        return {"positive_prompt": self.positive_prompt, "negative_prompt": self.negative_prompt}
 
 class RGBDataGetter(DataGetter):
     def __init__(
@@ -396,7 +425,7 @@ class RGBDataGetter(DataGetter):
 
         self.base_transform = transform.Compose(
             [
-                transform.ConvertDtype(rgb_dtype) if rescale else transform.ToDtype(rgb_dtype),
+                transform.ConvertImageDtype(rgb_dtype) if rescale else transform.ToDtype(rgb_dtype),
                 transform.Resize((height, width))
             ]
         )
@@ -433,7 +462,8 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         data_tree: dict[str, Any],
         info_getter: InfoGetter,
         data_getters: dict[str, DataGetter],
-        data_transforms: dict[str, Any] = None
+        data_transforms: dict[str, Callable[[str], int]] = None,
+        preprocess_func = None
     ):
         self.sample_infos: list[SampleInfo] = info_getter.parse_tree(
             dataset_path, data_tree
@@ -441,6 +471,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         self.info_getter = info_getter
         self.data_getters = data_getters
         self.dataset_path = dataset_path
+        self.preprocess_func = preprocess_func
 
         self.data_transforms = {**data_transforms} if data_transforms else {}
         for data_type in data_getters.keys():
@@ -469,20 +500,20 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         return len(self.sample_infos)
 
     @classmethod
-    def from_config(cls, config: Path | dict[str, Any]):
-        if isinstance(config, Path):
-            config = read_yaml(config)
+    def from_config(cls, dataset_config: Path | dict[str, Any]):
+        if isinstance(dataset_config, Path):
+            dataset_config = read_yaml(dataset_config)
 
-        dataset_path = Path(config["path"])
-        data_tree = read_data_tree(config["data_tree"])
-        dataset_name = config["dataset"]
+        dataset_path = Path(dataset_config["path"])
+        data_tree = read_data_tree(dataset_config["data_tree"])
+        dataset_name = dataset_config["dataset"]
 
         info_getter_factory = info_getter_builders[dataset_name]
         info_getter = info_getter_factory()
 
         data_getters = {}
 
-        for data_type, spec in config["data_getters"].items():
+        for data_type, spec in dataset_config["data_getters"].items():
             data_getter_factory = data_getter_builders[data_type]
             data_getter = data_getter_factory(info_getter, spec)
 
@@ -538,7 +569,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         i = self.idxs[idx]
 
         info = self.sample_infos[i]
-        sample = asdict(info)
+        sample = {}
 
         for data_type, getter in self.data_getters.items():
             data = getter.get_data(self.dataset_path, info)
@@ -547,6 +578,9 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
                 data = data_transform(data)
 
             sample[data_type] = data
+
+        if self.preprocess_func:
+            sample = self.preprocess_func(sample)
 
         return sample
 
