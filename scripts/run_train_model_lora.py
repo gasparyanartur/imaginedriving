@@ -194,8 +194,11 @@ def compute_time_ids(original_size, crops_coords_top_left, target_size, device, 
 
 
 def preprocess_rgb(
-    rgb, target_size: tuple[int, int], resizer, flipper, cropper, center_crop: bool
+    rgb, target_size: tuple[int, int], resizer, flipper, cropper, crop_square: bool, center_crop: bool
 ):
+    if crop_square:
+        target_size = min(target_size), min(target_size)
+
     th, tw = target_size
     h0, w0 = rgb.shape[-2:]
 
@@ -237,11 +240,11 @@ def preprocess_prompt(prompt: list[str], tokenizers):
 
 
 def preprocess_sample(
-    batch, resizer, flipper, cropper, tokenizers, target_size, center_crop: bool = False
+    batch, resizer, flipper, cropper, tokenizers, target_size, crop_square: bool = True, center_crop: bool = False
 ):
     # Ignore negative prompt :)
     rgb = preprocess_rgb(
-        batch["rgb"], target_size, resizer, flipper, cropper, center_crop
+        batch["rgb"], target_size, resizer, flipper, cropper, crop_square, center_crop
     )
     prompt = preprocess_prompt(batch["prompt"]["positive_prompt"], tokenizers)
 
@@ -307,7 +310,9 @@ class TrainLoraConfig:
     checkpoints_total_limit: int = None
     resume_from_checkpoint: bool = False
     n_epochs: int = 100
+    num_train_timesteps: int = None
     max_train_samples: int = None
+    val_freq: int = 10
 
     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
     noise_offset: float = 0
@@ -337,6 +342,7 @@ class TrainLoraConfig:
     image_width: int = 1024
     image_height: int = 1024
 
+    crop_square: bool = True
     center_crop: bool = False
     flip_prob: float = 0.5
 
@@ -753,17 +759,23 @@ def main(args):
         target_size, interpolation=transforms.InterpolationMode.BILINEAR
     )
     train_flipper = transforms.RandomHorizontalFlip(p=model_config.flip_prob)
+    
+    if model_config.crop_square:
+        crop_size = min(target_size)
+    else:
+        crop_size = target_size
+
     train_cropper = (
-        transforms.CenterCrop(target_size)
+        transforms.CenterCrop(crop_size)
         if model_config.center_crop
-        else transforms.RandomCrop(target_size)
+        else transforms.RandomCrop(crop_size)
     )
 
     val_resizer = transforms.Resize(
         target_size, interpolation=transforms.InterpolationMode.BILINEAR
     )
     val_flipper = transforms.RandomHorizontalFlip(p=0.0)
-    val_cropper = transforms.CenterCrop(target_size)
+    val_cropper = transforms.CenterCrop(crop_size)
 
 
     tokenizers = [tokenizer_one]
@@ -771,8 +783,8 @@ def main(args):
         tokenizers.append(tokenizer_two)
 
     with accelerator.main_process_first():
-        train_dataset.preprocess_func = lambda batch: preprocess_sample(batch, train_resizer, train_flipper, train_cropper, tokenizers, target_size, model_config.center_crop)
-        val_dataset.preprocess_func = lambda batch: preprocess_sample(batch, val_resizer, val_flipper, val_cropper, tokenizers, target_size, True)
+        train_dataset.preprocess_func = lambda batch: preprocess_sample(batch, train_resizer, train_flipper, train_cropper, tokenizers, target_size, model_config.crop_square, model_config.center_crop)
+        val_dataset.preprocess_func = lambda batch: preprocess_sample(batch, val_resizer, val_flipper, val_cropper, tokenizers, target_size, model_config.crop_square, True)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -928,7 +940,6 @@ def main(args):
     )
 
 
-
     for epoch in range(first_epoch, n_epochs):
         unet.train()
         if model_config.train_text_encoder:
@@ -942,9 +953,9 @@ def main(args):
 
             with accelerator.accumulate(unet):
                 rgbs = batch["rgb"].to(rgb_dtype)
-                model_input = vae.encode(rgbs).latent_dist.sample()
+                model_input = vae.encode(rgbs.to(weight_dtype)).latent_dist.sample()
                 model_input = model_input * vae.config.scaling_factor
-                model_input = model_input.to(rgb_dtype)
+                #model_input = model_input.to(rgb_dtype)
 
                 noise = torch.randn_like(model_input)
                 if model_config.noise_offset:
@@ -977,12 +988,13 @@ def main(args):
                     text_encoders.append(text_encoder_two)
                     text_input_ids_list.append(batch["input_ids_two"])
 
-                prompt_embeds, pooled_prompt_embeds = encode_prompt(
-                    text_encoders=text_encoders, text_input_ids_list=text_input_ids_list
-                )
+     
 
                 unet_added_conditions = {}
                 if using_sdxl:
+                    prompt_embeds, pooled_prompt_embeds = encode_prompt(
+                        text_encoders=text_encoders, text_input_ids_list=text_input_ids_list
+                    )
                     add_time_ids = torch.cat(
                         [
                             compute_time_ids(s, c, ts, accelerator.device, weight_dtype)
@@ -995,6 +1007,9 @@ def main(args):
                     )
                     unet_added_conditions["time_ids"] = add_time_ids
                     unet_added_conditions["text_embeds"] = pooled_prompt_embeds
+
+                else:
+                    prompt_embeds = text_encoders[0](text_input_ids_list[0])[0]
 
                 model_pred = unet(
                     noisy_model_input,
@@ -1103,7 +1118,7 @@ def main(args):
             if global_step >= max_train_steps:
                 break
 
-        if accelerator.is_main_process:
+        if accelerator.is_main_process and (global_step % model_config.val_freq) == 0:
             # Validation
 
             logger.info(

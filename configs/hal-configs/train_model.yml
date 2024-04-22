@@ -17,7 +17,7 @@ datasets:
 
       prompt: 
         type: static
-        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        positive_prompt: ""
         negative_prompt: ""
 
       meta: {}
@@ -44,7 +44,7 @@ datasets:
       
       prompt: 
         type: static
-        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        positive_prompt: ""
         negative_prompt: ""
 
       meta: {}
@@ -64,16 +64,18 @@ model:
   max_train_samples: null
   seed: 0
   train_batch_size: 1
-  learning_rate: 0.0003
+  learning_rate: 0.0001
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_weight_decay: 0.01
   adam_epsilon: 0.00000001
   max_grad_norm: 1.0
   mixed_precision: null
-  lora_rank: 4
+  lora_rank: 8
   n_epochs: 10000
+  val_freq: 100
 
+  crop_square: True
   center_crop: True
   flip_prob: 0
 
