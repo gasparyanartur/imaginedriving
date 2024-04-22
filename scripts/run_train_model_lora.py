@@ -442,6 +442,8 @@ def main(args):
     
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=(0.0, 1.0), reduction="none").to(accelerator.device)
 
+    # TODO: Change this to use custom number of timesteps.
+    # noise_scheduler = DDPMScheduler(...)
     noise_scheduler = DDPMScheduler.from_pretrained(
         model_config.model_id, subfolder="scheduler"
     )
@@ -846,6 +848,11 @@ def main(args):
     # Afterwards we recalculate our number of training epochs
     n_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 
+    # Override number of timesteps if set
+    if model_config.num_train_timesteps:
+        num_train_timesteps = model_config.num_train_timesteps 
+    else:
+        num_train_timesteps = noise_scheduler.config.num_train_timesteps
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -920,6 +927,8 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
+
+
     for epoch in range(first_epoch, n_epochs):
         unet.train()
         if model_config.train_text_encoder:
@@ -929,7 +938,7 @@ def main(args):
 
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            rgb_dtype = batch.dtype if model_config.model_id is None else weight_dtype
+            rgb_dtype = batch["rgb"].dtype if model_config.model_id is None else weight_dtype
 
             with accelerator.accumulate(unet):
                 rgbs = batch["rgb"].to(rgb_dtype)
@@ -946,10 +955,11 @@ def main(args):
                     )
 
                 bsz = model_input.shape[0]
+
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
                     0,
-                    noise_scheduler.config.num_train_timesteps,
+                    num_train_timesteps,
                     (bsz,),
                     device=model_input.device,
                     dtype=torch.long,
@@ -961,19 +971,6 @@ def main(args):
                     model_input, noise, timesteps
                 )
 
-                add_time_ids = torch.cat(
-                    [
-                        compute_time_ids(s, c, ts, accelerator.device, weight_dtype)
-                        for s, c, ts in zip(
-                            batch["original_size"],
-                            batch["crop_top_left"],
-                            batch["target_size"],
-                        )
-                    ]
-                )
-
-                # Predict the noise residual
-                unet_added_conditions = {"time_ids": add_time_ids}
                 text_encoders = [text_encoder_one]
                 text_input_ids_list = [batch["input_ids_one"]]
                 if text_encoder_two:
@@ -983,7 +980,22 @@ def main(args):
                 prompt_embeds, pooled_prompt_embeds = encode_prompt(
                     text_encoders=text_encoders, text_input_ids_list=text_input_ids_list
                 )
-                unet_added_conditions["text_embeds"] = pooled_prompt_embeds
+
+                unet_added_conditions = {}
+                if using_sdxl:
+                    add_time_ids = torch.cat(
+                        [
+                            compute_time_ids(s, c, ts, accelerator.device, weight_dtype)
+                            for s, c, ts in zip(
+                                batch["original_size"],
+                                batch["crop_top_left"],
+                                batch["target_size"],
+                            )
+                        ]
+                    )
+                    unet_added_conditions["time_ids"] = add_time_ids
+                    unet_added_conditions["text_embeds"] = pooled_prompt_embeds
+
                 model_pred = unet(
                     noisy_model_input,
                     timesteps,
