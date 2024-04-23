@@ -63,6 +63,7 @@ check_min_version("0.27.0")
 logger = get_logger(__name__, log_level="INFO")
 
 
+
 def import_text_encoder_class_from_model_name_or_path(
     pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
 ):
@@ -313,6 +314,7 @@ class TrainLoraConfig:
     num_train_timesteps: int = None
     max_train_samples: int = None
     val_freq: int = 10
+    val_strength: float = 0.8
 
     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
     noise_offset: float = 0
@@ -418,6 +420,7 @@ def main(args):
         project_config=accelerator_project_config,
         kwargs_handlers=[accelerator_kwargs],
     )
+    logging.info(f"Using device: {accelerator.device}, distributed: {accelerator.distributed_type}")
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -448,8 +451,6 @@ def main(args):
     
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=(0.0, 1.0), reduction="none").to(accelerator.device)
 
-    # TODO: Change this to use custom number of timesteps.
-    # noise_scheduler = DDPMScheduler(...)
     noise_scheduler = DDPMScheduler.from_pretrained(
         model_config.model_id, subfolder="scheduler"
     )
@@ -1161,7 +1162,7 @@ def main(args):
                     accelerator.device.type,
                     enabled=enable_autocast,
                 ):
-                    output_imgs = pipeline(image=batch["rgb"], prompt=batch["positive_prompt"], generator=generator, output_type="pt").images
+                    output_imgs = pipeline(image=batch["rgb"], prompt=batch["positive_prompt"], generator=generator, output_type="pt", strength=model_config.val_strength).images
 
                 # Benchmark
                 ssim_values = ssim_metric(
@@ -1273,7 +1274,7 @@ def main(args):
                 accelerator.device.type,
                 enabled=enable_autocast,
             ):
-                output_imgs = pipeline(image=batch["rgb"], prompt=batch["positive_prompt"], generator=generator, output_type="pt").images
+                output_imgs = pipeline(image=batch["rgb"], prompt=batch["positive_prompt"], generator=generator, output_type="pt", strength=model_config.val_strength).images
 
             # Benchmark
             ssim_values = ssim_metric(

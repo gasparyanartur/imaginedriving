@@ -74,6 +74,9 @@ model:
   lora_rank: 8
   n_epochs: 10000
   val_freq: 100
+  val_strength: 0.4
+
+  num_train_timesteps: 250
 
   crop_square: True
   center_crop: True

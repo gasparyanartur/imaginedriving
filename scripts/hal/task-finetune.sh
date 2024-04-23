@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-#SBATCH --nodes 1
-#SBATCH --gpus 1
+#SBATCH --nodes 2
+#SBATCH --gpus 2
 #SBATCH --output /staging/agp/masterthesis/nerf-thesis-shared/logs/finetune/%j.out
 #SBATCH --partition=zprodlow 
 #SBATCH --job-name=finetune
