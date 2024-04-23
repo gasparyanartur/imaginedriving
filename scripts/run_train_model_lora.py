@@ -359,6 +359,7 @@ def main(args):
     config_path = args.config_path
     config = setup_project(config_path)
 
+
     output_dir = Path(config["output_dir"])
     logging_dir = Path(output_dir, "logs")
 
@@ -371,6 +372,8 @@ def main(args):
 
     model_config = TrainLoraConfig(**config["model"])
     using_sdxl = is_sdxl_model(model_config.model_id)
+    
+    mixed_precision = model_config.mixed_precision
 
     if (model_config.vae_id is not None) and (
         (using_sdxl and not is_sdxl_vae(model_config.vae_id))
@@ -403,7 +406,7 @@ def main(args):
         )
 
 
-    if torch.backends.mps.is_available() and model_config.mixed_precision == "bf16":
+    if torch.backends.mps.is_available() and mixed_precision == "bf16":
         # due to pytorch#99272, MPS does not yet support bfloat16.
         raise ValueError(
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
@@ -415,12 +418,12 @@ def main(args):
     accelerator_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=model_config.gradient_accumulation_steps,
-        mixed_precision=model_config.mixed_precision,
+        mixed_precision=mixed_precision,
         log_with=[report_to],
         project_config=accelerator_project_config,
         kwargs_handlers=[accelerator_kwargs],
     )
-    logging.info(f"Using device: {accelerator.device}, distributed: {accelerator.distributed_type}")
+    logging.info(f"Number of cuda detected devices: {torch.cuda.device_count()}, Using device: {accelerator.device}, distributed: {accelerator.distributed_type}")
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -530,9 +533,9 @@ def main(args):
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
-    if model_config.mixed_precision == "fp16":
+    if mixed_precision == "fp16":
         weight_dtype = torch.float16
-    elif model_config.mixed_precision == "bf16":
+    elif mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
     unet.to(accelerator.device, dtype=weight_dtype)
@@ -567,6 +570,7 @@ def main(args):
 
         if text_encoder_two:
             text_encoder_two.add_adapter(text_lora_config)
+
 
 
     # ============================
@@ -678,7 +682,7 @@ def main(args):
                 )
 
         # Make sure the trainable params are in float32.
-        if model_config.mixed_precision == "fp16":
+        if mixed_precision == "fp16":
             models = [unet_]
             if model_config.train_text_encoder:
                 models.append(text_encoder_one_)
@@ -715,7 +719,7 @@ def main(args):
         )
 
     # Make sure the trainable params are in float32.
-    if model_config.mixed_precision == "fp16":
+    if mixed_precision == "fp16":
         models = [unet]
         if model_config.train_text_encoder:
             models.extend([text_encoder_one, text_encoder_two])
@@ -806,6 +810,12 @@ def main(args):
     # ==========================
     # ===   Setup training   ===
     # ==========================
+
+
+    #unet = torch.compile(unet)
+    #text_encoder_one = torch.compile(text_encoder_one)
+    #if text_encoder_two:
+    #    text_encoder_two = torch.compile(text_encoder_two)
 
     # Scheduler and math around the number of training steps.
     num_update_steps_per_epoch = math.ceil(
@@ -1119,7 +1129,7 @@ def main(args):
             if global_step >= max_train_steps:
                 break
 
-        if accelerator.is_main_process and (global_step % model_config.val_freq) == 0:
+        if accelerator.is_main_process and ((global_step // model_config.train_batch_size // len(train_dataloader)) % model_config.val_freq) == 0:
             # Validation
 
             logger.info(
@@ -1241,7 +1251,7 @@ def main(args):
 
         # Final inference
         # Make sure vae.dtype is consistent with the unet.dtype
-        if model_config.mixed_precision == "fp16":
+        if mixed_precision == "fp16":
             vae.to(weight_dtype)
 
         if using_sdxl:
