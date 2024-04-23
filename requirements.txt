@@ -8,6 +8,7 @@ accelerate
 diffusers>=0.27
 torchmetrics[image]
 open3d
+transforms3d
 opencv-contrib-python
 safetensors
 peft<=0.6.2

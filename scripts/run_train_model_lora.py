@@ -63,6 +63,7 @@ check_min_version("0.27.0")
 logger = get_logger(__name__, log_level="INFO")
 
 
+
 def import_text_encoder_class_from_model_name_or_path(
     pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
 ):
@@ -194,8 +195,11 @@ def compute_time_ids(original_size, crops_coords_top_left, target_size, device, 
 
 
 def preprocess_rgb(
-    rgb, target_size: tuple[int, int], resizer, flipper, cropper, center_crop: bool
+    rgb, target_size: tuple[int, int], resizer, flipper, cropper, crop_square: bool, center_crop: bool
 ):
+    if crop_square:
+        target_size = min(target_size), min(target_size)
+
     th, tw = target_size
     h0, w0 = rgb.shape[-2:]
 
@@ -237,11 +241,11 @@ def preprocess_prompt(prompt: list[str], tokenizers):
 
 
 def preprocess_sample(
-    batch, resizer, flipper, cropper, tokenizers, target_size, center_crop: bool = False
+    batch, resizer, flipper, cropper, tokenizers, target_size, crop_square: bool = True, center_crop: bool = False
 ):
     # Ignore negative prompt :)
     rgb = preprocess_rgb(
-        batch["rgb"], target_size, resizer, flipper, cropper, center_crop
+        batch["rgb"], target_size, resizer, flipper, cropper, crop_square, center_crop
     )
     prompt = preprocess_prompt(batch["prompt"]["positive_prompt"], tokenizers)
 
@@ -307,7 +311,10 @@ class TrainLoraConfig:
     checkpoints_total_limit: int = None
     resume_from_checkpoint: bool = False
     n_epochs: int = 100
+    num_train_timesteps: int = None
     max_train_samples: int = None
+    val_freq: int = 10
+    val_strength: float = 0.8
 
     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
     noise_offset: float = 0
@@ -337,6 +344,7 @@ class TrainLoraConfig:
     image_width: int = 1024
     image_height: int = 1024
 
+    crop_square: bool = True
     center_crop: bool = False
     flip_prob: float = 0.5
 
@@ -351,6 +359,7 @@ def main(args):
     config_path = args.config_path
     config = setup_project(config_path)
 
+
     output_dir = Path(config["output_dir"])
     logging_dir = Path(output_dir, "logs")
 
@@ -363,6 +372,8 @@ def main(args):
 
     model_config = TrainLoraConfig(**config["model"])
     using_sdxl = is_sdxl_model(model_config.model_id)
+    
+    mixed_precision = model_config.mixed_precision
 
     if (model_config.vae_id is not None) and (
         (using_sdxl and not is_sdxl_vae(model_config.vae_id))
@@ -395,7 +406,7 @@ def main(args):
         )
 
 
-    if torch.backends.mps.is_available() and model_config.mixed_precision == "bf16":
+    if torch.backends.mps.is_available() and mixed_precision == "bf16":
         # due to pytorch#99272, MPS does not yet support bfloat16.
         raise ValueError(
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
@@ -407,11 +418,12 @@ def main(args):
     accelerator_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=model_config.gradient_accumulation_steps,
-        mixed_precision=model_config.mixed_precision,
+        mixed_precision=mixed_precision,
         log_with=[report_to],
         project_config=accelerator_project_config,
         kwargs_handlers=[accelerator_kwargs],
     )
+    logging.info(f"Number of cuda detected devices: {torch.cuda.device_count()}, Using device: {accelerator.device}, distributed: {accelerator.distributed_type}")
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -521,9 +533,9 @@ def main(args):
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
-    if model_config.mixed_precision == "fp16":
+    if mixed_precision == "fp16":
         weight_dtype = torch.float16
-    elif model_config.mixed_precision == "bf16":
+    elif mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
     unet.to(accelerator.device, dtype=weight_dtype)
@@ -558,6 +570,7 @@ def main(args):
 
         if text_encoder_two:
             text_encoder_two.add_adapter(text_lora_config)
+
 
 
     # ============================
@@ -669,7 +682,7 @@ def main(args):
                 )
 
         # Make sure the trainable params are in float32.
-        if model_config.mixed_precision == "fp16":
+        if mixed_precision == "fp16":
             models = [unet_]
             if model_config.train_text_encoder:
                 models.append(text_encoder_one_)
@@ -706,7 +719,7 @@ def main(args):
         )
 
     # Make sure the trainable params are in float32.
-    if model_config.mixed_precision == "fp16":
+    if mixed_precision == "fp16":
         models = [unet]
         if model_config.train_text_encoder:
             models.extend([text_encoder_one, text_encoder_two])
@@ -751,17 +764,23 @@ def main(args):
         target_size, interpolation=transforms.InterpolationMode.BILINEAR
     )
     train_flipper = transforms.RandomHorizontalFlip(p=model_config.flip_prob)
+    
+    if model_config.crop_square:
+        crop_size = min(target_size)
+    else:
+        crop_size = target_size
+
     train_cropper = (
-        transforms.CenterCrop(target_size)
+        transforms.CenterCrop(crop_size)
         if model_config.center_crop
-        else transforms.RandomCrop(target_size)
+        else transforms.RandomCrop(crop_size)
     )
 
     val_resizer = transforms.Resize(
         target_size, interpolation=transforms.InterpolationMode.BILINEAR
     )
     val_flipper = transforms.RandomHorizontalFlip(p=0.0)
-    val_cropper = transforms.CenterCrop(target_size)
+    val_cropper = transforms.CenterCrop(crop_size)
 
 
     tokenizers = [tokenizer_one]
@@ -769,8 +788,8 @@ def main(args):
         tokenizers.append(tokenizer_two)
 
     with accelerator.main_process_first():
-        train_dataset.preprocess_func = lambda batch: preprocess_sample(batch, train_resizer, train_flipper, train_cropper, tokenizers, target_size, model_config.center_crop)
-        val_dataset.preprocess_func = lambda batch: preprocess_sample(batch, val_resizer, val_flipper, val_cropper, tokenizers, target_size, True)
+        train_dataset.preprocess_func = lambda batch: preprocess_sample(batch, train_resizer, train_flipper, train_cropper, tokenizers, target_size, model_config.crop_square, model_config.center_crop)
+        val_dataset.preprocess_func = lambda batch: preprocess_sample(batch, val_resizer, val_flipper, val_cropper, tokenizers, target_size, model_config.crop_square, True)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -791,6 +810,12 @@ def main(args):
     # ==========================
     # ===   Setup training   ===
     # ==========================
+
+
+    #unet = torch.compile(unet)
+    #text_encoder_one = torch.compile(text_encoder_one)
+    #if text_encoder_two:
+    #    text_encoder_two = torch.compile(text_encoder_two)
 
     # Scheduler and math around the number of training steps.
     num_update_steps_per_epoch = math.ceil(
@@ -846,6 +871,11 @@ def main(args):
     # Afterwards we recalculate our number of training epochs
     n_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 
+    # Override number of timesteps if set
+    if model_config.num_train_timesteps:
+        num_train_timesteps = model_config.num_train_timesteps 
+    else:
+        num_train_timesteps = noise_scheduler.config.num_train_timesteps
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -920,6 +950,7 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
+
     for epoch in range(first_epoch, n_epochs):
         unet.train()
         if model_config.train_text_encoder:
@@ -929,13 +960,13 @@ def main(args):
 
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            rgb_dtype = batch.dtype if model_config.model_id is None else weight_dtype
+            rgb_dtype = batch["rgb"].dtype if model_config.model_id is None else weight_dtype
 
             with accelerator.accumulate(unet):
                 rgbs = batch["rgb"].to(rgb_dtype)
-                model_input = vae.encode(rgbs).latent_dist.sample()
+                model_input = vae.encode(rgbs.to(weight_dtype)).latent_dist.sample()
                 model_input = model_input * vae.config.scaling_factor
-                model_input = model_input.to(rgb_dtype)
+                #model_input = model_input.to(rgb_dtype)
 
                 noise = torch.randn_like(model_input)
                 if model_config.noise_offset:
@@ -946,10 +977,11 @@ def main(args):
                     )
 
                 bsz = model_input.shape[0]
+
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
                     0,
-                    noise_scheduler.config.num_train_timesteps,
+                    num_train_timesteps,
                     (bsz,),
                     device=model_input.device,
                     dtype=torch.long,
@@ -961,29 +993,35 @@ def main(args):
                     model_input, noise, timesteps
                 )
 
-                add_time_ids = torch.cat(
-                    [
-                        compute_time_ids(s, c, ts, accelerator.device, weight_dtype)
-                        for s, c, ts in zip(
-                            batch["original_size"],
-                            batch["crop_top_left"],
-                            batch["target_size"],
-                        )
-                    ]
-                )
-
-                # Predict the noise residual
-                unet_added_conditions = {"time_ids": add_time_ids}
                 text_encoders = [text_encoder_one]
                 text_input_ids_list = [batch["input_ids_one"]]
                 if text_encoder_two:
                     text_encoders.append(text_encoder_two)
                     text_input_ids_list.append(batch["input_ids_two"])
 
-                prompt_embeds, pooled_prompt_embeds = encode_prompt(
-                    text_encoders=text_encoders, text_input_ids_list=text_input_ids_list
-                )
-                unet_added_conditions["text_embeds"] = pooled_prompt_embeds
+     
+
+                unet_added_conditions = {}
+                if using_sdxl:
+                    prompt_embeds, pooled_prompt_embeds = encode_prompt(
+                        text_encoders=text_encoders, text_input_ids_list=text_input_ids_list
+                    )
+                    add_time_ids = torch.cat(
+                        [
+                            compute_time_ids(s, c, ts, accelerator.device, weight_dtype)
+                            for s, c, ts in zip(
+                                batch["original_size"],
+                                batch["crop_top_left"],
+                                batch["target_size"],
+                            )
+                        ]
+                    )
+                    unet_added_conditions["time_ids"] = add_time_ids
+                    unet_added_conditions["text_embeds"] = pooled_prompt_embeds
+
+                else:
+                    prompt_embeds = text_encoders[0](text_input_ids_list[0])[0]
+
                 model_pred = unet(
                     noisy_model_input,
                     timesteps,
@@ -1091,7 +1129,7 @@ def main(args):
             if global_step >= max_train_steps:
                 break
 
-        if accelerator.is_main_process:
+        if accelerator.is_main_process and ((global_step // model_config.train_batch_size // len(train_dataloader)) % model_config.val_freq) == 0:
             # Validation
 
             logger.info(
@@ -1134,7 +1172,7 @@ def main(args):
                     accelerator.device.type,
                     enabled=enable_autocast,
                 ):
-                    output_imgs = pipeline(image=batch["rgb"], prompt=batch["positive_prompt"], generator=generator, output_type="pt").images
+                    output_imgs = pipeline(image=batch["rgb"], prompt=batch["positive_prompt"], generator=generator, output_type="pt", strength=model_config.val_strength).images
 
                 # Benchmark
                 ssim_values = ssim_metric(
@@ -1213,7 +1251,7 @@ def main(args):
 
         # Final inference
         # Make sure vae.dtype is consistent with the unet.dtype
-        if model_config.mixed_precision == "fp16":
+        if mixed_precision == "fp16":
             vae.to(weight_dtype)
 
         if using_sdxl:
@@ -1246,7 +1284,7 @@ def main(args):
                 accelerator.device.type,
                 enabled=enable_autocast,
             ):
-                output_imgs = pipeline(image=batch["rgb"], prompt=batch["positive_prompt"], generator=generator, output_type="pt").images
+                output_imgs = pipeline(image=batch["rgb"], prompt=batch["positive_prompt"], generator=generator, output_type="pt", strength=model_config.val_strength).images
 
             # Benchmark
             ssim_values = ssim_metric(
