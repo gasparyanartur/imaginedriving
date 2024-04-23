@@ -17,18 +17,14 @@ datasets:
 
       prompt: 
         type: static
-        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        positive_prompt: ""
         negative_prompt: ""
 
       meta: {}
 
     data_tree: 
       pandaset: 
-        #001-005: "*"
-        #001-005: "*"
-        #001: "0:4:"
-        001:
-          - 01
+        001-010: "0::4"
           
 
   val_data: 
@@ -44,16 +40,16 @@ datasets:
       
       prompt: 
         type: static
-        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        positive_prompt: ""
         negative_prompt: ""
 
       meta: {}
 
     data_tree: 
       pandaset: 
-        #001: "0:4:"
-        001:
-          - 01
+        001: "0::16"
+        006: "0::16"
+
           
 
 
@@ -63,17 +59,22 @@ model:
   variant: null
   max_train_samples: null
   seed: 0
-  train_batch_size: 1
-  learning_rate: 0.0003
+  train_batch_size: 16
+  learning_rate: 0.0001
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_weight_decay: 0.01
   adam_epsilon: 0.00000001
   max_grad_norm: 1.0
   mixed_precision: null
-  lora_rank: 4
-  n_epochs: 10000
+  lora_rank: 8
+  n_epochs: 1000
+  val_freq: 10
+  val_strength: 0.4
 
+  num_train_timesteps: 500
+
+  crop_square: True
   center_crop: True
   flip_prob: 0
 

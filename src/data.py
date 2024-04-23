@@ -279,20 +279,14 @@ class PandasetInfoGetter(InfoGetter):
             camera = specs.get("camera", "front_camera")
 
         match data_type:
-            case "rgb":
+            case "rgb" | "pose" | "intrinsics":
                 return dataset_path / scene / "camera" / camera
 
             case "lidar":
                 return dataset_path / scene / "lidar"
 
-            case "pose":
-                return dataset_path / scene / "camera" / camera
-
-            case "intrinsics":
-                return dataset_path / scene / "camera" / camera
-
             case _:
-                raise NotImplementedError
+                return None
 
     def get_sample_names_in_scene(
         self, dataset_path: Path, scene: str, specs: dict[str, Any] = None
@@ -402,7 +396,6 @@ class MetaDataGetter(DataGetter):
 
     def get_data(self, dataset_path: Path, info: SampleInfo):
         result = {
-            "path": self.get_data_path(dataset_path, info),
             **asdict(info)
         }
         return result
