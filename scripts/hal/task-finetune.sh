@@ -16,4 +16,4 @@ image_path=${IMAGE_PATH:-"/staging/agp/masterthesis/nerf-thesis-shared/container
 config_path=${CONFIG_PATH:-"configs/hal-configs/train_model.yml"}
 workdir=${WORKDIR:-"/home/s0001900/workspace/nerf-thesis"}
 
-singularity exec --env PYTHONPATH=$workdir --env WANDB_API_KEY=$wandb_api_key --bind /staging:/staging -H $workdir --nv $image_path accelerate launch --main_process_port 0 scripts/run_train_model_lora.py $config_path
+singularity exec --env PYTHONPATH=$workdir --env WANDB_API_KEY=$wandb_api_key --bind /staging:/staging -H $workdir --nv $image_path accelerate launch --num_processes=1 --num_machines=1 --main_process_port=0 scripts/run_train_model_lora.py $config_path
