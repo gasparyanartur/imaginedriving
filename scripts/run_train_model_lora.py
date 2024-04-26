@@ -3,7 +3,7 @@ from pathlib import Path
 from argparse import ArgumentParser
 import logging
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import math
 import itertools as it
 import tqdm
@@ -209,14 +209,18 @@ def preprocess_rgb(
     if flipper:
         rgb = flipper(rgb)
 
-    if center_crop:
-        cy = (h0 - th) // 2
-        cx = (w0 - tw) // 2
-        rgb = cropper(rgb)
+    if cropper:
+        if center_crop:
+            cy = (h0 - th) // 2
+            cx = (w0 - tw) // 2
+            rgb = cropper(rgb)
 
+        else:
+            cy, cx, h, w = cropper.get_params(rgb, target_size)
+            rgb = transforms.functional.crop(rgb, cy, cx, h, w)
     else:
-        cy, cx, h, w = cropper.get_params(rgb, target_size)
-        rgb = transforms.functional.crop(rgb, cy, cx, h, w)
+        cx, cy = 0, 0
+        h, w = h0, w0
 
     original_size = h0, w0
     crop_top_left = cy, cx
@@ -330,6 +334,7 @@ class TrainLoraConfig:
     gradient_accumulation_steps: int = 1
     train_batch_size: int = 16
     dataloader_num_workers: int = 0
+    pin_memory: bool = True
     learning_rate: float = 1e-4
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
@@ -337,24 +342,23 @@ class TrainLoraConfig:
     adam_epsilon: float = 1e-08
     snr_gamma: float = None
     max_grad_norm: float = 1.0
+    lora_rank: int = 4
+    compile_model: bool = False
 
     # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]'
-    lr_scheduler = "constant"
-    lr_warmup_steps = 500
-
-    lora_rank: int = 4
-    prompt: str = "dashcam video, self-driving car, urban driving scene"
-    negative_prompt: str = ""
+    lr_scheduler: str = "constant"
+    lr_warmup_steps: int = 500
+    lr_scheduler_kwargs: dict[str, any] = field(default_factory=dict)
 
     image_width: int = 1920
     image_height: int = 1080
 
     center_crop: bool = False
-    flip_prob: float = 0.0
+    flip_prob: float = 0.5
 
     crop_height: float = 512
     crop_width: float = 512
-    resize_factor: float = 1.0 
+    resize_factor: float = 1.0
 
     seed: int = None
 
@@ -390,29 +394,6 @@ def main(args):
         raise ValueError(
             f"Mismatch between model_id and vae_id. Both models need to either be SDXL or SD, but received {model_config.model_id} and {model_config.vae_id}"
         )
-
-    if report_to == "wandb":
-        if not is_wandb_available():
-            raise ImportError(
-                "Make sure to install wandb if you want to use it for logging during training."
-            )
-
-        if hub_token is not None:
-            raise ValueError(
-                "You cannot use both report_to=wandb and hub_token due to a security risk of exposing your token."
-                " Please use `huggingface-cli login` to authenticate with the Hub."
-            )
-
-        import wandb
-        wandb.init(
-            project=os.environ.get("WANDB_PROJECT", project),
-            entity=os.environ.get("WANDB_ENTITY", entity),
-            dir=os.environ.get("WANDB_DIR", str(logging_dir)),
-            group=os.environ.get("WANDB_GROUP", group),
-            reinit=True,
-            config=asdict(model_config)
-        )
-
 
     if torch.backends.mps.is_available() and mixed_precision == "bf16":
         # due to pytorch#99272, MPS does not yet support bfloat16.
@@ -455,6 +436,29 @@ def main(args):
 
         if push_to_hub:
             raise NotImplementedError
+
+    if report_to == "wandb":
+        if not is_wandb_available():
+            raise ImportError(
+                "Make sure to install wandb if you want to use it for logging during training."
+            )
+
+        if hub_token is not None:
+            raise ValueError(
+                "You cannot use both report_to=wandb and hub_token due to a security risk of exposing your token."
+                " Please use `huggingface-cli login` to authenticate with the Hub."
+            )
+
+        import wandb
+        if accelerator.is_local_main_process:
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", project),
+                entity=os.environ.get("WANDB_ENTITY", entity),
+                dir=os.environ.get("WANDB_DIR", str(logging_dir)),
+                group=os.environ.get("WANDB_GROUP", group),
+                reinit=True,
+                config=asdict(model_config)
+            )
 
     # =======================
     # ===   Load models   ===
@@ -530,6 +534,15 @@ def main(args):
     # ===================
     # === Config Lora ===
     # ===================
+
+    if model_config.compile_model:
+        torch_backend = "cudagraphs"
+        vae = torch.compile(vae, backend=torch_backend)
+        unet = torch.compile(unet, backend=torch_backend)
+        text_encoder_one = torch.compile(text_encoder_one, backend=torch_backend)
+        if text_encoder_two:
+            text_encoder_two = torch.compile(text_encoder_two, backend=torch_backend)
+
 
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
@@ -769,17 +782,26 @@ def main(args):
     train_dataset = DynamicDataset.from_config(train_dataset_config)
     val_dataset = DynamicDataset.from_config(val_dataset_config)
 
+
     # Preprocessing
-    target_size = (
-        int(model_config.crop_height * model_config.resize_factor),
-        int(model_config.crop_height * model_config.resize_factor)
+
+    def nearest_multiple(x: float | int, m: int) -> int:
+        return int(int(x / m) * m)
+
+    crop_height = model_config.crop_height or model_config.image_height 
+    crop_width = model_config.crop_width or model_config.image_width 
+    resize_factor = model_config.resize_factor or 1
+
+    crop_size = (
+        nearest_multiple(crop_height * resize_factor, 8),
+        nearest_multiple(crop_width * resize_factor, 8)
     )
     downsample_size = (
-        int(model_config.image_height * model_config.resize_factor),
-        int(model_config.image_width * model_config.resize_factor)
+        nearest_multiple(model_config.image_height * resize_factor, 8),
+        nearest_multiple(model_config.image_width * resize_factor, 8)
     ) 
 
-    if model_config.resize_factor != 1:
+    if resize_factor != 1:
         train_resizer = transforms.Resize(downsample_size, interpolation=transforms.InterpolationMode.BILINEAR)
     else:
         train_resizer = None
@@ -789,19 +811,25 @@ def main(args):
     else:
         train_flipper = None
 
-    train_cropper = (
-        transforms.CenterCrop(target_size)
-        if model_config.center_crop
-        else transforms.RandomCrop(target_size)
-    )
+    if (crop_height != model_config.image_height) or (crop_width != model_config.image_width):
+        train_cropper = (
+            transforms.CenterCrop(crop_size)
+            if model_config.center_crop
+            else transforms.RandomCrop(crop_size)
+        )
+    else:
+        train_cropper = None
 
-    if model_config.resize_factor != 1:
+    if resize_factor != 1:
         val_resizer = transforms.Resize(downsample_size, interpolation=transforms.InterpolationMode.BILINEAR)
     else:
         val_resizer = None
 
     val_flipper = None
-    val_cropper = transforms.CenterCrop(target_size)
+    if (crop_height != model_config.image_height) or (crop_width != model_config.image_width):
+        val_cropper = transforms.CenterCrop(crop_size)
+    else:
+        val_cropper = None
 
 
     tokenizers = [tokenizer_one]
@@ -809,15 +837,16 @@ def main(args):
         tokenizers.append(tokenizer_two)
 
     with accelerator.main_process_first():
-        train_dataset.preprocess_func = lambda batch: preprocess_sample(batch, train_resizer, train_flipper, train_cropper, tokenizers, target_size, model_config.center_crop)
-        val_dataset.preprocess_func = lambda batch: preprocess_sample(batch, val_resizer, val_flipper, val_cropper, tokenizers, target_size, True)
+        train_dataset.preprocess_func = lambda batch: preprocess_sample(batch, train_resizer, train_flipper, train_cropper, tokenizers, crop_size, model_config.center_crop)
+        val_dataset.preprocess_func = lambda batch: preprocess_sample(batch, val_resizer, val_flipper, val_cropper, tokenizers, crop_size, True)
 
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
         batch_size=model_config.train_batch_size,
         num_workers=model_config.dataloader_num_workers,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        pin_memory=model_config.pin_memory
     )
 
     val_dataloader = DataLoader(
@@ -825,18 +854,13 @@ def main(args):
         shuffle=False,
         batch_size=model_config.train_batch_size,
         num_workers=model_config.dataloader_num_workers,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        pin_memory=model_config.pin_memory
     )
 
     # ==========================
     # ===   Setup training   ===
     # ==========================
-
-
-    #unet = torch.compile(unet)
-    #text_encoder_one = torch.compile(text_encoder_one)
-    #if text_encoder_two:
-    #    text_encoder_two = torch.compile(text_encoder_two)
 
     # Scheduler and math around the number of training steps.
     num_update_steps_per_epoch = math.ceil(
@@ -850,6 +874,7 @@ def main(args):
         num_warmup_steps=model_config.lr_warmup_steps
         * model_config.gradient_accumulation_steps,
         num_training_steps=max_train_steps * model_config.gradient_accumulation_steps,
+        **model_config.lr_scheduler_kwargs
     )
 
     # Prepare everything with our `accelerator`.
@@ -982,9 +1007,7 @@ def main(args):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
-                rgbs = batch["rgb"]
-                model_input = vae.encode(rgbs).latent_dist.sample()
-                model_input = model_input * vae.config.scaling_factor
+                model_input = vae.encode(batch["rgb"].to(weight_dtype)).latent_dist.sample() * vae.config.scaling_factor
 
                 noise = torch.randn_like(model_input)
                 if model_config.noise_offset:
