@@ -10,11 +10,6 @@ datasets:
     data_getters:
       rgb:
         camera: "front_camera"
-        #height: 1080
-        #width: 1920
-        height: 536
-        width: 960
-
       prompt: 
         type: static
         positive_prompt: ""
@@ -24,7 +19,10 @@ datasets:
 
     data_tree: 
       pandaset: 
-        001-010: "0::4"
+        001-124: "0::1"
+        #001: "0::8"
+        #001:
+        #  - 01
           
 
   val_data: 
@@ -33,11 +31,7 @@ datasets:
     data_getters:
       rgb:
         camera: "front_camera"
-        #height: 1080
-        #width: 1920
-        height: 536
-        width: 960
-      
+
       prompt: 
         type: static
         positive_prompt: ""
@@ -47,39 +41,58 @@ datasets:
 
     data_tree: 
       pandaset: 
-        001: "0::16"
-        006: "0::16"
-
-          
+        139-158: "0::16"
+        #101: "0::16"
+        #001:
+        # - 01
 
 
 model:
-  model_id: "runwayml/stable-diffusion-v1-5"
+  #model_id: "runwayml/stable-diffusion-v1-5"
+  model_id: stabilityai/stable-diffusion-2-1
   revision: null
   variant: null
   max_train_samples: null
   seed: 0
   train_batch_size: 16
-  learning_rate: 0.0001
+  dataloader_num_workers: 8
+
+  max_grad_norm: 1.0
+  mixed_precision: null
+  lora_rank: 128
+
+  n_epochs: 1000
+  val_freq: 1
+
+  val_strength: 0.5
+  num_train_timesteps: 1000
+
+  learning_rate: 0.0003
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_weight_decay: 0.01
   adam_epsilon: 0.00000001
-  max_grad_norm: 1.0
-  mixed_precision: null
-  lora_rank: 8
-  n_epochs: 1000
-  val_freq: 10
-  val_strength: 0.4
 
-  num_train_timesteps: 500
 
-  crop_square: True
+  #lr_scheduler: "constant"
+  #lr_warmup_steps: 1000
+
+  lr_scheduler: "cosine_with_restarts"
+  lr_warmup_steps: 1000
+  lr_scheduler_kwargs:
+    num_cycles: 3
+
   center_crop: True
-  flip_prob: 0
+  flip_prob: 0.5
 
-  image_height: 536
-  image_width: 960
+  crop_height: null
+  crop_width: null
+  #crop_height: 512
+  #crop_width: 512
+  resize_factor: 0.250
 
-output_dir: /staging/agp/masterthesis/nerf-thesis-shared/output/finetune/sd_v1-5
+  image_height: 1080
+  image_width: 1920
+
+output_dir: /staging/agp/masterthesis/nerf-thesis-shared/output/finetune/sd_v2_1
 log_with: wandb
