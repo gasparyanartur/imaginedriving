@@ -10,6 +10,7 @@ import torch.utils
 import torch.utils.data
 import tqdm
 import shutil
+import functools
 
 import numpy as np
 import torch
@@ -300,6 +301,115 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[list[str], Any]:
     return batch
 
 
+def save_model_hook(models, weights, output_dir, accelerator, unet, text_encoder_one, text_encoder_two, using_sdxl):
+    if accelerator.is_main_process:
+        # there are only two options here. Either are just the unet attn processor layers
+        # or there are the unet and text encoder attn layers
+        unet_lora_layers_to_save = None
+        text_encoder_one_lora_layers_to_save = None
+        text_encoder_two_lora_layers_to_save = None
+
+        for model in models:
+            unwrapped_model = unwrap_model(model)
+            state_model_dict = convert_state_dict_to_diffusers(
+                get_peft_model_state_dict(model)
+            )
+
+            if isinstance(unwrapped_model, type(unwrap_model(unet))):
+                unet_lora_layers_to_save = state_model_dict
+
+            elif isinstance(unwrapped_model, type(unwrap_model(text_encoder_one))):
+                text_encoder_one_lora_layers_to_save = state_model_dict
+
+            elif text_encoder_two and isinstance(
+                unwrapped_model, type(unwrap_model(text_encoder_two))
+            ):
+                text_encoder_two_lora_layers_to_save = state_model_dict
+
+            else:
+                raise ValueError(f"unexpected save model: {model.__class__}")
+
+            # make sure to pop weight so that corresponding model is not saved again
+            if weights:
+                weights.pop()
+
+        if using_sdxl:
+            StableDiffusionXLImg2ImgPipeline.save_lora_weights(
+                save_directory=output_dir,
+                unet_lora_layers=unet_lora_layers_to_save,
+                text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
+                text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
+            )
+
+        else:
+            StableDiffusionImg2ImgPipeline.save_lora_weights(
+                save_directory=output_dir,
+                unet_lora_layers=unet_lora_layers_to_save,
+                text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
+            )
+
+def load_model_hook(models, input_dir, unet, text_encoder_one, text_encoder_two, model_config, mixed_precision, using_sdxl):
+    unet_ = None
+    text_encoder_one_ = None
+    text_encoder_two_ = None
+
+    while model := models.pop():
+        if isinstance(model, type(unwrap_model(unet))):
+            unet_ = model
+
+        elif isinstance(model, type(unwrap_model(text_encoder_one))):
+            text_encoder_one_ = model
+
+        elif text_encoder_two and isinstance(
+            model, type(unwrap_model(text_encoder_two))
+        ):
+            text_encoder_two_ = model
+
+        else:
+            raise ValueError(f"unexpected save model: {model.__class__}")
+
+    lora_state_dict, _ = LoraLoaderMixin.lora_state_dict(input_dir)
+    unet_state_dict = {
+        f'{k.replace("unet.", "")}': v
+        for k, v in lora_state_dict.items()
+        if k.startswith("unet.")
+    }
+    unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+    incompatible_keys = set_peft_model_state_dict(
+        unet_, unet_state_dict, adapter_name="default"
+    )
+    if incompatible_keys is not None:
+        # check only for unexpected keys
+        unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+        if unexpected_keys:
+            logger.warning(
+                f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
+                f" {unexpected_keys}. "
+            )
+
+    if model_config.train_text_encoder:
+        _set_state_dict_into_text_encoder(
+            lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_one_
+        )
+
+        if using_sdxl:
+            _set_state_dict_into_text_encoder(
+                lora_state_dict,
+                prefix="text_encoder_2.",
+                text_encoder=text_encoder_two_,
+            )
+
+    # Make sure the trainable params are in float32.
+    if mixed_precision == "fp16":
+        models = [unet_]
+        if model_config.train_text_encoder:
+            models.append(text_encoder_one_)
+
+            if text_encoder_two:
+                models.append(text_encoder_two_)
+
+        cast_training_params(models, dtype=torch.float32)
+
 def unwrap_model(accelerator, model):
     model = accelerator.unwrap_model(model)
     model = model._orig_mod if is_compiled_module(model) else model
@@ -388,7 +498,7 @@ def validate_model(
 ) -> None:
     logging.info(f"Running: {run_prefix}")
 
-    using_wandb = any(tracker.name == "wandb" for tracker in accelerator.trackers):
+    using_wandb = any(tracker.name == "wandb" for tracker in accelerator.trackers)
     if using_wandb:
         import wandb
 
@@ -897,118 +1007,27 @@ def main(args):
     # === Prepare optimization ===
     # ============================
 
-    # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-    def save_model_hook(models, weights, output_dir):
-        if accelerator.is_main_process:
-            # there are only two options here. Either are just the unet attn processor layers
-            # or there are the unet and text encoder attn layers
-            unet_lora_layers_to_save = None
-            text_encoder_one_lora_layers_to_save = None
-            text_encoder_two_lora_layers_to_save = None
-
-            for model in models:
-                unwrapped_model = unwrap_model(model)
-                state_model_dict = convert_state_dict_to_diffusers(
-                    get_peft_model_state_dict(model)
-                )
-
-                if isinstance(unwrapped_model, type(unwrap_model(unet))):
-                    unet_lora_layers_to_save = state_model_dict
-
-                elif isinstance(unwrapped_model, type(unwrap_model(text_encoder_one))):
-                    text_encoder_one_lora_layers_to_save = state_model_dict
-
-                elif text_encoder_two and isinstance(
-                    unwrapped_model, type(unwrap_model(text_encoder_two))
-                ):
-                    text_encoder_two_lora_layers_to_save = state_model_dict
-
-                else:
-                    raise ValueError(f"unexpected save model: {model.__class__}")
-
-                # make sure to pop weight so that corresponding model is not saved again
-                if weights:
-                    weights.pop()
-
-            if using_sdxl:
-                StableDiffusionXLImg2ImgPipeline.save_lora_weights(
-                    save_directory=output_dir,
-                    unet_lora_layers=unet_lora_layers_to_save,
-                    text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
-                    text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
-                )
-
-            else:
-                StableDiffusionImg2ImgPipeline.save_lora_weights(
-                    save_directory=output_dir,
-                    unet_lora_layers=unet_lora_layers_to_save,
-                    text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
-                )
-
-    def load_model_hook(models, input_dir):
-        unet_ = None
-        text_encoder_one_ = None
-        text_encoder_two_ = None
-
-        while model := models.pop():
-            if isinstance(model, type(unwrap_model(unet))):
-                unet_ = model
-
-            elif isinstance(model, type(unwrap_model(text_encoder_one))):
-                text_encoder_one_ = model
-
-            elif text_encoder_two and isinstance(
-                model, type(unwrap_model(text_encoder_two))
-            ):
-                text_encoder_two_ = model
-
-            else:
-                raise ValueError(f"unexpected save model: {model.__class__}")
-
-        lora_state_dict, _ = LoraLoaderMixin.lora_state_dict(input_dir)
-        unet_state_dict = {
-            f'{k.replace("unet.", "")}': v
-            for k, v in lora_state_dict.items()
-            if k.startswith("unet.")
-        }
-        unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
-        incompatible_keys = set_peft_model_state_dict(
-            unet_, unet_state_dict, adapter_name="default"
+    accelerator.register_save_state_pre_hook(
+        functools.partial(
+            save_model_hook, 
+            accelerator=accelerator, 
+            unet=unet, 
+            text_encoder_one=text_encoder_one, 
+            text_encoder_two=text_encoder_two, 
+            using_sdxl=using_sdxl
         )
-        if incompatible_keys is not None:
-            # check only for unexpected keys
-            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-            if unexpected_keys:
-                logger.warning(
-                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                    f" {unexpected_keys}. "
-                )
-
-        if model_config.train_text_encoder:
-            _set_state_dict_into_text_encoder(
-                lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_one_
-            )
-
-            if using_sdxl:
-                _set_state_dict_into_text_encoder(
-                    lora_state_dict,
-                    prefix="text_encoder_2.",
-                    text_encoder=text_encoder_two_,
-                )
-
-        # Make sure the trainable params are in float32.
-        if mixed_precision == "fp16":
-            models = [unet_]
-            if model_config.train_text_encoder:
-                models.append(text_encoder_one_)
-
-                if text_encoder_two:
-                    models.append(text_encoder_two_)
-
-            cast_training_params(models, dtype=torch.float32)
-
-    accelerator.register_save_state_pre_hook(save_model_hook)
-    accelerator.register_load_state_pre_hook(load_model_hook)
+    )
+    accelerator.register_load_state_pre_hook(
+        functools.partial(
+            load_model_hook,
+            unet=unet, 
+            text_encoder_one=text_encoder_one, 
+            text_encoder_two=text_encoder_two, 
+            model_config=model_config, 
+            mixed_precision=mixed_precision, 
+            using_sdxl=using_sdxl
+        )
+    )
 
     if model_config.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
