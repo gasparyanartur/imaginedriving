@@ -348,7 +348,7 @@ model_name_to_constructor = {
 
 
 def encode_img(
-    img_processor: VaeImageProcessor, vae: AutoencoderKL, img: Tensor, seed: int = 0
+    img_processor: VaeImageProcessor, vae: AutoencoderKL, img: Tensor, seed: int = 0, sample_latent: bool = False
 ) -> Tensor:
     img = img_processor.preprocess(img)
 
@@ -359,11 +359,15 @@ def encode_img(
         img = img.float()
 
     latents = vae.encode(img.to("cuda"))
+    if sample_latent:
+        latents = latents.latent_dist.sample()
 
-    if needs_upcasting:
-        vae.to(original_vae_dtype)
+    else:
+        if needs_upcasting:
+            vae.to(original_vae_dtype)
 
-    latents = retrieve_latents(latents, generator=torch.manual_seed(seed))
+        latents = retrieve_latents(latents, generator=torch.manual_seed(seed))
+
     latents = latents * vae.config.scaling_factor
 
     return latents
