@@ -4,6 +4,3 @@
 [submodule "implicit-tracking"]
 	path = implicit-tracking
 	url = git@github.com:gasparyanartur/implicit-tracking.git
-[submodule "neurad-studio"]
-	path = neurad-studio
-	url = git@github.com:gasparyanartur/neurad-studio.git
