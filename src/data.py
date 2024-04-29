@@ -236,8 +236,13 @@ class InfoGetter(ABC):
     ) -> list[SampleInfo]:
         samples = []
 
+        existing_scenes = set(path.stem for path in dataset_path.iterdir())
+
         for dataset_name, dataset_dict in data_tree.items():
             for scene_name, sample_list in dataset_dict.items():
+                if scene_name not in existing_scenes:
+                    continue
+
                 if isinstance(sample_list, tuple) and len(sample_list) == 3:
                     start_range, end_range, skip_range = sample_list
                     sample_list = sorted(self.get_sample_names_in_scene(
