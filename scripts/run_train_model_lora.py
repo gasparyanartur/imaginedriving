@@ -436,10 +436,13 @@ class TrainLoraConfig:
     checkpoints_total_limit: int = None
     resume_from_checkpoint: bool = False
     n_epochs: int = 100
-    num_train_timesteps: int = None
     max_train_samples: int = None
     val_freq: int = 10
-    val_strength: float = 0.8
+
+    train_noise_num_steps: int = 200
+    train_noise_strength: float = 0.5
+    val_noise_num_steps: int = 30
+    val_noise_strength: float = 0.25
 
     keep_vae_full: bool = True
 
@@ -528,6 +531,7 @@ def validate_model(
 
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
+    pipeline.set_timesteps(model_config.val_noise_num_steps)
 
     for step, batch in enumerate(dataloader):
         input_imgs = batch["rgb"].to(dtype=torch.float32, device=accelerator.device)
@@ -536,7 +540,13 @@ def validate_model(
         random_seeds = np.arange(bs * step, bs * (step+1))  
         generator = [torch.Generator(device=accelerator.device).manual_seed(int(seed)) for seed in random_seeds]
 
-        output_imgs = pipeline(image=input_imgs, prompt=batch["positive_prompt"], generator=generator, output_type="pt", strength=model_config.val_strength).images.to(dtype=torch.float32, device=accelerator.device)
+        output_imgs = pipeline(
+            image=input_imgs,
+            prompt=batch["positive_prompt"],
+            generator=generator,
+            output_type="pt",
+            strength=model_config.val_noise_strength
+        ).images.to(dtype=torch.float32, device=accelerator.device)
 
         # Benchmark
         metrics = {}        
@@ -584,7 +594,6 @@ def train_epoch(
     text_encoder_two, 
     noise_scheduler, 
     weight_dtype: torch.dtype, 
-    num_train_timesteps: int, 
     max_train_steps: int, 
     global_step: int,
     params_to_optimize, 
@@ -597,6 +606,11 @@ def train_epoch(
         text_encoder_one.train()
         if text_encoder_two:
             text_encoder_two.train()
+
+
+    min_noise_step = int((1 - model_config.train_noise_strength) * noise_scheduler.num_train_timesteps)
+    max_noise_step = noise_scheduler.num_train_timesteps
+
 
     train_loss = 0.0
     for step, batch in enumerate(dataloader):
@@ -611,13 +625,11 @@ def train_epoch(
                     device=model_input.device,
                 )
 
-            bsz = model_input.shape[0]
-
             # Sample a random timestep for each image
             timesteps = torch.randint(
-                0,
-                num_train_timesteps,
-                (bsz,),
+                min_noise_step,
+                max_noise_step,
+                (model_input.shape[0],),
                 device=model_input.device,
                 dtype=torch.long,
             )
@@ -633,7 +645,6 @@ def train_epoch(
             if text_encoder_two:
                 text_encoders.append(text_encoder_two)
                 text_input_ids_list.append(batch["input_ids_two"])
-
 
 
             unet_added_conditions = {}
@@ -1226,12 +1237,6 @@ def main(args):
     # Afterwards we recalculate our number of training epochs
     n_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 
-    # Override number of timesteps if set
-    if model_config.num_train_timesteps:
-        num_train_timesteps = model_config.num_train_timesteps 
-    else:
-        num_train_timesteps = noise_scheduler.config.num_train_timesteps
-
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
@@ -1320,7 +1325,6 @@ def main(args):
             text_encoder_two,
             noise_scheduler,
             weight_dtype,
-            num_train_timesteps,
             max_train_steps,
             global_step,
             params_to_optimize,
