@@ -45,6 +45,7 @@ datasets:
         #101: "0::16"
         #001:
         # - 01
+        # - 09
 
 
 model:
@@ -61,18 +62,21 @@ model:
   mixed_precision: null
   lora_rank: 128
 
-  n_epochs: 1000
+  n_epochs: 500
   val_freq: 1
 
-  val_strength: 0.5
-  num_train_timesteps: 1000
+  train_noise_strength: 0.4
+
+  val_noise_num_steps: 50
+  val_noise_strength: 0.2
+
+  add_rgb_loss: True
 
   learning_rate: 0.0003
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_weight_decay: 0.01
   adam_epsilon: 0.00000001
-
 
   #lr_scheduler: "constant"
   #lr_warmup_steps: 1000
@@ -82,14 +86,17 @@ model:
   lr_scheduler_kwargs:
     num_cycles: 3
 
-  center_crop: True
+  #center_crop: True
+  #flip_prob: 0
+
+  center_crop: False
   flip_prob: 0.5
 
-  crop_height: null
-  crop_width: null
-  #crop_height: 512
-  #crop_width: 512
-  resize_factor: 0.250
+  #crop_height: null
+  #crop_width: null
+  crop_height: 512
+  crop_width: 512
+  resize_factor: 1.0
 
   image_height: 1080
   image_width: 1920

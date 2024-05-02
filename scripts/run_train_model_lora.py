@@ -24,12 +24,11 @@ import diffusers
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    StableDiffusionXLPipeline,
-    StableDiffusionPipeline,
     StableDiffusionXLImg2ImgPipeline,
     StableDiffusionImg2ImgPipeline,
     UNet2DConditionModel,
 )
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import LoraLoaderMixin
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import (
@@ -59,11 +58,83 @@ from huggingface_hub import create_repo, upload_folder
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 from src.data import setup_project, DynamicDataset
-from src.diffusion import is_sdxl_model, is_sdxl_vae
+from src.diffusion import is_sdxl_model, is_sdxl_vae, get_noised_img
+from src.diffusion import get_noised_img
+
 
 
 check_min_version("0.27.0")
 logger = get_logger(__name__, log_level="INFO")
+
+
+
+@dataclass(init=True)
+class TrainLoraConfig:
+    model_id: str = "runwayml/stable-diffusion-v1-5"
+    #model_id: str = "stabilityai/stable-diffusion-xl-base-1.0"
+
+    # Path to pretrained VAE model with better numerical stability.
+    # More details: https://github.com/huggingface/diffusers/pull/4038.
+    #vae_id: str = "madebyollin/sdxl-vae-fp16-fix"
+    vae_id: str = None
+
+    mixed_precision: str = None
+    revision: str = None
+    variant: str = None
+    prediction_type: str = None
+
+    train_text_encoder: bool = False
+    gradient_checkpointing: bool = False
+    checkpointing_steps: int = 500
+    checkpoints_total_limit: int = None
+    resume_from_checkpoint: bool = False
+    n_epochs: int = 100
+    max_train_samples: int = None
+    val_freq: int = 10
+
+    train_noise_strength: float = 0.5
+    val_noise_num_steps: int = 30
+    val_noise_strength: float = 0.25
+
+    keep_vae_full: bool = True
+    add_rgb_loss: bool = False
+
+    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+    noise_offset: float = 0
+
+    # https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+    allow_tf32: bool = True
+    scale_lr: bool = False
+    gradient_accumulation_steps: int = 1
+    train_batch_size: int = 16
+    dataloader_num_workers: int = 0
+    pin_memory: bool = True
+    learning_rate: float = 1e-4
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_weight_decay: float = 1e-2
+    adam_epsilon: float = 1e-08
+    snr_gamma: float = None
+    max_grad_norm: float = 1.0
+    lora_rank: int = 4
+    compile_model: bool = False
+
+    # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]'
+    lr_scheduler: str = "constant"
+    lr_warmup_steps: int = 500
+    lr_scheduler_kwargs: dict[str, any] = field(default_factory=dict)
+
+    image_width: int = 1920
+    image_height: int = 1080
+
+    center_crop: bool = False
+    flip_prob: float = 0.5
+
+    crop_height: float = 512
+    crop_width: float = 512
+    resize_factor: float = 1.0
+
+    seed: int = None
 
 
 
@@ -310,19 +381,19 @@ def save_model_hook(models, weights, output_dir, accelerator, unet, text_encoder
         text_encoder_two_lora_layers_to_save = None
 
         for model in models:
-            unwrapped_model = unwrap_model(model)
+            unwrapped_model = unwrap_model(accelerator, model)
             state_model_dict = convert_state_dict_to_diffusers(
                 get_peft_model_state_dict(model)
             )
 
-            if isinstance(unwrapped_model, type(unwrap_model(unet))):
+            if isinstance(unwrapped_model, type(unwrap_model(accelerator, unet))):
                 unet_lora_layers_to_save = state_model_dict
 
-            elif isinstance(unwrapped_model, type(unwrap_model(text_encoder_one))):
+            elif isinstance(unwrapped_model, type(unwrap_model(accelerator, text_encoder_one))):
                 text_encoder_one_lora_layers_to_save = state_model_dict
 
             elif text_encoder_two and isinstance(
-                unwrapped_model, type(unwrap_model(text_encoder_two))
+                unwrapped_model, type(unwrap_model(accelerator, text_encoder_two))
             ):
                 text_encoder_two_lora_layers_to_save = state_model_dict
 
@@ -348,20 +419,20 @@ def save_model_hook(models, weights, output_dir, accelerator, unet, text_encoder
                 text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
             )
 
-def load_model_hook(models, input_dir, unet, text_encoder_one, text_encoder_two, model_config, mixed_precision, using_sdxl):
+def load_model_hook(models, input_dir, accelerator, unet, text_encoder_one, text_encoder_two, model_config, mixed_precision, using_sdxl):
     unet_ = None
     text_encoder_one_ = None
     text_encoder_two_ = None
 
     while model := models.pop():
-        if isinstance(model, type(unwrap_model(unet))):
+        if isinstance(model, type(unwrap_model(accelerator, unet))):
             unet_ = model
 
-        elif isinstance(model, type(unwrap_model(text_encoder_one))):
+        elif isinstance(model, type(unwrap_model(accelerator, text_encoder_one))):
             text_encoder_one_ = model
 
         elif text_encoder_two and isinstance(
-            model, type(unwrap_model(text_encoder_two))
+            model, type(unwrap_model(accelerator, text_encoder_two))
         ):
             text_encoder_two_ = model
 
@@ -415,79 +486,47 @@ def unwrap_model(accelerator, model):
     model = model._orig_mod if is_compiled_module(model) else model
     return model
 
-@dataclass(init=True)
-class TrainLoraConfig:
-    model_id: str = "runwayml/stable-diffusion-v1-5"
-    #model_id: str = "stabilityai/stable-diffusion-xl-base-1.0"
 
-    # Path to pretrained VAE model with better numerical stability.
-    # More details: https://github.com/huggingface/diffusers/pull/4038.
-    #vae_id: str = "madebyollin/sdxl-vae-fp16-fix"
-    vae_id: str = None
+def nearest_multiple(x: float | int, m: int) -> int:
+    return int(int(x / m) * m)
 
-    mixed_precision: str = None
-    revision: str = None
-    variant: str = None
-    prediction_type: str = None
 
-    train_text_encoder: bool = False
-    gradient_checkpointing: bool = False
-    checkpointing_steps: int = 500
-    checkpoints_total_limit: int = None
-    resume_from_checkpoint: bool = False
-    n_epochs: int = 100
-    max_train_samples: int = None
-    val_freq: int = 10
+def prepare_preprocessing(model_config):
+    crop_height = model_config.crop_height or model_config.image_height 
+    crop_width = model_config.crop_width or model_config.image_width 
+    resize_factor = model_config.resize_factor or 1
 
-    train_noise_num_steps: int = 200
-    train_noise_strength: float = 0.5
-    val_noise_num_steps: int = 30
-    val_noise_strength: float = 0.25
+    crop_size = (
+        nearest_multiple(crop_height * resize_factor, 8),
+        nearest_multiple(crop_width * resize_factor, 8)
+    )
+    downsample_size = (
+        nearest_multiple(model_config.image_height * resize_factor, 8),
+        nearest_multiple(model_config.image_width * resize_factor, 8)
+    ) 
 
-    keep_vae_full: bool = True
+    train_resizer = transforms.Resize(downsample_size, interpolation=transforms.InterpolationMode.BILINEAR) if resize_factor != 1 else None
+    train_flipper = transforms.RandomHorizontalFlip(p=model_config.flip_prob) if model_config.flip_prob > 0 else None
+    train_cropper = (
+        transforms.CenterCrop(crop_size)
+        if model_config.center_crop
+        else transforms.RandomCrop(crop_size)
+    ) if (
+        (crop_height != model_config.image_height) or 
+        (crop_width != model_config.image_width)
+    ) else None
 
-    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-    noise_offset: float = 0
+    val_resizer = transforms.Resize(downsample_size, interpolation=transforms.InterpolationMode.BILINEAR) if resize_factor != 1 else None
+    val_flipper = None
+    val_cropper = transforms.CenterCrop(crop_size) if (crop_height != model_config.image_height) or (crop_width != model_config.image_width) else None
 
-    # https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
-    allow_tf32: bool = True
-    scale_lr: bool = False
-    gradient_accumulation_steps: int = 1
-    train_batch_size: int = 16
-    dataloader_num_workers: int = 0
-    pin_memory: bool = True
-    learning_rate: float = 1e-4
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_weight_decay: float = 1e-2
-    adam_epsilon: float = 1e-08
-    snr_gamma: float = None
-    max_grad_norm: float = 1.0
-    lora_rank: int = 4
-    compile_model: bool = False
-
-    # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]'
-    lr_scheduler: str = "constant"
-    lr_warmup_steps: int = 500
-    lr_scheduler_kwargs: dict[str, any] = field(default_factory=dict)
-
-    image_width: int = 1920
-    image_height: int = 1080
-
-    center_crop: bool = False
-    flip_prob: float = 0.5
-
-    crop_height: float = 512
-    crop_width: float = 512
-    resize_factor: float = 1.0
-
-    seed: int = None
-
+    return train_resizer, train_flipper, train_cropper, val_resizer, val_flipper, val_cropper, crop_size
 
 def validate_model(
     accelerator,
     model_config: TrainLoraConfig,
     dataloader: torch.utils.data.DataLoader,
+    noise_scheduler: DDPMScheduler,
     vae,
     unet,
     text_encoder_one,
@@ -531,13 +570,12 @@ def validate_model(
 
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
-    pipeline.set_timesteps(model_config.val_noise_num_steps)
+    noise_scheduler.set_timesteps(model_config.val_noise_num_steps)
 
     for step, batch in enumerate(dataloader):
         input_imgs = batch["rgb"].to(dtype=torch.float32, device=accelerator.device)
-
-        bs = len(input_imgs)
-        random_seeds = np.arange(bs * step, bs * (step+1))  
+        batch_size = len(input_imgs)
+        random_seeds = np.arange(batch_size * step, batch_size * (step+1))  
         generator = [torch.Generator(device=accelerator.device).manual_seed(int(seed)) for seed in random_seeds]
 
         output_imgs = pipeline(
@@ -548,17 +586,17 @@ def validate_model(
             strength=model_config.val_noise_strength
         ).images.to(dtype=torch.float32, device=accelerator.device)
 
+        val_start_timestep = int((1 - model_config.val_noise_strength) * len(noise_scheduler.timesteps))
+        noised_imgs = get_noised_img(input_imgs, timestep=val_start_timestep, pipe=pipeline, noise_scheduler=noise_scheduler, device=accelerator.device)
+
         # Benchmark
-        metrics = {}        
         for metric_name, metric in metrics.items():
             values = metric(output_imgs, input_imgs)
             if len(values.shape) == 0:
                 values = [values.item()]
 
             value_dict = {str(i): float(v) for i, v in enumerate(values)}
-            log_values = {f"{run_prefix}_{metric_name}": value_dict}
-            accelerator.log(log_values, step=global_step)
-
+            accelerator.log({f"{run_prefix}_{metric_name}": value_dict}, step=global_step)
 
         for tracker in accelerator.trackers:
             if tracker.name == "tensorboard":
@@ -574,7 +612,11 @@ def validate_model(
                     f"{run_prefix}_images": [
                         wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
                         for (img, meta) in (zip(output_imgs, batch["meta"]))
-                    ]
+                    ],
+                    "noised_images": [
+                        wandb.Image(img, caption=f"{meta['dataset']} - {meta['scene']} - {meta['sample']}")
+                        for (img, meta) in (zip(noised_imgs, batch["meta"]))
+                    ],
                 }, step=global_step)
 
     del pipeline
@@ -590,6 +632,7 @@ def train_epoch(
     dataloader: torch.utils.data.DataLoader, 
     vae: AutoencoderKL, 
     unet: UNet2DConditionModel, 
+    image_processor: VaeImageProcessor,
     text_encoder_one, 
     text_encoder_two, 
     noise_scheduler, 
@@ -608,14 +651,15 @@ def train_epoch(
             text_encoder_two.train()
 
 
-    min_noise_step = int((1 - model_config.train_noise_strength) * noise_scheduler.num_train_timesteps)
-    max_noise_step = noise_scheduler.num_train_timesteps
-
+    min_noise_step = int((1 - model_config.train_noise_strength) * noise_scheduler.config.num_train_timesteps)
+    max_noise_step = noise_scheduler.config.num_train_timesteps
 
     train_loss = 0.0
     for step, batch in enumerate(dataloader):
         with accelerator.accumulate(unet):
-            model_input = vae.encode(batch["rgb"].to(weight_dtype)).latent_dist.sample() * vae.config.scaling_factor
+            rgb = batch["rgb"].to(weight_dtype)
+            rgb = image_processor.preprocess(rgb)
+            model_input = vae.encode(rgb).latent_dist.sample() * vae.config.scaling_factor
 
             noise = torch.randn_like(model_input)
             if model_config.noise_offset:
@@ -639,6 +683,7 @@ def train_epoch(
             noisy_model_input = noise_scheduler.add_noise(
                 model_input, noise, timesteps
             )
+
 
             text_encoders = [text_encoder_one]
             text_input_ids_list = [batch["input_ids_one"]]
@@ -675,6 +720,7 @@ def train_epoch(
                 added_cond_kwargs=unet_added_conditions,
                 return_dict=False,
             )[0]
+
 
             # Get the target for loss depending on the prediction type
             if model_config.prediction_type is not None:
@@ -772,8 +818,6 @@ def train_epoch(
         logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
         progress_bar.set_postfix(**logs)
 
-        if global_step >= max_train_steps:
-            break
 
     return global_step
 
@@ -947,6 +991,8 @@ def main(args):
         variant=model_config.variant,
     )
 
+    image_processor = VaeImageProcessor()
+
     # ===================
     # === Config Lora ===
     # ===================
@@ -1031,6 +1077,7 @@ def main(args):
     accelerator.register_load_state_pre_hook(
         functools.partial(
             load_model_hook,
+            accelerator=accelerator,
             unet=unet, 
             text_encoder_one=text_encoder_one, 
             text_encoder_two=text_encoder_two, 
@@ -1105,60 +1152,15 @@ def main(args):
 
     # Preprocessing
 
-    def nearest_multiple(x: float | int, m: int) -> int:
-        return int(int(x / m) * m)
-
-    crop_height = model_config.crop_height or model_config.image_height 
-    crop_width = model_config.crop_width or model_config.image_width 
-    resize_factor = model_config.resize_factor or 1
-
-    crop_size = (
-        nearest_multiple(crop_height * resize_factor, 8),
-        nearest_multiple(crop_width * resize_factor, 8)
-    )
-    downsample_size = (
-        nearest_multiple(model_config.image_height * resize_factor, 8),
-        nearest_multiple(model_config.image_width * resize_factor, 8)
-    ) 
-
-    if resize_factor != 1:
-        train_resizer = transforms.Resize(downsample_size, interpolation=transforms.InterpolationMode.BILINEAR)
-    else:
-        train_resizer = None
-
-    if model_config.flip_prob > 0:
-        train_flipper = transforms.RandomHorizontalFlip(p=model_config.flip_prob)
-    else:
-        train_flipper = None
-
-    if (crop_height != model_config.image_height) or (crop_width != model_config.image_width):
-        train_cropper = (
-            transforms.CenterCrop(crop_size)
-            if model_config.center_crop
-            else transforms.RandomCrop(crop_size)
-        )
-    else:
-        train_cropper = None
-
-    if resize_factor != 1:
-        val_resizer = transforms.Resize(downsample_size, interpolation=transforms.InterpolationMode.BILINEAR)
-    else:
-        val_resizer = None
-
-    val_flipper = None
-    if (crop_height != model_config.image_height) or (crop_width != model_config.image_width):
-        val_cropper = transforms.CenterCrop(crop_size)
-    else:
-        val_cropper = None
-
+    train_resizer, train_flipper, train_cropper, val_resizer, val_flipper, val_cropper, target_size = prepare_preprocessing(model_config)
 
     tokenizers = [tokenizer_one]
     if tokenizer_two:
         tokenizers.append(tokenizer_two)
 
     with accelerator.main_process_first():
-        train_dataset.preprocess_func = lambda batch: preprocess_sample(batch, train_resizer, train_flipper, train_cropper, tokenizers, crop_size, model_config.center_crop)
-        val_dataset.preprocess_func = lambda batch: preprocess_sample(batch, val_resizer, val_flipper, val_cropper, tokenizers, crop_size, True)
+        train_dataset.preprocess_func = lambda batch: preprocess_sample(batch, train_resizer, train_flipper, train_cropper, tokenizers, target_size, model_config.center_crop)
+        val_dataset.preprocess_func = lambda batch: preprocess_sample(batch, val_resizer, val_flipper, val_cropper, tokenizers, target_size, True)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -1310,7 +1312,6 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
-
     for epoch in range(first_epoch, n_epochs):
         global_step = train_epoch(
             config,
@@ -1321,6 +1322,7 @@ def main(args):
             train_dataloader,
             vae,
             unet,
+            image_processor,
             text_encoder_one,
             text_encoder_two,
             noise_scheduler,
@@ -1333,24 +1335,26 @@ def main(args):
             using_sdxl
         )
 
-        if accelerator.is_main_process and ((global_step // model_config.train_batch_size // len(train_dataloader)) % model_config.val_freq) == 0:
-            validate_model(accelerator, model_config, val_dataloader, vae, unet, text_encoder_one, text_encoder_two, weight_dtype, epoch, global_step, val_metrics, "val", using_sdxl)
+        if epoch % model_config.val_freq == 0:
+            validate_model(accelerator, model_config, val_dataloader, noise_scheduler, vae, unet, text_encoder_one, text_encoder_two, weight_dtype, epoch, global_step, val_metrics, "val", using_sdxl)
 
+        if global_step >= max_train_steps:
+            break
      
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
 
         # Final inference
-        validate_model(accelerator, model_config, val_dataloader, vae, unet, text_encoder_one, text_encoder_two, weight_dtype, epoch, global_step, val_metrics, "test", using_sdxl)
+        validate_model(accelerator, model_config, val_dataloader, noise_scheduler, vae, unet, text_encoder_one, text_encoder_two, weight_dtype, epoch, global_step, val_metrics, "test", using_sdxl)
 
         # Save the lora layers
-        unet = unwrap_model(unet)
+        unet = unwrap_model(accelerator, unet)
         unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
 
         if model_config.train_text_encoder:
-            text_encoder_one = unwrap_model(text_encoder_one)
+            text_encoder_one = unwrap_model(accelerator, text_encoder_one)
             if text_encoder_two:
-                text_encoder_two = unwrap_model(text_encoder_two)
+                text_encoder_two = unwrap_model(accelerator, text_encoder_two)
 
             text_encoder_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder_one))
             if text_encoder_two:
