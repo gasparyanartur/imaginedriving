@@ -21,6 +21,6 @@ fi
 
 image_path=${IMAGE_PATH:-"/staging/agp/masterthesis/nerf-thesis-shared/containers/nerf-thesis.sif"}
 config_path=${CONFIG_PATH:-"configs/hal-configs/train_model.yml"}
-workdir=${WORKDIR:-"/home/s0001900/workspace/nerf-thesis"}
+workdir=${WORKDIR:-"/home/s0001900/workspace/imaginedriving"}
 
 singularity exec --env PYTHONPATH=$workdir --env WANDB_API_KEY=$wandb_api_key --bind /staging:/staging -H $workdir --nv $image_path accelerate launch --num_processes=$num_processes --num_machines=$num_machines --dynamo_backend=$dynamo_backend --mixed_precision=$mixed_precision --main_process_port=$main_process_port scripts/run_train_model_lora.py $config_path
