@@ -386,6 +386,10 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[list[str], Any]:
     return batch
 
 
+def get_matching_type(model, models):
+
+
+
 def save_model_hook(
     models,
     weights,
@@ -446,45 +450,35 @@ def save_model_hook(
 
 
 def load_model_hook(
-    models,
+    loaded_models,
     input_dir,
     accelerator,
-    unet,
-    text_encoder_one,
-    text_encoder_two,
-    model_config,
-    mixed_precision,
-    using_sdxl,
+    models,
+    model_config: TrainLoraConfig,
 ):
-    unet_ = None
-    text_encoder_one_ = None
-    text_encoder_two_ = None
+    loaded_models_dict = {}
 
-    while model := models.pop():
-        if isinstance(model, type(unwrap_model(accelerator, unet))):
-            unet_ = model
-
-        elif isinstance(model, type(unwrap_model(accelerator, text_encoder_one))):
-            text_encoder_one_ = model
-
-        elif text_encoder_two and isinstance(
-            model, type(unwrap_model(accelerator, text_encoder_two))
-        ):
-            text_encoder_two_ = model
+    while loaded_model := loaded_models.pop():
+        for model_name, model in models.items():
+            if isinstance(loaded_model, unwrap_model(accelerator, model)):
+                loaded_models_dict[model_name] = loaded_model
 
         else:
-            raise ValueError(f"unexpected save model: {model.__class__}")
+            raise ValueError(f"unexpected save model: {loaded_model.__class__}")
 
     lora_state_dict, _ = LoraLoaderMixin.lora_state_dict(input_dir)
-    unet_state_dict = {
-        f'{k.replace("unet.", "")}': v
-        for k, v in lora_state_dict.items()
-        if k.startswith("unet.")
-    }
-    unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
-    incompatible_keys = set_peft_model_state_dict(
-        unet_, unet_state_dict, adapter_name="default"
-    )
+
+    if "unet" in models:
+        unet_state_dict = {
+            f'{k.replace("unet.", "")}': v
+            for k, v in lora_state_dict.items()
+            if k.startswith("unet.")
+        }
+        unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+        incompatible_keys = set_peft_model_state_dict(
+            loaded_models_dict["unet"], unet_state_dict, adapter_name="default"
+        )
+
     if incompatible_keys is not None:
         # check only for unexpected keys
         unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
@@ -494,28 +488,19 @@ def load_model_hook(
                 f" {unexpected_keys}. "
             )
 
-    if model_config.train_text_encoder:
+    if "text_encoder" in models:
         _set_state_dict_into_text_encoder(
-            lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_one_
+            lora_state_dict, prefix="text_encoder.", text_encoder=loaded_models["text_encoder"]
         )
 
-        if using_sdxl:
-            _set_state_dict_into_text_encoder(
-                lora_state_dict,
-                prefix="text_encoder_2.",
-                text_encoder=text_encoder_two_,
-            )
 
     # Make sure the trainable params are in float32.
-    if mixed_precision == "fp16":
-        models = [unet_]
+    if model_config.mixed_precision == "fp16":
+        loaded_models = [loaded_unet]
         if model_config.train_text_encoder:
-            models.append(text_encoder_one_)
+            loaded_models.append(loaded_text_encoder)
 
-            if text_encoder_two:
-                models.append(text_encoder_two_)
-
-        cast_training_params(models, dtype=torch.float32)
+        cast_training_params(loaded_models, dtype=torch.float32)
 
 
 def unwrap_model(accelerator, model):
