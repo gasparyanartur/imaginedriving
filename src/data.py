@@ -43,7 +43,7 @@ def save_yaml(path: Path, data: dict[str, Any]):
         yaml.dump(data, f, default_flow_style=False)
 
 
-def setup_project(config_path: Path = None):
+def setup_project(config_path: Path):
     logging.getLogger().setLevel(logging.INFO)
 
     if not torch.cuda.is_available():
@@ -51,22 +51,20 @@ def setup_project(config_path: Path = None):
             f"CUDA not detected. Running on CPU. The code is not supported for CPU and will most likely give incorrect results. Proceed with caution."
         )
 
-    proj_dir = get_env("PROJ_DIR") or Path.cwd()
-
     if config_path is None:
-        config_path = get_env("PROJ_CONF_PATH")
+        project_dir = get_env("PROJECT_DIR") or Path.cwd()
+        config_path = project_dir / "proj_config.yml"
+        if not config_path.exists():
+            raise ValueError(f"No config path specified")
+            
+    else:
+        if not config_path.exists():
+            raise ValueError(f"Could not find config at specified path: {config_path}")
 
-        if config_path is None:
-            config_path = proj_dir / "proj_config.yml"
-
-            if not config_path.exists():
-                raise ValueError(f"No config path specified")
 
     config = read_yaml(config_path)
-
-    proj_dir = set_if_no_key(config, "PROJ_DIR", proj_dir)
-    cache_dir = set_if_no_key(config, "CACHE_DIR", proj_dir / ".cache")
-    cache_dir = config["CACHE_DIR"]
+    project_dir = config.get("project_path", get_env("PROJECT_DIR") or Path.cwd())
+    cache_dir = config.get("cache_dir", get_env("CACHE_DIR", project_dir / ".cache"))
 
     set_env("HF_HUB_CACHE", cache_dir / "hf")  # Huggingface cache dir
     set_env("MPLCONFIGDIR", cache_dir / "mpl")  # Matplotlib cache dir
