@@ -72,7 +72,6 @@ class LoraTrainingState:
     cache_dir: str = None
     datasets: dict[str, Any] = field(default_factory=dict)
 
-
     model_id: str = "stabilityai/stable-diffusion-2-1"
     # model_id: str = "stabilityai/stable-diffusion-xl-base-1.0"
 
@@ -81,10 +80,9 @@ class LoraTrainingState:
     # vae_id: str = "madebyollin/sdxl-vae-fp16-fix"
     vae_id: str = None
 
-    weights_dtype: torch.dtype = torch.float32
-    vae_dtype: torch.dtype = torch.float32
+    weights_dtype: str = "fp32"
+    vae_dtype: str = "fp32"
 
-    mixed_precision: str = None
     revision: str = None
     variant: str = None
     prediction_type: str = None
@@ -125,7 +123,7 @@ class LoraTrainingState:
     max_grad_norm: float = 1.0
     lora_rank: int = 4
 
-    max_train_steps: int = None         # Gets set later
+    max_train_steps: int = None  # Gets set later
     num_update_steps_per_epoch: int = None  # Gets set later
 
     compile_model: bool = False
@@ -155,10 +153,14 @@ class LoraTrainingState:
     output_dir: str = None
     logging_dir: str = None
 
-    push_to_hub: bool = False   # Not Implemented
+    push_to_hub: bool = False  # Not Implemented
     hub_token: str = None
 
     seed: int = None
+
+
+_lower_dtypes = {"fp16", "bf16"}
+_dtype_conversion = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
 def import_text_encoder_class_from_model_name_or_path(
@@ -291,22 +293,20 @@ def compute_time_ids(original_size, crops_coords_top_left, target_size, device, 
     return add_time_ids
 
 
-def preprocess_rgb(
-    rgb, target_size: tuple[int, int], resizer, flipper, cropper, center_crop: bool
-):
+def preprocess_rgb(rgb, preprocessors, target_size: tuple[int, int], center_crop: bool):
     # preprocess rgb:
     # out: rgb, original_size, crop_top_left, target_size
 
     th, tw = target_size
     h0, w0 = rgb.shape[-2:]
 
-    if resizer:
+    if resizer := preprocessors.get("resizer"):
         rgb = resizer(rgb)
 
-    if flipper:
+    if flipper := preprocessors.get("flipper"):
         rgb = flipper(rgb)
 
-    if cropper:
+    if cropper := preprocessors.get("cropper"):
         if center_crop:
             cy = (h0 - th) // 2
             cx = (w0 - tw) // 2
@@ -330,40 +330,29 @@ def preprocess_rgb(
     }
 
 
-def preprocess_prompt(prompt: list[str], tokenizers):
-    assert 1 <= len(tokenizers) <= 2
+def preprocess_prompt(prompt: list[str], models):
+    assert "tokenizer" in models
 
     if isinstance(prompt, str):
         prompt = [prompt]
 
-    input_ids_one = tokenize_prompt(tokenizers[0], prompt)[0]
-    input_ids_two = (
-        tokenize_prompt(tokenizers[1], prompt)[0] if len(tokenizers) > 1 else None
-    )
-
-    return {"input_ids_one": input_ids_one, "input_ids_two": input_ids_two}
+    input_ids = tokenize_prompt(models["tokenizer"], prompt)[0]
+    return {"input_ids": input_ids}
 
 
-def preprocess_sample(
-    batch, resizer, flipper, cropper, tokenizers, target_size, center_crop: bool = False
-):
-    # Ignore negative prompt :)
-    rgb = preprocess_rgb(
-        batch["rgb"], target_size, resizer, flipper, cropper, center_crop
-    )
-    prompt = preprocess_prompt(batch["prompt"]["positive_prompt"], tokenizers)
+def preprocess_sample(batch, preprocessors):
+    rgb = preprocessors["rgb"](batch["rgb"])
+    prompt = preprocessors["prompt"](batch["prompt"])
 
     sample = {
+        "rgb": rgb["rgb"],
         "original_size": rgb["original_size"],
         "crop_top_left": rgb["crop_top_left"],
         "target_size": rgb["target_size"],
-        "rgb": rgb["rgb"],
-        "input_ids_one": prompt["input_ids_one"],
+        "input_ids": prompt["input_ids"],
         "meta": batch["meta"],
         "positive_prompt": batch["prompt"]["positive_prompt"],
     }
-    if prompt.get("input_ids_two"):
-        sample["input_ids_two"] = prompt["input_ids_two"]
 
     return sample
 
@@ -401,13 +390,7 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[list[str], Any]:
     return batch
 
 
-def save_model_hook(
-    loaded_models,
-    weights,
-    accelerator,
-    models,
-    model_config
-):
+def save_model_hook(loaded_models, weights, accelerator, models, lora_train_state):
     if not accelerator.is_main_process:
         return
 
@@ -416,7 +399,7 @@ def save_model_hook(
     layers_to_save = {}
 
     while loaded_model := loaded_models.pop():
-        # Map the list of loaded_models given by accelerator to keys given in model_config.
+        # Map the list of loaded_models given by accelerator to keys given in lora_train_state.
         # NOTE: This mapping is done by type, so two objects of the same type will be treated as the same object.
         # TODO: Find a better way of mapping this.
 
@@ -435,7 +418,7 @@ def save_model_hook(
 
     # TODO: Extend for more models
     StableDiffusionImg2ImgPipeline.save_lora_weights(
-        save_directory=model_config.output_dir,
+        save_directory=lora_train_state.output_dir,
         unet_lora_layers=layers_to_save.get("unet"),
         text_encoder_lora_layers=layers_to_save.get("text_encoder"),
     )
@@ -446,12 +429,12 @@ def load_model_hook(
     input_dir,
     accelerator,
     models,
-    model_config: LoraTrainingState,
+    lora_train_state: LoraTrainingState,
 ):
     loaded_models_dict = {}
 
     while loaded_model := loaded_models.pop():
-        # Map the list of loaded_models given by accelerator to keys given in model_config.
+        # Map the list of loaded_models given by accelerator to keys given in lora_train_state.
         # NOTE: This mapping is done by type, so two objects of the same type will be treated as the same object.
         # TODO: Find a better way of mapping this.
 
@@ -487,12 +470,18 @@ def load_model_hook(
 
     if "text_encoder" in models:
         _set_state_dict_into_text_encoder(
-            lora_state_dict, prefix="text_encoder.", text_encoder=loaded_models_dict["text_encoder"]
+            lora_state_dict,
+            prefix="text_encoder.",
+            text_encoder=loaded_models_dict["text_encoder"],
         )
 
     # Make sure the trainable params are in float32.
-    if model_config.mixed_precision in {"fp16", "bf16"}:
-        models_to_cast = [loaded_model for model_name, loaded_model in loaded_models_dict.items() if model_name in model_config.trainable_models]
+    if lora_train_state.weights_dtype in _lower_dtypes:
+        models_to_cast = [
+            loaded_model
+            for model_name, loaded_model in loaded_models_dict.items()
+            if model_name in lora_train_state.trainable_models
+        ]
         cast_training_params(models_to_cast, dtype=torch.float32)
 
 
@@ -506,78 +495,78 @@ def nearest_multiple(x: float | int, m: int) -> int:
     return int(int(x / m) * m)
 
 
-def prepare_preprocessing(model_config):
-    crop_height = model_config.crop_height or model_config.image_height
-    crop_width = model_config.crop_width or model_config.image_width
-    resize_factor = model_config.resize_factor or 1
+def prepare_preprocessors(models, lora_train_state: LoraTrainingState):
+    crop_height = lora_train_state.crop_height or lora_train_state.image_height
+    crop_width = lora_train_state.crop_width or lora_train_state.image_width
+    resize_factor = lora_train_state.resize_factor or 1
 
     crop_size = (
         nearest_multiple(crop_height * resize_factor, 8),
         nearest_multiple(crop_width * resize_factor, 8),
     )
     downsample_size = (
-        nearest_multiple(model_config.image_height * resize_factor, 8),
-        nearest_multiple(model_config.image_width * resize_factor, 8),
+        nearest_multiple(lora_train_state.image_height * resize_factor, 8),
+        nearest_multiple(lora_train_state.image_width * resize_factor, 8),
     )
 
-    train_resizer = (
-        transforms.Resize(
+    preprocessors = {"train": {}, "val": {}}
+
+    _train_rgb_preprocess_steps = {}
+    _val_rgb_preprocess_steps = {}
+
+    if resize_factor != 1:
+        _train_rgb_preprocess_steps["resizer"] = transforms.Resize(
             downsample_size, interpolation=transforms.InterpolationMode.BILINEAR
         )
-        if resize_factor != 1
-        else None
-    )
-    train_flipper = (
-        transforms.RandomHorizontalFlip(p=model_config.flip_prob)
-        if model_config.flip_prob > 0
-        else None
-    )
-    train_cropper = (
-        (
+        _val_rgb_preprocess_steps["resizer"] = transforms.Resize(
+            downsample_size, interpolation=transforms.InterpolationMode.BILINEAR
+        )
+
+    if lora_train_state.flip_prob > 0:
+        _train_rgb_preprocess_steps["flipper"] = transforms.RandomHorizontalFlip(
+            p=lora_train_state.flip_prob
+        )
+
+    if (crop_height != lora_train_state.image_height) or (
+        crop_width != lora_train_state.image_width
+    ):
+        _train_rgb_preprocess_steps["cropper"] = (
             transforms.CenterCrop(crop_size)
-            if model_config.center_crop
+            if lora_train_state.center_crop
             else transforms.RandomCrop(crop_size)
         )
-        if (
-            (crop_height != model_config.image_height)
-            or (crop_width != model_config.image_width)
-        )
-        else None
+        _val_rgb_preprocess_steps["cropper"] = transforms.CenterCrop(crop_size)
+
+    preprocessors["train"]["rgb"] = functools.partial(
+        preprocess_rgb,
+        preprocessor=_train_rgb_preprocess_steps,
+        target_size=crop_size,
+        center_crop=lora_train_state.center_crop,
     )
 
-    val_resizer = (
-        transforms.Resize(
-            downsample_size, interpolation=transforms.InterpolationMode.BILINEAR
-        )
-        if resize_factor != 1
-        else None
-    )
-    val_flipper = None
-    val_cropper = (
-        transforms.CenterCrop(crop_size)
-        if (crop_height != model_config.image_height)
-        or (crop_width != model_config.image_width)
-        else None
+    preprocessors["val"]["rgb"] = functools.partial(
+        preprocess_rgb,
+        preprocessor=_val_rgb_preprocess_steps,
+        target_size=crop_size,
+        center_crop=lora_train_state.center_crop,
     )
 
-    return (
-        train_resizer,
-        train_flipper,
-        train_cropper,
-        val_resizer,
-        val_flipper,
-        val_cropper,
-        crop_size,
+    preprocessors["train"]["prompt"] = functools.partial(
+        preprocess_prompt, models=models
     )
 
+    preprocessors["val"]["prompt"] = functools.partial(preprocess_prompt, models=models)
 
-def save_lora_weights(accelerator, model_config, using_sdxl, output_dir):
+    return preprocessors
+
+
+def save_lora_weights(accelerator, lora_train_state, using_sdxl, output_dir):
     unet = unwrap_model(accelerator, unet)
     unet_lora_state_dict = convert_state_dict_to_diffusers(
         get_peft_model_state_dict(unet)
     )
 
-    if model_config.train_text_encoder:
+    if lora_train_state.train_text_encoder:
         text_encoder_one = unwrap_model(accelerator, text_encoder_one)
         if text_encoder_two:
             text_encoder_two = unwrap_model(accelerator, text_encoder_two)
@@ -610,13 +599,13 @@ def save_lora_weights(accelerator, model_config, using_sdxl, output_dir):
         )
 
 
-def resume_from_checkpoint(accelerator, model_config, num_update_steps_per_epoch):
+def resume_from_checkpoint(accelerator, lora_train_state, num_update_steps_per_epoch):
     global_step = 0
     first_epoch = 0
 
-    if model_config.resume_from_checkpoint:
-        if model_config.resume_from_checkpoint != "latest":
-            path = os.path.basename(model_config.resume_from_checkpoint)
+    if lora_train_state.resume_from_checkpoint:
+        if lora_train_state.resume_from_checkpoint != "latest":
+            path = os.path.basename(lora_train_state.resume_from_checkpoint)
         else:
             # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
@@ -626,7 +615,7 @@ def resume_from_checkpoint(accelerator, model_config, num_update_steps_per_epoch
 
         if path is None:
             accelerator.print(
-                f"Checkpoint '{model_config.resume_from_checkpoint}' does not exist. Starting a new training run."
+                f"Checkpoint '{lora_train_state.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
             initial_global_step = 0
         else:
@@ -643,62 +632,53 @@ def resume_from_checkpoint(accelerator, model_config, num_update_steps_per_epoch
     return global_step, first_epoch, initial_global_step
 
 
-def prepare_models(model_config: LoraTrainingState, device):
+def prepare_models(lora_train_state: LoraTrainingState, device):
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
-    match model_config.mixed_precision:
-        case "fp16":
-            model_config.weight_dtype = torch.float16
-        case "bf16":
-            model_config.weight_dtype = torch.bfloat16
-        case _:
-            model_config.weight_dtype = torch.float32
 
-    model_config.vae_dtype = (
-        torch.float32
-        if (  # The VAE in SDXL is in float32 to avoid NaN losses.
-            is_sdxl_model(model_config.vae_id) or model_config.keep_vae_full
-        )
-        else model_config.weight_dtype
-    )    
+    if is_sdxl_vae(lora_train_state.vae_id) or lora_train_state.keep_vae_full:
+        # The VAE in SDXL is in float32 to avoid NaN losses.
+        lora_train_state.vae_dtype = "fp32"
+    else:
+        lora_train_state.vae_dtype = lora_train_state.weights_dtype
 
     models = {}
     models["noise_scheduler"] = DDPMScheduler.from_pretrained(
-        model_config.model_id, subfolder="scheduler"
+        lora_train_state.model_id, subfolder="scheduler"
     )
     models["tokenizer"] = AutoTokenizer.from_pretrained(
-        model_config.model_id,
+        lora_train_state.model_id,
         subfolder="tokenizer",
-        revision=model_config.revision,
+        revision=lora_train_state.revision,
         use_fast=False,
     )
     text_encoder_cls = import_text_encoder_class_from_model_name_or_path(
-        model_config.model_id, model_config.revision, subfolder="text_encoder"
+        lora_train_state.model_id, lora_train_state.revision, subfolder="text_encoder"
     )
     models["text_encoder"] = text_encoder_cls.from_pretrained(
-        model_config.model_id,
+        lora_train_state.model_id,
         subfolder="text_encoder",
-        revision=model_config.revision,
-        variant=model_config.variant,
+        revision=lora_train_state.revision,
+        variant=lora_train_state.variant,
     )
     models["vae"] = (
-        AutoencoderKL.from_pretrained(model_config.vae_id, subfolder=None)
+        AutoencoderKL.from_pretrained(lora_train_state.vae_id, subfolder=None)
         if (
-            model_config.vae_id
+            lora_train_state.vae_id
             # Need VAE fix for stable diffusion XL, see https://github.com/huggingface/diffusers/pull/4038
         )
         else AutoencoderKL.from_pretrained(
-            model_config.model_id,
+            lora_train_state.model_id,
             subfolder="vae",
-            revision=model_config.revision,
-            variant=model_config.variant,
+            revision=lora_train_state.revision,
+            variant=lora_train_state.variant,
         )
     )
     models["unet"] = UNet2DConditionModel.from_pretrained(
-        model_config.model_id,
+        lora_train_state.model_id,
         subfolder="unet",
-        revision=model_config.revision,
-        variant=model_config.variant,
+        revision=lora_train_state.revision,
+        variant=lora_train_state.variant,
     )
     models["image_processor"] = VaeImageProcessor()
 
@@ -706,11 +686,15 @@ def prepare_models(model_config: LoraTrainingState, device):
     # === Config Lora ===
     # ===================
 
-    if model_config.compile_model:
-        models["vae"] = torch.compile(models["vae"], backend=model_config.torch_backend)
-        models["unet"] = torch.compile(models["unet"], backend=model_config.torch_backend)
+    if lora_train_state.compile_model:
+        models["vae"] = torch.compile(
+            models["vae"], backend=lora_train_state.torch_backend
+        )
+        models["unet"] = torch.compile(
+            models["unet"], backend=lora_train_state.torch_backend
+        )
         models["text_encoder"] = torch.compile(
-            models["text_encoder"], backend=model_config.torch_backend
+            models["text_encoder"], backend=lora_train_state.torch_backend
         )
 
     # We only train the additional adapter LoRA layers
@@ -718,39 +702,39 @@ def prepare_models(model_config: LoraTrainingState, device):
     models["unet"].requires_grad_(False)
     models["text_encoder"].requires_grad_(False)
 
-    models["vae"].to(device, dtype=model_config.vae_dtype)
-    models["unet"].to(device, dtype=model_config.weight_dtype)
-    models["text_encoder"].to(device, dtype=model_config.weight_dtype)
+    models["vae"].to(device, dtype=lora_train_state.vae_dtype)
+    models["unet"].to(device, dtype=lora_train_state.weights_dtype)
+    models["text_encoder"].to(device, dtype=lora_train_state.weights_dtype)
 
-    if "unet" in model_config.trainable_models:
+    if "unet" in lora_train_state.trainable_models:
         models["unet"].add_adapter(
             LoraConfig(
-                r=model_config.lora_rank,
-                lora_alpha=model_config.lora_rank,
+                r=lora_train_state.lora_rank,
+                lora_alpha=lora_train_state.lora_rank,
                 init_lora_weights="gaussian",
                 target_modules=["to_k", "to_q", "to_v", "to_out.0"],
             )
         )
 
-    if "text_encoder" in model_config.trainable_models:
+    if "text_encoder" in lora_train_state.trainable_models:
         models["text_encoder"].add_adapter(
             LoraConfig(
-                r=model_config.lora_rank,
-                lora_alpha=model_config.lora_rank,
+                r=lora_train_state.lora_rank,
+                lora_alpha=lora_train_state.lora_rank,
                 init_lora_weights="gaussian",
                 target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
             )
         )
 
-    for model_name in model_config.trainable_models:
+    for model_name in lora_train_state.trainable_models:
         if model_name in models:
-            if model_config.gradient_checkpointing:
+            if lora_train_state.gradient_checkpointing:
                 models[model_name].enable_gradient_checkpointing()
 
     # Make sure the trainable params are in float32.
     cast_training_params(
-        [models[model_name] for model_name in model_config.trainable_models], 
-        dtype=torch.float32
+        [models[model_name] for model_name in lora_train_state.trainable_models],
+        dtype=torch.float32,
     )
 
     return models
@@ -758,19 +742,13 @@ def prepare_models(model_config: LoraTrainingState, device):
 
 def validate_model(
     accelerator,
-    model_config: LoraTrainingState,
+    lora_train_state: LoraTrainingState,
     dataloader: torch.utils.data.DataLoader,
-    noise_scheduler: DDPMScheduler,
-    vae,
-    unet,
-    text_encoder_one,
-    text_encoder_two,
-    weight_dtype,
+    models,
     epoch: int,
     global_step: int,
     metrics: dict[str, Any],
     run_prefix: str,
-    using_sdxl: bool = False,
 ) -> None:
     logging.info(f"Running: {run_prefix}")
 
@@ -778,42 +756,41 @@ def validate_model(
     if using_wandb:
         import wandb
 
-    # create pipeline
-    if using_sdxl:
-        pipeline = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-            model_config.model_id,
-            vae=vae.to(dtype=weight_dtype),
-            text_encoder=unwrap_model(accelerator, text_encoder_one).to(
-                dtype=weight_dtype
-            ),
-            text_encoder_2=unwrap_model(accelerator, text_encoder_two).to(
-                dtype=weight_dtype
-            ),
-            unet=unwrap_model(accelerator, unet).to(dtype=weight_dtype),
-            revision=model_config.revision,
-            variant=model_config.variant,
-            torch_dtype=weight_dtype,
-        )
+    weights_dtype = _dtype_conversion[lora_train_state.weights_dtype]
+    vae_dtype = _dtype_conversion[lora_train_state.vae_dtype]
+    noise_scheduler = models["noise_scheduler"]
 
-    else:
-        pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
-            model_config.model_id,
-            vae=vae,
-            text_encoder=unwrap_model(accelerator, text_encoder_one),
-            unet=unwrap_model(accelerator, unet),
-            revision=model_config.revision,
-            variant=model_config.variant,
-            torch_dtype=weight_dtype,
-        )
+    # create pipeline
+    pipeline_args = {}
+
+    if "vae" in models:
+        pipeline_args["vae"] = models["vae"].to(dtype=vae_dtype)
+
+    if "text_encoder" in models:
+        pipeline_args["text_encoder"] = unwrap_model(accelerator, models["text_encoder"])
+
+    if "unet" in models:
+        pipeline_args["unet"] = unwrap_model(accelerator, models["unet"])
+
+
+    # TODO: Support SDXL 
+    pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
+        lora_train_state.model_id,
+        torch_dtype=weights_dtype,
+        revision=lora_train_state.revision,
+        variant=lora_train_state.variant,
+        **pipeline_args
+    )
 
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
-    noise_scheduler.set_timesteps(model_config.val_noise_num_steps)
+    noise_scheduler.set_timesteps(lora_train_state.val_noise_num_steps)
 
     for step, batch in enumerate(dataloader):
-        input_imgs = batch["rgb"].to(dtype=torch.float32, device=accelerator.device)
+        input_imgs = batch["rgb"].to(dtype=weights_dtype, device=accelerator.device)
         batch_size = len(input_imgs)
         random_seeds = np.arange(batch_size * step, batch_size * (step + 1))
+
         generator = [
             torch.Generator(device=accelerator.device).manual_seed(int(seed))
             for seed in random_seeds
@@ -824,11 +801,11 @@ def validate_model(
             prompt=batch["positive_prompt"],
             generator=generator,
             output_type="pt",
-            strength=model_config.val_noise_strength,
-        ).images.to(dtype=torch.float32, device=accelerator.device)
+            strength=lora_train_state.val_noise_strength,
+        ).images.to(dtype=weights_dtype, device=accelerator.device)
 
         val_start_timestep = int(
-            (1 - model_config.val_noise_strength) * len(noise_scheduler.timesteps)
+            (1 - lora_train_state.val_noise_strength) * len(noise_scheduler.timesteps)
         )
         noised_imgs = get_noised_img(
             input_imgs,
@@ -893,15 +870,9 @@ def train_epoch(
     accelerator: Accelerator,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
-    model_config: LoraTrainingState,
+    lora_train_state: LoraTrainingState,
     dataloader: torch.utils.data.DataLoader,
-    vae: AutoencoderKL,
-    unet: UNet2DConditionModel,
-    image_processor: VaeImageProcessor,
-    text_encoder_one,
-    text_encoder_two,
-    noise_scheduler,
-    weight_dtype: torch.dtype,
+    models,
     max_train_steps: int,
     global_step: int,
     params_to_optimize,
@@ -909,14 +880,17 @@ def train_epoch(
     output_dir: Path,
     using_sdxl: bool = False,
 ):
+    weights_dtype = _dtype_conversion[lora_train_state.weights_dtype]
+
+
     unet.train()
-    if model_config.train_text_encoder:
+    if lora_train_state.train_text_encoder:
         text_encoder_one.train()
         if text_encoder_two:
             text_encoder_two.train()
 
     min_noise_step = int(
-        (1 - model_config.train_noise_strength)
+        (1 - lora_train_state.train_noise_strength)
         * noise_scheduler.config.num_train_timesteps
     )
     max_noise_step = noise_scheduler.config.num_train_timesteps
@@ -931,9 +905,9 @@ def train_epoch(
             )
 
             noise = torch.randn_like(model_input)
-            if model_config.noise_offset:
+            if lora_train_state.noise_offset:
                 # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                noise += model_config.noise_offset * torch.randn(
+                noise += lora_train_state.noise_offset * torch.randn(
                     (model_input.shape[0], model_input.shape[1], 1, 1),
                     device=model_input.device,
                 )
@@ -987,10 +961,10 @@ def train_epoch(
             )[0]
 
             # Get the target for loss depending on the prediction type
-            if model_config.prediction_type is not None:
+            if lora_train_state.prediction_type is not None:
                 # set prediction_type of scheduler if defined
                 noise_scheduler.register_to_config(
-                    prediction_type=model_config.prediction_type
+                    prediction_type=lora_train_state.prediction_type
                 )
 
             if noise_scheduler.config.prediction_type == "epsilon":
@@ -1002,7 +976,7 @@ def train_epoch(
                     f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                 )
 
-            if model_config.snr_gamma is None:
+            if lora_train_state.snr_gamma is None:
                 loss = nn.functional.mse_loss(
                     model_pred.float(), target.float(), reduction="mean"
                 )
@@ -1012,7 +986,7 @@ def train_epoch(
                 # This is discussed in Section 4.2 of the same paper.
                 snr = compute_snr(noise_scheduler, timesteps)
                 mse_loss_weights = torch.stack(
-                    [snr, model_config.snr_gamma * torch.ones_like(timesteps)],
+                    [snr, lora_train_state.snr_gamma * torch.ones_like(timesteps)],
                     dim=1,
                 ).min(dim=1)[0]
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -1032,15 +1006,15 @@ def train_epoch(
 
             # Gather the losses across all processes for logging (if we use distributed training).
             avg_loss = accelerator.gather(
-                loss.repeat(model_config.train_batch_size)
+                loss.repeat(lora_train_state.train_batch_size)
             ).mean()
-            train_loss += avg_loss.item() / model_config.gradient_accumulation_steps
+            train_loss += avg_loss.item() / lora_train_state.gradient_accumulation_steps
 
             # Backpropagate
             accelerator.backward(loss)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(
-                    params_to_optimize, model_config.max_grad_norm
+                    params_to_optimize, lora_train_state.max_grad_norm
                 )
 
             optimizer.step()
@@ -1055,9 +1029,9 @@ def train_epoch(
             train_loss = 0.0
 
             if accelerator.is_main_process:
-                if global_step % model_config.checkpointing_steps == 0:
+                if global_step % lora_train_state.checkpointing_steps == 0:
                     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                    if model_config.checkpoints_total_limit is not None:
+                    if lora_train_state.checkpoints_total_limit is not None:
                         checkpoints = os.listdir(output_dir)
                         checkpoints = [
                             d for d in checkpoints if d.startswith("checkpoint")
@@ -1067,10 +1041,10 @@ def train_epoch(
                         )
 
                         # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                        if len(checkpoints) >= model_config.checkpoints_total_limit:
+                        if len(checkpoints) >= lora_train_state.checkpoints_total_limit:
                             num_to_remove = (
                                 len(checkpoints)
-                                - model_config.checkpoints_total_limit
+                                - lora_train_state.checkpoints_total_limit
                                 + 1
                             )
                             removing_checkpoints = checkpoints[0:num_to_remove]
@@ -1104,10 +1078,8 @@ def main(args):
     # ========================
 
     config = setup_project(args.config_path)
-    
-    lora_train_state = LoraTrainingState(
-        **config["model"]
-    )
+
+    lora_train_state = LoraTrainingState(**config["model"])
 
     using_sdxl = is_sdxl_model(lora_train_state.model_id)
     if (lora_train_state.vae_id is not None) and (
@@ -1118,19 +1090,17 @@ def main(args):
             f"Mismatch between model_id and vae_id. Both models need to either be SDXL or SD, but received {lora_train_state.model_id} and {lora_train_state.vae_id}"
         )
 
-
-
     accelerator = Accelerator(
         gradient_accumulation_steps=lora_train_state.gradient_accumulation_steps,
-        mixed_precision=lora_train_state.mixed_precision,
+        mixed_precision=lora_train_state.weights_dtype,
         log_with=lora_train_state.loggers,
         project_config=ProjectConfiguration(
-            project_dir=lora_train_state.output_dir, logging_dir=lora_train_state.logging_dir
+            project_dir=lora_train_state.output_dir,
+            logging_dir=lora_train_state.logging_dir,
         ),
-        kwargs_handlers=[
-            DistributedDataParallelKwargs(find_unused_parameters=True)
-        ],
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
+
     logging.info(
         f"Number of cuda detected devices: {torch.cuda.device_count()}, Using device: {accelerator.device}, distributed: {accelerator.distributed_type}"
     )
@@ -1157,7 +1127,7 @@ def main(args):
     if lora_train_state.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    if torch.backends.mps.is_available() and lora_train_state.mixed_precision == "bf16":
+    if torch.backends.mps.is_available() and lora_train_state.weights_dtype == "bf16":
         # due to pytorch#99272, MPS does not yet support bfloat16.
         raise ValueError(
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
@@ -1198,7 +1168,7 @@ def main(args):
     # ===   Load models   ===
     # =======================
 
-    val_metrics = {
+    metrics = {
         "ssim": StructuralSimilarityIndexMeasure(
             data_range=(0.0, 1.0), reduction="none"
         ).to(accelerator.device)
@@ -1215,7 +1185,7 @@ def main(args):
             save_model_hook,
             accelerator=accelerator,
             models=models,
-            model_config=lora_train_state,
+            lora_train_state=lora_train_state,
         )
     )
     accelerator.register_load_state_pre_hook(
@@ -1223,42 +1193,27 @@ def main(args):
             load_model_hook,
             accelerator=accelerator,
             models=models,
-            model_config=lora_train_state,
+            lora_train_state=lora_train_state,
         )
     )
-
 
     # ======================
     # ===   Setup data   ===
     # ======================
 
-    train_dataset = DynamicDataset.from_config(lora_train_state.datasets["train_data"])
-    val_dataset = DynamicDataset.from_config(lora_train_state.datasets["val_data"])
-
-    # Preprocessing
-    (
-        train_resizer,
-        train_flipper,
-        train_cropper,
-        val_resizer,
-        val_flipper,
-        val_cropper,
-        target_size,
-    ) = prepare_preprocessing(lora_train_state)
-
-    with accelerator.main_process_first():
-        train_dataset.preprocess_func = lambda batch: preprocess_sample(
-            batch,
-            train_resizer,
-            train_flipper,
-            train_cropper,
-            models,
-            target_size,
-            lora_train_state.center_crop,
-        )
-        val_dataset.preprocess_func = lambda batch: preprocess_sample(
-            batch, val_resizer, val_flipper, val_cropper, models, target_size, True
-        )
+    preprocessors = prepare_preprocessors(models, lora_train_state)
+    train_dataset = DynamicDataset.from_config(
+        lora_train_state.datasets["train_data"],
+        preprocess_func=functools.partial(
+            preprocess_sample, preprocessors=preprocessors["train"]
+        ),
+    )
+    val_dataset = DynamicDataset.from_config(
+        lora_train_state.datasets["val_data"],
+        preprocess_func=functools.partial(
+            preprocess_sample, preprocessors=preprocessors["val"]
+        ),
+    )
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -1282,11 +1237,15 @@ def main(args):
     # ===   Setup training   ===
     # ==========================
 
-    trainable_models = [models[model_name] for model_name in lora_train_state.trainable_models]
-    params_to_optimize = list(filter(
-        lambda p: p.requires_grad,
-        it.chain(*(model.parameters() for model in trainable_models))
-    ))
+    trainable_models = [
+        models[model_name] for model_name in lora_train_state.trainable_models
+    ]
+    params_to_optimize = list(
+        filter(
+            lambda p: p.requires_grad,
+            it.chain(*(model.parameters() for model in trainable_models)),
+        )
+    )
 
     if lora_train_state.scale_lr:
         lora_train_state.learning_rate = (
@@ -1309,52 +1268,25 @@ def main(args):
     lora_train_state.num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / lora_train_state.gradient_accumulation_steps
     )
-    lora_train_state.max_train_steps = lora_train_state.n_epochs * num_update_steps_per_epoch
+    lora_train_state.max_train_steps = (
+        lora_train_state.n_epochs * num_update_steps_per_epoch
+    )
 
     lr_scheduler = get_scheduler(
         lora_train_state.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=lora_train_state.lr_warmup_steps
         * lora_train_state.gradient_accumulation_steps,
-        num_training_steps=max_train_steps * lora_train_state.gradient_accumulation_steps,
+        num_training_steps=max_train_steps
+        * lora_train_state.gradient_accumulation_steps,
         **lora_train_state.lr_scheduler_kwargs,
     )
 
-
-    optimizer, train_dataloader, lr_scheduler, *trainable_models = accelerator.prepare(optimizer, train_dataloader, lr_scheduler, *trainable_models)
+    optimizer, train_dataloader, lr_scheduler, *trainable_models = accelerator.prepare(
+        optimizer, train_dataloader, lr_scheduler, *trainable_models
+    )
     for model, model_name in zip(trainable_models, lora_train_state.trainable_models):
         models[model_name] = model
-
-    # Prepare everything with our `accelerator`.
-    if lora_train_state.train_text_encoder:
-        if text_encoder_two:
-            (
-                unet,
-                text_encoder_one,
-                text_encoder_two,
-                optimizer,
-                train_dataloader,
-                lr_scheduler,
-            ) = accelerator.prepare(
-                unet,
-                text_encoder_one,
-                text_encoder_two,
-                optimizer,
-                train_dataloader,
-                lr_scheduler,
-            )
-
-        else:
-            unet, text_encoder_one, optimizer, train_dataloader, lr_scheduler = (
-                accelerator.prepare(
-                    unet, text_encoder_one, optimizer, train_dataloader, lr_scheduler
-                )
-            )
-
-    else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
-        )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
@@ -1368,14 +1300,9 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers(group, config=asdict(lora_train_state))
-
-    # Some configurations require autocast to be disabled.
-    enable_autocast = True
-    if torch.backends.mps.is_available() or (
-        accelerator.mixed_precision == "fp16" or accelerator.mixed_precision == "bf16"
-    ):
-        enable_autocast = False
+        accelerator.init_trackers(
+            lora_train_state.wandb_group, config=asdict(lora_train_state)
+        )
 
     # ===================
     # === Train model ===
@@ -1472,7 +1399,7 @@ def main(args):
                 weight_dtype,
                 epoch,
                 global_step,
-                val_metrics,
+                metrics,
                 "val",
                 using_sdxl,
             )
@@ -1496,7 +1423,7 @@ def main(args):
             weight_dtype,
             epoch,
             global_step,
-            val_metrics,
+            metrics,
             "test",
             using_sdxl,
         )

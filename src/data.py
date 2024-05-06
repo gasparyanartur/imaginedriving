@@ -585,7 +585,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         return len(self.sample_infos)
 
     @classmethod
-    def from_config(cls, dataset_config: Path | dict[str, Any]):
+    def from_config(cls, dataset_config: Path | dict[str, Any], **kwargs):
         if isinstance(dataset_config, Path):
             dataset_config = read_yaml(dataset_config)
 
@@ -607,7 +607,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
 
             data_getters[data_type] = data_getter
 
-        return DynamicDataset(dataset_path, data_tree, info_getter, data_getters)
+        return DynamicDataset(dataset_path, data_tree, info_getter, data_getters, **kwargs)
 
     @property
     def name(self) -> str:
