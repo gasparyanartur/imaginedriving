@@ -1,4 +1,5 @@
 from typing import Any
+from functools import lru_cache
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -461,6 +462,7 @@ def diffusion_from_config_to_dir(
     logging.info(f"Finished diffusion.")
 
 
+@lru_cache(maxsize=4)
 def tokenize_prompt(tokenizer, prompt):
     text_inputs = tokenizer(
         prompt,
@@ -469,11 +471,11 @@ def tokenize_prompt(tokenizer, prompt):
         truncation=True,
         return_tensors="pt",
     )
-    text_input_ids = text_inputs.input_ids
-    return text_input_ids
+    tokens = text_inputs.input_ids
+    return tokens
 
 
-def encode_prompt(text_encoder, tokens, using_sdxl):
+def encode_tokens(text_encoder, tokens, using_sdxl):
     if using_sdxl:
         raise NotImplementedError
 

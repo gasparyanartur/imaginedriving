@@ -61,7 +61,7 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 from src.data import setup_project, DynamicDataset
 from src.diffusion import is_sdxl_model, is_sdxl_vae, get_noised_img
 from src.diffusion import tokenize_prompt
-from src.diffusion import encode_prompt
+from src.diffusion import encode_tokens
 from src.utils import get_env
 
 
@@ -893,8 +893,8 @@ def train_epoch(
 
             unet_added_conditions = {}
             if using_sdxl:
-                prompt_embeds, pooled_prompt_embeds = encode_prompt(
-                    text_encoders=text_encoders, text_input_ids_list=text_input_ids_list
+                prompt_embeds, pooled_prompt_embeds = encode_tokens(
+                    text_encoders=models["text_encoder"], text_input_ids_list=batch["input_ids"]
                 )
                 add_time_ids = torch.cat(
                     [
