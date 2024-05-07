@@ -1,5 +1,5 @@
 [submodule "control-lora-v2"]
-	path = control-lora-v2
+	path = controllorav2
 	url = git@github.com:gasparyanartur/control-lora-v2.git
 [submodule "implicit-tracking"]
 	path = implicit-tracking

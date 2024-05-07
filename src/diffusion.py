@@ -348,7 +348,7 @@ model_name_to_constructor = {
 
 
 def encode_img(
-    img_processor: VaeImageProcessor, vae: AutoencoderKL, img: Tensor, seed: int = 0
+    img_processor: VaeImageProcessor, vae: AutoencoderKL, img: Tensor, device, seed: int = None, sample_latent: bool = False
 ) -> Tensor:
     img = img_processor.preprocess(img)
 
@@ -358,12 +358,19 @@ def encode_img(
         upcast_vae(vae)  # Ensure float32 to avoid overflow
         img = img.float()
 
-    latents = vae.encode(img.to("cuda"))
+    latents = vae.encode(img.to(device))
+    if sample_latent:
+        latents = latents.latent_dist.sample()
 
-    if needs_upcasting:
-        vae.to(original_vae_dtype)
+    else:
+        if needs_upcasting:
+            vae.to(original_vae_dtype)
 
-    latents = retrieve_latents(latents, generator=torch.manual_seed(seed))
+        latents = retrieve_latents(
+            latents,
+            generator=(torch.manual_seed(seed) if seed is not None else None)
+        )
+
     latents = latents * vae.config.scaling_factor
 
     return latents
@@ -396,6 +403,21 @@ def upcast_vae(vae):
 
     return vae
 
+def get_noised_img(img, timestep, pipe, noise_scheduler, device, seed=None):
+    vae = pipe.vae
+    img_processor = pipe.image_processor
+        
+    with torch.no_grad():
+        model_input = encode_img(img_processor, vae, img, sample_latent=True, device=device, seed=seed)  
+        noise = torch.randn_like(model_input).to(device)
+        timestep = noise_scheduler.timesteps[timestep]
+        timesteps = torch.tensor([timestep]).to(device)
+        noisy_model_input = noise_scheduler.add_noise(
+            model_input, noise, timesteps
+        )
+        img_pred = decode_img(img_processor, vae, noisy_model_input)
+
+    return img_pred
 
 def load_img2img_model(model_config_params: dict[str, Any], device=get_device()) -> DiffusionModel:
     logging.info(f"Loading diffusion model...")
