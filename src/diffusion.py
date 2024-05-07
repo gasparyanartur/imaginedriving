@@ -146,6 +146,7 @@ class SDPipe(DiffusionModel):
                 )
             )
             self.refiner_pipe = prep_model(self.refiner_pipe, low_mem_mode=low_mem_mode, device=device, compile=compile_model)
+        self.tokenizer = self.base_pipe.tokenizer
 
     def diffuse_sample(
         self,
@@ -175,6 +176,10 @@ class SDPipe(DiffusionModel):
         validate_same_len(image, base_gen, refiner_gen)
 
         base_kwargs = base_kwargs or {}
+        if prompt is not None:
+            prompt_embeds = 
+
+
         image = self.base_pipe(
             image=image,
             generator=base_gen,
