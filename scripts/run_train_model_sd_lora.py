@@ -1,3 +1,5 @@
+# Adapted from https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image_lora.py
+
 from typing import Any, Iterable
 from pathlib import Path
 from argparse import ArgumentParser
@@ -881,13 +883,12 @@ def train_epoch(
     using_sdxl: bool = False,
 ):
     weights_dtype = _dtype_conversion[lora_train_state.weights_dtype]
+    noise_scheduler = models["noise_scheduler"]
 
 
-    unet.train()
-    if lora_train_state.train_text_encoder:
-        text_encoder_one.train()
-        if text_encoder_two:
-            text_encoder_two.train()
+    models["unet"].train()
+    if "text_encoder" in lora_train_state.trainable_models:
+        models["text_encoder"].train()
 
     min_noise_step = int(
         (1 - lora_train_state.train_noise_strength)
@@ -897,11 +898,11 @@ def train_epoch(
 
     train_loss = 0.0
     for step, batch in enumerate(dataloader):
-        with accelerator.accumulate(unet):
-            rgb = batch["rgb"].to(weight_dtype)
-            rgb = image_processor.preprocess(rgb)
+        with accelerator.accumulate(models["unet"]):
+            rgb = batch["rgb"].to(weights_dtype)
+            rgb = models["image_processor"].preprocess(rgb)
             model_input = (
-                vae.encode(rgb).latent_dist.sample() * vae.config.scaling_factor
+                models["vae"].encode(rgb).latent_dist.sample() * models["vae"].config.scaling_factor
             )
 
             noise = torch.randn_like(model_input)
