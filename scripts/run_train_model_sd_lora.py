@@ -70,7 +70,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 @dataclass(init=True)
-class LoraTrainingState:
+class LoraTrainState:
     project_name: str = "ImagineDriving"
     project_dir: str = None
     cache_dir: str = None
@@ -104,7 +104,6 @@ class LoraTrainingState:
     val_noise_strength: float = 0.25
 
     keep_vae_full: bool = True
-    add_rgb_loss: bool = False
 
     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
     noise_offset: float = 0
@@ -129,6 +128,9 @@ class LoraTrainingState:
 
     max_train_steps: int = None  # Gets set later
     num_update_steps_per_epoch: int = None  # Gets set later
+
+    global_step: int = 0
+    epoch = 0
 
     compile_model: bool = False
 
@@ -164,7 +166,18 @@ class LoraTrainingState:
 
 
 _lower_dtypes = {"fp16", "bf16"}
-_dtype_conversion = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+_dtype_conversion = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
+
+
+def find_checkpoint_paths(cp_dir: str, cp_prefix: str = "checkpoint", cp_delim="-"):
+    cp_paths = os.listdir(cp_dir)
+    cp_paths = [d for d in cp_paths if d.startswith(cp_prefix)]
+    cp_paths = sorted(cp_paths, key=lambda x: int(x.split(cp_delim)[1]))
+    return cp_paths
 
 
 def import_text_encoder_class_from_model_name_or_path(
@@ -394,9 +407,9 @@ def save_model_hook(loaded_models, weights, accelerator, models, lora_train_stat
 def load_model_hook(
     loaded_models,
     input_dir,
-    accelerator,
+    accelerator: Accelerator,
     models,
-    lora_train_state: LoraTrainingState,
+    lora_train_state: LoraTrainState,
 ):
     loaded_models_dict = {}
 
@@ -452,7 +465,7 @@ def load_model_hook(
         cast_training_params(models_to_cast, dtype=torch.float32)
 
 
-def unwrap_model(accelerator, model):
+def unwrap_model(accelerator: Accelerator, model):
     model = accelerator.unwrap_model(model)
     model = model._orig_mod if is_compiled_module(model) else model
     return model
@@ -462,7 +475,7 @@ def nearest_multiple(x: float | int, m: int) -> int:
     return int(int(x / m) * m)
 
 
-def prepare_preprocessors(models, lora_train_state: LoraTrainingState):
+def prepare_preprocessors(models, lora_train_state: LoraTrainState):
     crop_height = lora_train_state.crop_height or lora_train_state.image_height
     crop_width = lora_train_state.crop_width or lora_train_state.image_width
     resize_factor = lora_train_state.resize_factor or 1
@@ -527,79 +540,173 @@ def prepare_preprocessors(models, lora_train_state: LoraTrainingState):
     return preprocessors
 
 
-def save_lora_weights(accelerator, lora_train_state, using_sdxl, output_dir):
-    unet = unwrap_model(accelerator, unet)
-    unet_lora_state_dict = convert_state_dict_to_diffusers(
-        get_peft_model_state_dict(unet)
+def get_diffusion_cls(
+    model_id: str,
+) -> StableDiffusionImg2ImgPipeline | StableDiffusionXLImg2ImgPipeline:
+    if is_sdxl_model(model_id):
+        return StableDiffusionXLImg2ImgPipeline
+    else:
+        return StableDiffusionImg2ImgPipeline
+
+
+def save_lora_weights(
+    accelerator: Accelerator, models, train_state: LoraTrainState
+) -> None:
+    lora_state_dicts = {}
+
+    if "unet" in train_state.trainable_models:
+        lora_state_dicts["unet_lora_layers"] = convert_state_dict_to_diffusers(
+            get_peft_model_state_dict(unwrap_model(accelerator, models["unet"]))
+        )
+
+    if "text_encoder" in train_state.trainable_models:
+        lora_state_dicts["text_encoder_lora_layers"] = convert_state_dict_to_diffusers(
+            get_peft_model_state_dict(unwrap_model(accelerator, models["text_encoder"]))
+        )
+
+    get_diffusion_cls(train_state.model_id).save_lora_weights(
+        save_directory=train_state, **lora_state_dicts
     )
 
-    if lora_train_state.train_text_encoder:
-        text_encoder_one = unwrap_model(accelerator, text_encoder_one)
-        if text_encoder_two:
-            text_encoder_two = unwrap_model(accelerator, text_encoder_two)
 
-        text_encoder_lora_layers = convert_state_dict_to_diffusers(
-            get_peft_model_state_dict(text_encoder_one)
+def get_diffusion_noise(
+    size: Iterable[int], device: torch.device, train_state: LoraTrainState
+) -> Tensor:
+    noise = torch.randn(size)
+    if train_state.noise_offset:
+        # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+        noise += train_state.noise_offset * torch.randn(
+            (size[0], size[1], 1, 1),
+            device=device,
         )
-        if text_encoder_two:
-            text_encoder_2_lora_layers = convert_state_dict_to_diffusers(
-                get_peft_model_state_dict(text_encoder_two)
+    return noise
+
+
+def get_diffusion_loss(
+    models, train_state: LoraTrainState, model_input, model_pred, noise, timesteps
+):
+    noise_scheduler = models["noise_scheduler"]
+
+    match noise_scheduler.config.prediction_type:
+        case "epsilon":
+            target = noise
+        case "v_prediction":
+            target = noise_scheduler.get_velocity(model_input, noise, timesteps)
+        case _:
+            raise ValueError(
+                f"Unknown prediction type {noise_scheduler.config.prediction_type}"
             )
 
-    else:
-        text_encoder_lora_layers = None
-        text_encoder_2_lora_layers = None
+    # Get the target for loss depending on the prediction type
+    if train_state.prediction_type is not None:
+        # set prediction_type of scheduler if defined
+        noise_scheduler.register_to_config(prediction_type=train_state.prediction_type)
 
-    if using_sdxl:
-        StableDiffusionXLImg2ImgPipeline.save_lora_weights(
-            save_directory=output_dir,
-            unet_lora_layers=unet_lora_state_dict,
-            text_encoder_lora_layers=text_encoder_lora_layers,
-            text_encoder_2_lora_layers=text_encoder_2_lora_layers,
+    if noise_scheduler.config.prediction_type == "epsilon":
+        target = noise
+    elif noise_scheduler.config.prediction_type == "v_prediction":
+        target = noise_scheduler.get_velocity(model_input, noise, timesteps)
+    else:
+        raise ValueError(
+            f"Unknown prediction type {noise_scheduler.config.prediction_type}"
         )
 
-    else:
-        StableDiffusionImg2ImgPipeline.save_lora_weights(
-            save_directory=output_dir,
-            unet_lora_layers=unet_lora_state_dict,
-            text_encoder_lora_layers=text_encoder_lora_layers,
+    if train_state.snr_gamma is None:
+        loss = nn.functional.mse_loss(
+            model_pred.float(), target.float(), reduction="mean"
         )
+    else:
+        # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+        # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+        # This is discussed in Section 4.2 of the same paper.
+        snr = compute_snr(noise_scheduler, timesteps)
+        mse_loss_weights = torch.stack(
+            [snr, train_state.snr_gamma * torch.ones_like(timesteps)],
+            dim=1,
+        ).min(dim=1)[0]
+        if noise_scheduler.config.prediction_type == "epsilon":
+            mse_loss_weights = mse_loss_weights / snr
+        elif noise_scheduler.config.prediction_type == "v_prediction":
+            mse_loss_weights = mse_loss_weights / (snr + 1)
+
+        loss = nn.functional.mse_loss(
+            model_pred.float(), target.float(), reduction="none"
+        )
+        loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+        loss = loss.mean()
+
+    return loss
 
 
-def resume_from_checkpoint(accelerator, lora_train_state, num_update_steps_per_epoch):
-    global_step = 0
-    first_epoch = 0
+def get_timesteps(noise_strength, total_num_timesteps, device, batch_size):
+    # Sample a random timestep for each image
+    timesteps = torch.randint(
+        int((1 - noise_strength) * total_num_timesteps),
+        total_num_timesteps,
+        (batch_size,),
+        device=device,
+        dtype=torch.long,
+    )
+    return timesteps
 
-    if lora_train_state.resume_from_checkpoint:
-        if lora_train_state.resume_from_checkpoint != "latest":
-            path = os.path.basename(lora_train_state.resume_from_checkpoint)
-        else:
+
+def save_checkpoint(accelerator: Accelerator, lora_train_state: LoraTrainState) -> None:
+    # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+    if lora_train_state.checkpoints_total_limit is not None:
+        cp_paths = find_checkpoint_paths(lora_train_state.output_dir)
+
+        # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+        if len(cp_paths) >= lora_train_state.checkpoints_total_limit:
+            num_to_remove = len(cp_paths) - lora_train_state.checkpoints_total_limit + 1
+            cps_to_remove = cp_paths[0:num_to_remove]
+
+            logger.info(
+                f"{len(cp_paths)} checkpoints already exist, removing {len(cps_to_remove)} checkpoints"
+            )
+            logger.info(f"removing checkpoints: {', '.join(cps_to_remove)}")
+
+            for cp_path in cps_to_remove:
+                cp_path = os.path.join(lora_train_state.output_dir, cp_path)
+                shutil.rmtree(cp_path)
+
+    cp_path = os.path.join(
+        lora_train_state.output_dir, f"checkpoint-{lora_train_state.global_step}"
+    )
+    accelerator.save_state(cp_path)
+    logger.info(f"Saved state to {cp_path}")
+
+
+def resume_from_checkpoint(accelerator, train_state: LoraTrainState):
+    if train_state.resume_from_checkpoint:
+
+        if train_state.resume_from_checkpoint == "latest":
             # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
+            cp_paths = find_checkpoint_paths(train_state.output_dir)
 
-        if path is None:
-            accelerator.print(
-                f"Checkpoint '{lora_train_state.resume_from_checkpoint}' does not exist. Starting a new training run."
-            )
-            initial_global_step = 0
+            if len(cp_paths) == 0:
+                accelerator.print(
+                    f"Checkpoint '{train_state.resume_from_checkpoint}' does not exist. Starting a new training run."
+                )
+                return
+
+            path = cp_paths[-1]
+
         else:
-            accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(Path(args.output_dir, path))
-            global_step = int(path.split("-")[1])
+            path = os.path.basename(train_state.resume_from_checkpoint)
 
-            initial_global_step = global_step
-            first_epoch = global_step // num_update_steps_per_epoch
+        accelerator.print(f"Resuming from checkpoint {path}")
+        accelerator.load_state(Path(args.output_dir, path))
+
+        train_state.global_step = int(path.split("-")[1])
+        train_state.epoch = (
+            train_state.global_step // train_state.num_update_steps_per_epoch
+        )
 
     else:
-        initial_global_step = 0
-
-    return global_step, first_epoch, initial_global_step
+        train_state.initial_global_step = 0
 
 
-def prepare_models(lora_train_state: LoraTrainingState, device):
+def prepare_models(lora_train_state: LoraTrainState, device):
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
 
@@ -709,11 +816,9 @@ def prepare_models(lora_train_state: LoraTrainingState, device):
 
 def validate_model(
     accelerator,
-    lora_train_state: LoraTrainingState,
+    train_state: LoraTrainState,
     dataloader: torch.utils.data.DataLoader,
     models,
-    epoch: int,
-    global_step: int,
     metrics: dict[str, Any],
     run_prefix: str,
 ) -> None:
@@ -723,8 +828,8 @@ def validate_model(
     if using_wandb:
         import wandb
 
-    weights_dtype = _dtype_conversion[lora_train_state.weights_dtype]
-    vae_dtype = _dtype_conversion[lora_train_state.vae_dtype]
+    weights_dtype = _dtype_conversion[train_state.weights_dtype]
+    vae_dtype = _dtype_conversion[train_state.vae_dtype]
     noise_scheduler = models["noise_scheduler"]
 
     # create pipeline
@@ -734,24 +839,25 @@ def validate_model(
         pipeline_args["vae"] = models["vae"].to(dtype=vae_dtype)
 
     if "text_encoder" in models:
-        pipeline_args["text_encoder"] = unwrap_model(accelerator, models["text_encoder"])
+        pipeline_args["text_encoder"] = unwrap_model(
+            accelerator, models["text_encoder"]
+        )
 
     if "unet" in models:
         pipeline_args["unet"] = unwrap_model(accelerator, models["unet"])
 
-
-    # TODO: Support SDXL 
+    # TODO: Support SDXL
     pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
-        lora_train_state.model_id,
+        train_state.model_id,
         torch_dtype=weights_dtype,
-        revision=lora_train_state.revision,
-        variant=lora_train_state.variant,
-        **pipeline_args
+        revision=train_state.revision,
+        variant=train_state.variant,
+        **pipeline_args,
     )
 
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
-    noise_scheduler.set_timesteps(lora_train_state.val_noise_num_steps)
+    noise_scheduler.set_timesteps(train_state.val_noise_num_steps)
 
     for step, batch in enumerate(dataloader):
         input_imgs = batch["rgb"].to(dtype=weights_dtype, device=accelerator.device)
@@ -768,11 +874,11 @@ def validate_model(
             prompt=batch["positive_prompt"],
             generator=generator,
             output_type="pt",
-            strength=lora_train_state.val_noise_strength,
+            strength=train_state.val_noise_strength,
         ).images.to(dtype=weights_dtype, device=accelerator.device)
 
         val_start_timestep = int(
-            (1 - lora_train_state.val_noise_strength) * len(noise_scheduler.timesteps)
+            (1 - train_state.val_noise_strength) * len(noise_scheduler.timesteps)
         )
         noised_imgs = get_noised_img(
             input_imgs,
@@ -790,14 +896,17 @@ def validate_model(
 
             value_dict = {str(i): float(v) for i, v in enumerate(values)}
             accelerator.log(
-                {f"{run_prefix}_{metric_name}": value_dict}, step=global_step
+                {f"{run_prefix}_{metric_name}": value_dict},
+                step=train_state.global_step,
             )
 
         for tracker in accelerator.trackers:
             if tracker.name == "tensorboard":
-                np_images = np.stack([np.asarray(img) for img in output_imgs])
                 tracker.writer.add_images(
-                    f"{run_prefix}_images", np_images, epoch, dataformats="NHWC"
+                    f"{run_prefix}_images",
+                    np.stack([np.asarray(img) for img in output_imgs]),
+                    train_state.epoch,
+                    dataformats="NHWC",
                 )
 
             if tracker.name == "wandb" and using_wandb:
@@ -825,11 +934,8 @@ def validate_model(
                             for (img, meta) in (zip(noised_imgs, batch["meta"]))
                         ],
                     },
-                    step=global_step,
+                    step=train_state.global_step,
                 )
-
-    del pipeline
-    torch.cuda.empty_cache()
 
 
 def train_epoch(
@@ -837,54 +943,41 @@ def train_epoch(
     accelerator: Accelerator,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
-    lora_train_state: LoraTrainingState,
+    train_state: LoraTrainState,
     dataloader: torch.utils.data.DataLoader,
     models,
-    max_train_steps: int,
-    global_step: int,
     params_to_optimize,
     progress_bar: tqdm.tqdm,
-    output_dir: Path,
-    using_sdxl: bool = False,
 ):
-    weights_dtype = _dtype_conversion[lora_train_state.weights_dtype]
-    vae_dtype = _dtype_conversion[lora_train_state.vae_dtype]
+    weights_dtype = _dtype_conversion[train_state.weights_dtype]
+    vae_dtype = _dtype_conversion[train_state.vae_dtype]
+    using_sdxl = is_sdxl_model(train_state.model_id)
     noise_scheduler = models["noise_scheduler"]
 
     models["unet"].train()
-    if "text_encoder" in lora_train_state.trainable_models:
+    if "text_encoder" in train_state.trainable_models:
         models["text_encoder"].train()
 
-    min_noise_step = int(
-        (1 - lora_train_state.train_noise_strength)
-        * noise_scheduler.config.num_train_timesteps
-    )
-    max_noise_step = noise_scheduler.config.num_train_timesteps
-
     train_loss = 0.0
-    for step, batch in enumerate(dataloader):
+    for batch in dataloader:
         with accelerator.accumulate(models["unet"]):
-            rgb = batch["rgb"].to(vae_dtype)
-            rgb = models["image_processor"].preprocess(rgb)
             model_input = (
-                models["vae"].encode(rgb).latent_dist.sample() * models["vae"].config.scaling_factor
+                models["vae"]
+                .encode(
+                    models["image_processor"].preprocess(batch["rgb"]).to(vae_dtype)
+                )
+                .latent_dist.sample()
+                * models["vae"].config.scaling_factor
             ).to(weights_dtype)
 
-            noise = torch.randn_like(model_input)
-            if lora_train_state.noise_offset:
-                # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                noise += lora_train_state.noise_offset * torch.randn(
-                    (model_input.shape[0], model_input.shape[1], 1, 1),
-                    device=model_input.device,
-                )
-
-            # Sample a random timestep for each image
-            timesteps = torch.randint(
-                min_noise_step,
-                max_noise_step,
-                (model_input.shape[0],),
-                device=model_input.device,
-                dtype=torch.long,
+            noise = get_diffusion_noise(
+                model_input.size, model_input.device, train_state
+            )
+            timesteps = get_timesteps(
+                train_state.train_noise_strength,
+                noise_scheduler.config.num_train_timesteps,
+                model_input.device,
+                model_input.size(0),
             )
 
             # Add noise to the model input according to the noise magnitude at each timestep
@@ -892,13 +985,14 @@ def train_epoch(
             noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
 
             unet_added_conditions = {}
+            token_embed_outputs = encode_tokens(
+                models["text_encoder"], batch["input_ids"], using_sdxl
+            )
+
             if using_sdxl:
-                prompt_embeds, pooled_prompt_embeds = encode_tokens(
-                    text_encoders=models["text_encoder"], text_input_ids_list=batch["input_ids"]
-                )
                 add_time_ids = torch.cat(
                     [
-                        compute_time_ids(s, c, ts, accelerator.device, weight_dtype)
+                        compute_time_ids(s, c, ts, accelerator.device, weights_dtype)
                         for s, c, ts in zip(
                             batch["original_size"],
                             batch["crop_top_left"],
@@ -907,74 +1001,39 @@ def train_epoch(
                     ]
                 )
                 unet_added_conditions["time_ids"] = add_time_ids
-                unet_added_conditions["text_embeds"] = pooled_prompt_embeds
+                unet_added_conditions["pooled_embeds"] = token_embed_outputs[
+                    "pooled_embeds"
+                ]
 
-            else:
-                prompt_embeds = text_encoders[0](text_input_ids_list[0])[0]
-
-            model_pred = unet(
+            model_pred = models["unet"](
                 noisy_model_input,
                 timesteps,
-                prompt_embeds,
+                token_embed_outputs["embeds"],
                 added_cond_kwargs=unet_added_conditions,
                 return_dict=False,
             )[0]
 
-            # Get the target for loss depending on the prediction type
-            if lora_train_state.prediction_type is not None:
-                # set prediction_type of scheduler if defined
-                noise_scheduler.register_to_config(
-                    prediction_type=lora_train_state.prediction_type
-                )
-
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(model_input, noise, timesteps)
-            else:
-                raise ValueError(
-                    f"Unknown prediction type {noise_scheduler.config.prediction_type}"
-                )
-
-            if lora_train_state.snr_gamma is None:
-                loss = nn.functional.mse_loss(
-                    model_pred.float(), target.float(), reduction="mean"
-                )
-            else:
-                # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                # This is discussed in Section 4.2 of the same paper.
-                snr = compute_snr(noise_scheduler, timesteps)
-                mse_loss_weights = torch.stack(
-                    [snr, lora_train_state.snr_gamma * torch.ones_like(timesteps)],
-                    dim=1,
-                ).min(dim=1)[0]
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    mse_loss_weights = mse_loss_weights / snr
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    mse_loss_weights = mse_loss_weights / (snr + 1)
-
-                loss = nn.functional.mse_loss(
-                    model_pred.float(), target.float(), reduction="none"
-                )
-                loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                loss = loss.mean()
+            loss = get_diffusion_loss(
+                models, train_state, model_input, model_pred, noise, timesteps
+            )
 
             if config.get("debug_loss", False) and "meta" in batch:
                 for meta in batch["meta"]:
-                    accelerator.log({"loss_for_" + meta.path: loss}, step=global_step)
+                    accelerator.log(
+                        {"loss_for_" + meta.path: loss}, step=train_state.global_step
+                    )
 
             # Gather the losses across all processes for logging (if we use distributed training).
             avg_loss = accelerator.gather(
-                loss.repeat(lora_train_state.train_batch_size)
+                loss.repeat(train_state.train_batch_size)
             ).mean()
-            train_loss += avg_loss.item() / lora_train_state.gradient_accumulation_steps
+            train_loss += avg_loss.item() / train_state.gradient_accumulation_steps
 
             # Backpropagate
             accelerator.backward(loss)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(
-                    params_to_optimize, lora_train_state.max_grad_norm
+                    params_to_optimize, train_state.max_grad_norm
                 )
 
             optimizer.step()
@@ -984,52 +1043,17 @@ def train_epoch(
         # Checks if the accelerator has performed an optimization step behind the scenes
         if accelerator.sync_gradients:
             progress_bar.update(1)
-            global_step += 1
-            accelerator.log({"train_loss": train_loss}, step=global_step)
+            train_state.global_step += 1
+            accelerator.log({"train_loss": train_loss}, step=train_state.global_step)
             train_loss = 0.0
 
-            if accelerator.is_main_process:
-                if global_step % lora_train_state.checkpointing_steps == 0:
-                    # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                    if lora_train_state.checkpoints_total_limit is not None:
-                        checkpoints = os.listdir(output_dir)
-                        checkpoints = [
-                            d for d in checkpoints if d.startswith("checkpoint")
-                        ]
-                        checkpoints = sorted(
-                            checkpoints, key=lambda x: int(x.split("-")[1])
-                        )
-
-                        # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                        if len(checkpoints) >= lora_train_state.checkpoints_total_limit:
-                            num_to_remove = (
-                                len(checkpoints)
-                                - lora_train_state.checkpoints_total_limit
-                                + 1
-                            )
-                            removing_checkpoints = checkpoints[0:num_to_remove]
-
-                            logger.info(
-                                f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                            )
-                            logger.info(
-                                f"removing checkpoints: {', '.join(removing_checkpoints)}"
-                            )
-
-                            for removing_checkpoint in removing_checkpoints:
-                                removing_checkpoint = os.path.join(
-                                    output_dir, removing_checkpoint
-                                )
-                                shutil.rmtree(removing_checkpoint)
-
-                    save_path = Path(output_dir, f"checkpoint-{global_step}")
-                    accelerator.save_state(save_path)
-                    logger.info(f"Saved state to {save_path}")
+            if accelerator.is_main_process and (
+                train_state.global_step % train_state.checkpointing_steps == 0
+            ):
+                save_checkpoint(accelerator, train_state)
 
         logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
         progress_bar.set_postfix(**logs)
-
-    return global_step
 
 
 def main(args):
@@ -1039,24 +1063,24 @@ def main(args):
 
     config = setup_project(args.config_path)
 
-    lora_train_state = LoraTrainingState(**config["model"])
+    train_state = LoraTrainState(**config["model"])
 
-    using_sdxl = is_sdxl_model(lora_train_state.model_id)
-    if (lora_train_state.vae_id is not None) and (
-        (using_sdxl and not is_sdxl_vae(lora_train_state.vae_id))
-        or (not using_sdxl and is_sdxl_vae(lora_train_state.vae_id))
+    using_sdxl = is_sdxl_model(train_state.model_id)
+    if (train_state.vae_id is not None) and (
+        (using_sdxl and not is_sdxl_vae(train_state.vae_id))
+        or (not using_sdxl and is_sdxl_vae(train_state.vae_id))
     ):
         raise ValueError(
-            f"Mismatch between model_id and vae_id. Both models need to either be SDXL or SD, but received {lora_train_state.model_id} and {lora_train_state.vae_id}"
+            f"Mismatch between model_id and vae_id. Both models need to either be SDXL or SD, but received {train_state.model_id} and {train_state.vae_id}"
         )
 
     accelerator = Accelerator(
-        gradient_accumulation_steps=lora_train_state.gradient_accumulation_steps,
-        mixed_precision=lora_train_state.weights_dtype,
-        log_with=lora_train_state.loggers,
+        gradient_accumulation_steps=train_state.gradient_accumulation_steps,
+        mixed_precision=train_state.weights_dtype,
+        log_with=train_state.loggers,
         project_config=ProjectConfiguration(
-            project_dir=lora_train_state.output_dir,
-            logging_dir=lora_train_state.logging_dir,
+            project_dir=train_state.output_dir,
+            logging_dir=train_state.logging_dir,
         ),
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
@@ -1078,35 +1102,35 @@ def main(args):
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    if lora_train_state.seed is not None:
-        set_seed(lora_train_state.seed)
+    if train_state.seed is not None:
+        set_seed(train_state.seed)
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     # Note: this applies to the A100
-    if lora_train_state.allow_tf32:
+    if train_state.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    if torch.backends.mps.is_available() and lora_train_state.weights_dtype == "bf16":
+    if torch.backends.mps.is_available() and train_state.weights_dtype == "bf16":
         # due to pytorch#99272, MPS does not yet support bfloat16.
         raise ValueError(
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
     if accelerator.is_main_process:
-        Path(lora_train_state.output_dir).mkdir(exist_ok=True, parents=True)
-        Path(lora_train_state.logging_dir).mkdir(exist_ok=True)
+        Path(train_state.output_dir).mkdir(exist_ok=True, parents=True)
+        Path(train_state.logging_dir).mkdir(exist_ok=True)
 
-        if lora_train_state.push_to_hub:
+        if train_state.push_to_hub:
             raise NotImplementedError
 
-    if lora_train_state.report_to == "wandb":
+    if train_state.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError(
                 "Make sure to install wandb if you want to use it for logging during training."
             )
 
-        if lora_train_state.hub_token is not None:
+        if train_state.hub_token is not None:
             raise ValueError(
                 "You cannot use both report_to=wandb and hub_token due to a security risk of exposing your token."
                 " Please use `huggingface-cli login` to authenticate with the Hub."
@@ -1116,12 +1140,12 @@ def main(args):
 
         if accelerator.is_local_main_process:
             wandb.init(
-                project=lora_train_state.wandb_project or get_env("WANDB_PROJECT"),
-                entity=lora_train_state.wandb_entity or get_env("WANDB_ENTITY"),
-                dir=lora_train_state.logging_dir or get_env("WANDB_DIR"),
-                group=lora_train_state.wandb_group or get_env("WANDB_GROUP"),
+                project=train_state.wandb_project or get_env("WANDB_PROJECT"),
+                entity=train_state.wandb_entity or get_env("WANDB_ENTITY"),
+                dir=train_state.logging_dir or get_env("WANDB_DIR"),
+                group=train_state.wandb_group or get_env("WANDB_GROUP"),
                 reinit=True,
-                config=asdict(lora_train_state),
+                config=asdict(train_state),
             )
 
     # =======================
@@ -1134,7 +1158,7 @@ def main(args):
         ).to(accelerator.device)
     }
 
-    models = prepare_models(lora_train_state, accelerator.device)
+    models = prepare_models(train_state, accelerator.device)
 
     # ============================
     # === Prepare optimization ===
@@ -1145,7 +1169,7 @@ def main(args):
             save_model_hook,
             accelerator=accelerator,
             models=models,
-            lora_train_state=lora_train_state,
+            lora_train_state=train_state,
         )
     )
     accelerator.register_load_state_pre_hook(
@@ -1153,7 +1177,7 @@ def main(args):
             load_model_hook,
             accelerator=accelerator,
             models=models,
-            lora_train_state=lora_train_state,
+            lora_train_state=train_state,
         )
     )
 
@@ -1161,15 +1185,15 @@ def main(args):
     # ===   Setup data   ===
     # ======================
 
-    preprocessors = prepare_preprocessors(models, lora_train_state)
+    preprocessors = prepare_preprocessors(models, train_state)
     train_dataset = DynamicDataset.from_config(
-        lora_train_state.datasets["train_data"],
+        train_state.datasets["train_data"],
         preprocess_func=functools.partial(
             preprocess_sample, preprocessors=preprocessors["train"]
         ),
     )
     val_dataset = DynamicDataset.from_config(
-        lora_train_state.datasets["val_data"],
+        train_state.datasets["val_data"],
         preprocess_func=functools.partial(
             preprocess_sample, preprocessors=preprocessors["val"]
         ),
@@ -1178,19 +1202,19 @@ def main(args):
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
-        batch_size=lora_train_state.train_batch_size,
-        num_workers=lora_train_state.dataloader_num_workers,
+        batch_size=train_state.train_batch_size,
+        num_workers=train_state.dataloader_num_workers,
         collate_fn=collate_fn,
-        pin_memory=lora_train_state.pin_memory,
+        pin_memory=train_state.pin_memory,
     )
 
     val_dataloader = DataLoader(
         val_dataset,
         shuffle=False,
-        batch_size=lora_train_state.train_batch_size,
-        num_workers=lora_train_state.dataloader_num_workers,
+        batch_size=train_state.train_batch_size,
+        num_workers=train_state.dataloader_num_workers,
         collate_fn=collate_fn,
-        pin_memory=lora_train_state.pin_memory,
+        pin_memory=train_state.pin_memory,
     )
 
     # ==========================
@@ -1198,7 +1222,7 @@ def main(args):
     # ==========================
 
     trainable_models = [
-        models[model_name] for model_name in lora_train_state.trainable_models
+        models[model_name] for model_name in train_state.trainable_models
     ]
     params_to_optimize = list(
         filter(
@@ -1207,164 +1231,128 @@ def main(args):
         )
     )
 
-    if lora_train_state.scale_lr:
-        lora_train_state.learning_rate = (
-            lora_train_state.learning_rate
-            * lora_train_state.gradient_accumulation_steps
-            * lora_train_state.train_batch_size
+    if train_state.scale_lr:
+        train_state.learning_rate = (
+            train_state.learning_rate
+            * train_state.gradient_accumulation_steps
+            * train_state.train_batch_size
             * accelerator.num_processes
         )
 
     optimizer_class = torch.optim.AdamW
     optimizer = optimizer_class(
         params_to_optimize,
-        lr=lora_train_state.learning_rate,
-        betas=(lora_train_state.adam_beta1, lora_train_state.adam_beta2),
-        weight_decay=lora_train_state.adam_weight_decay,
-        eps=lora_train_state.adam_epsilon,
+        lr=train_state.learning_rate,
+        betas=(train_state.adam_beta1, train_state.adam_beta2),
+        weight_decay=train_state.adam_weight_decay,
+        eps=train_state.adam_epsilon,
     )
 
     # Scheduler and math around the number of training steps.
-    lora_train_state.num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / lora_train_state.gradient_accumulation_steps
+    train_state.num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / train_state.gradient_accumulation_steps
     )
-    lora_train_state.max_train_steps = (
-        lora_train_state.n_epochs * num_update_steps_per_epoch
+    train_state.max_train_steps = (
+        train_state.n_epochs * train_state.num_update_steps_per_epoch
     )
 
     lr_scheduler = get_scheduler(
-        lora_train_state.lr_scheduler,
+        train_state.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=lora_train_state.lr_warmup_steps
-        * lora_train_state.gradient_accumulation_steps,
-        num_training_steps=max_train_steps
-        * lora_train_state.gradient_accumulation_steps,
-        **lora_train_state.lr_scheduler_kwargs,
+        num_warmup_steps=train_state.lr_warmup_steps
+        * train_state.gradient_accumulation_steps,
+        num_training_steps=train_state.max_train_steps
+        * train_state.gradient_accumulation_steps,
+        **train_state.lr_scheduler_kwargs,
     )
 
     optimizer, train_dataloader, lr_scheduler, *trainable_models = accelerator.prepare(
         optimizer, train_dataloader, lr_scheduler, *trainable_models
     )
-    for model, model_name in zip(trainable_models, lora_train_state.trainable_models):
+    for model, model_name in zip(trainable_models, train_state.trainable_models):
         models[model_name] = model
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / lora_train_state.gradient_accumulation_steps
+    train_state.num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / train_state.gradient_accumulation_steps
     )
-    max_train_steps = lora_train_state.n_epochs * num_update_steps_per_epoch
+    train_state.max_train_steps = (
+        train_state.n_epochs * train_state.num_update_steps_per_epoch
+    )
 
     # Afterwards we recalculate our number of training epochs
-    n_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
+    train_state.n_epochs = math.ceil(
+        train_state.max_train_steps / train_state.num_update_steps_per_epoch
+    )
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers(
-            lora_train_state.wandb_group, config=asdict(lora_train_state)
-        )
+        accelerator.init_trackers(train_state.wandb_group, config=asdict(train_state))
 
     # ===================
     # === Train model ===
     # ===================
     total_batch_size = (
-        lora_train_state.train_batch_size
+        train_state.train_batch_size
         * accelerator.num_processes
-        * lora_train_state.gradient_accumulation_steps
+        * train_state.gradient_accumulation_steps
     )
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {n_epochs}")
+    logger.info(f"  Num Epochs = {train_state.n_epochs}")
     logger.info(
-        f"  Instantaneous batch size per device = {lora_train_state.train_batch_size}"
+        f"  Instantaneous batch size per device = {train_state.train_batch_size}"
     )
     logger.info(
         f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
     )
     logger.info(
-        f"  Gradient Accumulation steps = {lora_train_state.gradient_accumulation_steps}"
+        f"  Gradient Accumulation steps = {train_state.gradient_accumulation_steps}"
     )
-    logger.info(f"  Total optimization steps = {max_train_steps}")
-    global_step = 0
-    first_epoch = 0
+    logger.info(f"  Total optimization steps = {train_state.max_train_steps}")
 
-    if lora_train_state.resume_from_checkpoint:
-        if lora_train_state.resume_from_checkpoint != "latest":
-            path = os.path.basename(lora_train_state.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
-
-        if path is None:
-            accelerator.print(
-                f"Checkpoint '{lora_train_state.resume_from_checkpoint}' does not exist. Starting a new training run."
-            )
-            initial_global_step = 0
-        else:
-            accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(Path(args.output_dir, path))
-            global_step = int(path.split("-")[1])
-
-            initial_global_step = global_step
-            first_epoch = global_step // num_update_steps_per_epoch
-
-    else:
-        initial_global_step = 0
+    if train_state.resume_from_checkpoint:
+        resume_from_checkpoint(accelerator, train_state)
 
     progress_bar = tqdm.tqdm(
-        range(0, max_train_steps),
-        initial=initial_global_step,
+        range(0, train_state.max_train_steps),
+        initial=train_state.global_step,
         desc="Steps",
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
 
-    for epoch in range(first_epoch, n_epochs):
-        global_step = train_epoch(
+    while train_state.epoch < train_state.n_epochs:
+        train_epoch(
             config,
             accelerator,
             optimizer,
             lr_scheduler,
-            lora_train_state,
+            train_state,
             train_dataloader,
-            vae,
-            unet,
-            image_processor,
-            text_encoder_one,
-            text_encoder_two,
-            noise_scheduler,
-            weight_dtype,
-            max_train_steps,
-            global_step,
+            models,
             params_to_optimize,
             progress_bar,
-            output_dir,
-            using_sdxl,
         )
+        torch.cuda.empty_cache()
 
-        if epoch % lora_train_state.val_freq == 0:
+        if train_state.epoch % train_state.val_freq == 0:
             validate_model(
                 accelerator,
-                lora_train_state,
+                train_state,
                 val_dataloader,
-                noise_scheduler,
-                vae,
-                unet,
-                text_encoder_one,
-                text_encoder_two,
-                weight_dtype,
-                epoch,
-                global_step,
+                models,
                 metrics,
                 "val",
-                using_sdxl,
             )
+        torch.cuda.empty_cache()
 
-        if global_step >= max_train_steps:
+        if (
+            train_state.global_step >= train_state.max_train_steps
+            or train_state.epoch > train_state.n_epochs
+        ):
             break
 
     accelerator.wait_for_everyone()
@@ -1373,23 +1361,15 @@ def main(args):
         # Final inference
         validate_model(
             accelerator,
-            lora_train_state,
+            train_state,
             val_dataloader,
-            noise_scheduler,
-            vae,
-            unet,
-            text_encoder_one,
-            text_encoder_two,
-            weight_dtype,
-            epoch,
-            global_step,
+            models,
             metrics,
             "test",
-            using_sdxl,
         )
 
         # Save the lora layers
-        save_lora_weights(accelerator, lora_train_state, using_sdxl, output_dir)
+        save_lora_weights(accelerator, train_state)
 
     accelerator.end_training()
 
