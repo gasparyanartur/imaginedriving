@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import json
 import yaml
+from functools import cache
 
 import numpy as np
 import pandas as pd
