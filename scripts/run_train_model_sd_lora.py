@@ -60,6 +60,8 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 from src.data import setup_project, DynamicDataset
 from src.diffusion import is_sdxl_model, is_sdxl_vae, get_noised_img
+from src.diffusion import tokenize_prompt
+from src.diffusion import encode_prompt
 from src.utils import get_env
 
 
@@ -196,43 +198,6 @@ def parse_args():
 
     args = parser.parse_args()
     return args
-
-
-def tokenize_prompt(tokenizer, prompt):
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-        return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids
-    return text_input_ids
-
-
-# Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
-def encode_prompt(text_encoders, text_input_ids_list=None):
-    prompt_embeds_list = []
-
-    for i, text_encoder in enumerate(text_encoders):
-        text_input_ids = text_input_ids_list[i]
-
-        prompt_embeds = text_encoder(
-            text_input_ids.to(text_encoder.device),
-            output_hidden_states=True,
-            return_dict=False,
-        )
-
-        # We are only ALWAYS interested in the pooled output of the final text encoder
-        pooled_prompt_embeds = prompt_embeds[0]
-        prompt_embeds = prompt_embeds[-1][-2]
-        bs_embed, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
-        prompt_embeds_list.append(prompt_embeds)
-
-    prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
-    pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
-    return prompt_embeds, pooled_prompt_embeds
 
 
 def compute_vae_encodings(batch, vae):
@@ -883,8 +848,8 @@ def train_epoch(
     using_sdxl: bool = False,
 ):
     weights_dtype = _dtype_conversion[lora_train_state.weights_dtype]
+    vae_dtype = _dtype_conversion[lora_train_state.vae_dtype]
     noise_scheduler = models["noise_scheduler"]
-
 
     models["unet"].train()
     if "text_encoder" in lora_train_state.trainable_models:
@@ -899,11 +864,11 @@ def train_epoch(
     train_loss = 0.0
     for step, batch in enumerate(dataloader):
         with accelerator.accumulate(models["unet"]):
-            rgb = batch["rgb"].to(weights_dtype)
+            rgb = batch["rgb"].to(vae_dtype)
             rgb = models["image_processor"].preprocess(rgb)
             model_input = (
                 models["vae"].encode(rgb).latent_dist.sample() * models["vae"].config.scaling_factor
-            )
+            ).to(weights_dtype)
 
             noise = torch.randn_like(model_input)
             if lora_train_state.noise_offset:
@@ -925,12 +890,6 @@ def train_epoch(
             # Add noise to the model input according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
             noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
-
-            text_encoders = [text_encoder_one]
-            text_input_ids_list = [batch["input_ids_one"]]
-            if text_encoder_two:
-                text_encoders.append(text_encoder_two)
-                text_input_ids_list.append(batch["input_ids_two"])
 
             unet_added_conditions = {}
             if using_sdxl:

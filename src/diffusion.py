@@ -35,6 +35,7 @@ default_negative_prompt = "face, human features, unrealistic, artifacts, blurry,
 @dataclass
 class ModelId:
     sd_v1_5 = "runwayml/stable-diffusion-v1-5"
+    sd_v2_1 = "stabilityai/stable-diffusion-2-1"
     sdxl_base_v1_0 = "stabilityai/stable-diffusion-xl-base-1.0"
     sdxl_refiner_v1_0 = "stabilityai/stable-diffusion-xl-refiner-1.0"
     sdxl_turbo_v1_0 = "stabilityai/sdxl-turbo"
@@ -458,3 +459,26 @@ def diffusion_from_config_to_dir(
     save_yaml(dst_dir / "config.yml", model_config)
 
     logging.info(f"Finished diffusion.")
+
+
+def tokenize_prompt(tokenizer, prompt):
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    return text_input_ids
+
+
+def encode_prompt(text_encoder, tokens, using_sdxl):
+    if using_sdxl:
+        raise NotImplementedError
+
+    prompt_embeds = text_encoder(tokens)
+
+    return {
+        "embeds": prompt_embeds.last_hidden_state
+    }
