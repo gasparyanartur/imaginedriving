@@ -115,10 +115,13 @@ class SDPipe(DiffusionModel):
         self,
         configs: dict[str, Any] = None,
         device: torch.device = get_device(),
+        **kwargs,
     ) -> None:
         super().__init__()
         if configs is None:
             configs = {}
+
+        configs.update(kwargs)
 
         base_model_id = configs.get("base_model_id", ModelId.sd_v1_5)
         refiner_model_id = configs.get("refiner_model_id", None)
@@ -160,6 +163,7 @@ class SDPipe(DiffusionModel):
             )
         self.tokenizer = self.base_pipe.tokenizer
         self.text_encoder = self.base_pipe.text_encoder
+        self.device = device
 
     def diffuse_sample(
         self,
@@ -181,22 +185,40 @@ class SDPipe(DiffusionModel):
         base_kwargs: dict[str, any] = None,
         refiner_kwargs: dict[str, any] = None,
     ):
+
         image = sample["rgb"]
+        batch_size = len(image)
 
         image = batch_if_not_iterable(image)
         base_gen = batch_if_not_iterable(base_gen)
         refiner_gen = batch_if_not_iterable(refiner_gen)
         validate_same_len(image, base_gen, refiner_gen)
 
+        if base_gen:
+            base_gen = base_gen * batch_size
+
+        if refiner_gen:
+            refiner_gen = refiner_gen * batch_size
+
         base_kwargs = base_kwargs or {}
         if prompt is not None:
-            tokens = tokenize_prompt(self.tokenizer, prompt)
-            prompt_embeds = encode_tokens(self.text_encoder, tokens, using_sdxl=False)
+            with torch.no_grad():
+                tokens = tokenize_prompt(self.tokenizer, prompt).to(self.device)
+                prompt_embeds = encode_tokens(
+                    self.text_encoder, tokens, using_sdxl=False
+                )["embeds"]
+            prompt_embeds = prompt_embeds.expand(batch_size, -1, -1)
+
         if negative_prompt is not None:
-            negative_tokens = tokenize_prompt(self.tokenizer, prompt)
-            negative_prompt_embeds = encode_tokens(
-                self.text_encoder, negative_tokens, using_sdxl=False
-            )
+            with torch.no_grad():
+                negative_tokens = tokenize_prompt(self.tokenizer, negative_prompt).to(
+                    self.device
+                )
+                negative_prompt_embeds = encode_tokens(
+                    self.text_encoder, negative_tokens, using_sdxl=False
+                )["embeds"]
+
+            negative_prompt_embeds = negative_prompt_embeds.expand(batch_size, -1, -1)
 
         image = self.base_pipe(
             image=image,
