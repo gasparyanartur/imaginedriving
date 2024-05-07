@@ -21,11 +21,7 @@ from src.utils import (
     validate_same_len,
     batch_if_not_iterable,
 )
-from src.data import (
-    save_image,
-    DynamicDataset,
-    suffixes
-)
+from src.data import save_image, DynamicDataset, suffixes
 from src.data import save_yaml
 
 
@@ -42,29 +38,35 @@ class ModelId:
     sdxl_turbo_v1_0 = "stabilityai/sdxl-turbo"
 
 
-sdxl_models = {ModelId.sdxl_base_v1_0, ModelId.sdxl_refiner_v1_0, ModelId.sdxl_turbo_v1_0}
+sdxl_models = {
+    ModelId.sdxl_base_v1_0,
+    ModelId.sdxl_refiner_v1_0,
+    ModelId.sdxl_turbo_v1_0,
+}
 sd_models = {ModelId.sd_v1_5}
+
 
 def is_sdxl_model(model_id: str) -> bool:
     return model_id in sdxl_models
+
 
 def is_sdxl_vae(model_id: str) -> bool:
     return model_id == "madebyollin/sdxl-vae-fp16-fix" or is_sdxl_model(model_id)
 
 
-def prep_model(pipe, device=get_device(), low_mem_mode: bool = False, compile: bool = True):
+def prep_model(
+    pipe, device=get_device(), low_mem_mode: bool = False, compile: bool = True
+):
     if compile:
         try:
             pipe.unet = torch.compile(pipe.unet, fullgraph=True)
         except AttributeError:
             logging.warn(f"No unet found in Pipe. Skipping compiling")
-    
-    
-    if low_mem_mode: 
+
+    if low_mem_mode:
         pipe.enable_model_cpu_offload()
     else:
         pipe = pipe.to(device)
-
 
     return pipe
 
@@ -77,7 +79,11 @@ class DiffusionModel(ABC):
         raise NotImplementedError
 
     def diffuse_to_dir(
-        self, src_dataset: DynamicDataset, dst_dir: Path, id_range: tuple[int, int, int] = None, **kwargs
+        self,
+        src_dataset: DynamicDataset,
+        dst_dir: Path,
+        id_range: tuple[int, int, int] = None,
+        **kwargs,
     ) -> None:
         assert "meta" in src_dataset.data_getters
 
@@ -124,29 +130,36 @@ class SDPipe(DiffusionModel):
         if self.use_refiner:
             raise NotImplementedError
 
-        
         self.base_pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
             base_model_id,
             torch_dtype=torch.float16,
             variant="fp16",
             use_safetensors=True,
         )
-        self.base_pipe = prep_model(self.base_pipe, low_mem_mode=low_mem_mode, device=device, compile=compile_model)
-        
+        self.base_pipe = prep_model(
+            self.base_pipe,
+            low_mem_mode=low_mem_mode,
+            device=device,
+            compile=compile_model,
+        )
 
         if self.use_refiner:
-            self.refiner_pipe = (
-                StableDiffusionImg2ImgPipeline.from_pretrained(
-                    refiner_model_id,
-                    text_encoder_2=self.base_pipe.text_encoder_2,
-                    vae=self.base_pipe.vae,
-                    torch_dtype=torch.float16,
-                    use_safetensors=True,
-                    variant="fp16",
-                )
+            self.refiner_pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+                refiner_model_id,
+                text_encoder_2=self.base_pipe.text_encoder_2,
+                vae=self.base_pipe.vae,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+                variant="fp16",
             )
-            self.refiner_pipe = prep_model(self.refiner_pipe, low_mem_mode=low_mem_mode, device=device, compile=compile_model)
+            self.refiner_pipe = prep_model(
+                self.refiner_pipe,
+                low_mem_mode=low_mem_mode,
+                device=device,
+                compile=compile_model,
+            )
         self.tokenizer = self.base_pipe.tokenizer
+        self.text_encoder = self.base_pipe.text_encoder
 
     def diffuse_sample(
         self,
@@ -177,8 +190,13 @@ class SDPipe(DiffusionModel):
 
         base_kwargs = base_kwargs or {}
         if prompt is not None:
-            prompt_embeds = 
-
+            tokens = tokenize_prompt(self.tokenizer, prompt)
+            prompt_embeds = encode_tokens(self.text_encoder, tokens, using_sdxl=False)
+        if negative_prompt is not None:
+            negative_tokens = tokenize_prompt(self.tokenizer, prompt)
+            negative_prompt_embeds = encode_tokens(
+                self.text_encoder, negative_tokens, using_sdxl=False
+            )
 
         image = self.base_pipe(
             image=image,
@@ -190,8 +208,8 @@ class SDPipe(DiffusionModel):
             num_inference_steps=base_num_steps,
             original_size=original_size,
             target_size=target_size,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
             **base_kwargs,
         ).images
 
@@ -220,7 +238,7 @@ class SDPipe(DiffusionModel):
 
     @property
     def image_processor(self) -> VaeImageProcessor:
-        return self.base_pipe.image_processor    
+        return self.base_pipe.image_processor
 
 
 class SDXLPipe(DiffusionModel):
@@ -237,7 +255,7 @@ class SDXLPipe(DiffusionModel):
         if configs is None:
             configs = {
                 "base_model_id": ModelId.sdxl_base_v1_0,
-                "refiner_model_id": None
+                "refiner_model_id": None,
             }
 
         base_model_id = configs.get("base_model_id")
@@ -252,21 +270,19 @@ class SDXLPipe(DiffusionModel):
             use_safetensors=True,
         )
 
-        if low_mem_mode: 
+        if low_mem_mode:
             self.base_pipe.enable_model_cpu_offload()
         else:
             self.base_pipe = self.base_pipe.to(device)
 
         if self.use_refiner:
-            self.refiner_pipe = (
-                StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                    refiner_model_id,
-                    text_encoder_2=self.base_pipe.text_encoder_2,
-                    vae=self.base_pipe.vae,
-                    torch_dtype=torch.float16,
-                    use_safetensors=True,
-                    variant="fp16",
-                )
+            self.refiner_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+                refiner_model_id,
+                text_encoder_2=self.base_pipe.text_encoder_2,
+                vae=self.base_pipe.vae,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+                variant="fp16",
             )
 
             if low_mem_mode:
@@ -355,7 +371,12 @@ model_name_to_constructor = {
 
 
 def encode_img(
-    img_processor: VaeImageProcessor, vae: AutoencoderKL, img: Tensor, device, seed: int = None, sample_latent: bool = False
+    img_processor: VaeImageProcessor,
+    vae: AutoencoderKL,
+    img: Tensor,
+    device,
+    seed: int = None,
+    sample_latent: bool = False,
 ) -> Tensor:
     img = img_processor.preprocess(img)
 
@@ -374,8 +395,7 @@ def encode_img(
             vae.to(original_vae_dtype)
 
         latents = retrieve_latents(
-            latents,
-            generator=(torch.manual_seed(seed) if seed is not None else None)
+            latents, generator=(torch.manual_seed(seed) if seed is not None else None)
         )
 
     latents = latents * vae.config.scaling_factor
@@ -410,23 +430,27 @@ def upcast_vae(vae):
 
     return vae
 
+
 def get_noised_img(img, timestep, pipe, noise_scheduler, device, seed=None):
     vae = pipe.vae
     img_processor = pipe.image_processor
-        
+
     with torch.no_grad():
-        model_input = encode_img(img_processor, vae, img, sample_latent=True, device=device, seed=seed)  
+        model_input = encode_img(
+            img_processor, vae, img, sample_latent=True, device=device, seed=seed
+        )
         noise = torch.randn_like(model_input).to(device)
         timestep = noise_scheduler.timesteps[timestep]
         timesteps = torch.tensor([timestep]).to(device)
-        noisy_model_input = noise_scheduler.add_noise(
-            model_input, noise, timesteps
-        )
+        noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
         img_pred = decode_img(img_processor, vae, noisy_model_input)
 
     return img_pred
 
-def load_img2img_model(model_config_params: dict[str, Any], device=get_device()) -> DiffusionModel:
+
+def load_img2img_model(
+    model_config_params: dict[str, Any], device=get_device()
+) -> DiffusionModel:
     logging.info(f"Loading diffusion model...")
 
     model_name = model_config_params.get("model_name")
@@ -448,7 +472,7 @@ def diffusion_from_config_to_dir(
     model_config: dict[str, Any],
     model: DiffusionModel = None,
     id_range: tuple[int, int, int] = None,
-    device=get_device()
+    device=get_device(),
 ):
     if model_config is not None:
         model_config_params = model_config["model_config_params"]
@@ -458,10 +482,14 @@ def diffusion_from_config_to_dir(
         model_forward_params = {}
 
     if model is None:
-        model = load_img2img_model(model_config_params=model_config_params, device=device)
+        model = load_img2img_model(
+            model_config_params=model_config_params, device=device
+        )
 
     dst_dir.mkdir(exist_ok=True, parents=True)
-    model.diffuse_to_dir(src_dataset, dst_dir, id_range=id_range, **model_forward_params)
+    model.diffuse_to_dir(
+        src_dataset, dst_dir, id_range=id_range, **model_forward_params
+    )
     save_yaml(dst_dir / "config.yml", model_config)
 
     logging.info(f"Finished diffusion.")
@@ -486,6 +514,4 @@ def encode_tokens(text_encoder, tokens, using_sdxl):
 
     prompt_embeds = text_encoder(tokens)
 
-    return {
-        "embeds": prompt_embeds.last_hidden_state
-    }
+    return {"embeds": prompt_embeds.last_hidden_state}
