@@ -149,9 +149,9 @@ class LoraTrainState:
     crop_width: float = 512
     resize_factor: float = 1.0
 
-    trainable_models: list[str] = ["unet"]
+    trainable_models: list[str] = ("unet",)
 
-    loggers: list[str] = ["wandb"]
+    loggers: list[str] = ("wandb",)
     wandb_project: str = "ImagineDriving"
     wandb_entity: str = "arturruiqi"
     wandb_group: str = "finetune-lora"
