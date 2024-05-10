@@ -405,15 +405,15 @@ def upcast_vae(vae):
 
     return vae
 
-def get_noised_img(img, timestep, pipe, noise_scheduler, device, seed=None):
+def get_noised_img(img, timestep, pipe, noise_scheduler, seed=None):
     vae = pipe.vae
     img_processor = pipe.image_processor
         
     with torch.no_grad():
-        model_input = encode_img(img_processor, vae, img, sample_latent=True, device=device, seed=seed)  
-        noise = torch.randn_like(model_input).to(device)
+        model_input = encode_img(img_processor, vae, img, sample_latent=True, device=vae.device, seed=seed)  
+        noise = torch.randn_like(model_input, device=vae.device)
         timestep = noise_scheduler.timesteps[timestep]
-        timesteps = torch.tensor([timestep]).to(device)
+        timesteps = torch.tensor([timestep], device=vae.device)
         noisy_model_input = noise_scheduler.add_noise(
             model_input, noise, timesteps
         )
