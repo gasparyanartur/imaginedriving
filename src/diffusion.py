@@ -484,3 +484,63 @@ def encode_tokens(text_encoder, tokens, using_sdxl):
     return {
         "embeds": prompt_embeds.last_hidden_state
     }
+
+
+def get_diffusion_cls(
+    model_id: str,
+) -> StableDiffusionImg2ImgPipeline | StableDiffusionXLImg2ImgPipeline:
+    if is_sdxl_model(model_id):
+        return StableDiffusionXLImg2ImgPipeline
+    else:
+        return StableDiffusionImg2ImgPipeline
+
+
+def get_random_timesteps(noise_strength, total_num_timesteps, device, batch_size):
+    # Sample a random timestep for each image
+    timesteps = torch.randint(
+        int((1 - noise_strength) * total_num_timesteps),
+        total_num_timesteps,
+        (batch_size,),
+        device=device,
+        dtype=torch.long,
+    )
+    return timesteps
+
+
+def draw_from_bins(start, end, n_draws, device, include_last: bool = False):
+    values = torch.zeros(n_draws+int(include_last), dtype=torch.long, device=device)
+    buckets = torch.round(torch.linspace(start, end, n_draws+1)).int()
+
+    for i in range(n_draws):
+        values[i] = torch.randint(buckets[i], buckets[i+1], (1,))
+
+    if include_last:
+        values[-1] = end
+
+    return values
+
+
+def get_ordered_timesteps(noise_strength, total_num_timesteps, device, num_timesteps=None, sample_from_bins: bool = True):
+    if num_timesteps is None:
+        num_timesteps = total_num_timesteps
+
+    start_step = int((1 - noise_strength) * total_num_timesteps)
+    end_step = total_num_timesteps-1
+
+    # Make sure the last one is total_num_timesteps-1
+    if sample_from_bins:
+        timesteps = draw_from_bins(
+            start_step,
+            end_step,
+            num_timesteps-1,
+            include_last=True,
+            device=device
+        )
+    else:
+        timesteps = torch.round(torch.linspace(
+            start_step,
+            end_step,
+            num_timesteps,
+            device=device
+        )).to(torch.long)
+    return timesteps

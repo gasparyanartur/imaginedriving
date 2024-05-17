@@ -9,6 +9,11 @@ import os
 from dataclasses import dataclass, asdict, field
 import math
 import itertools as it
+from src.data import get_meta_word
+from src.diffusion import get_diffusion_cls
+from src.diffusion import get_random_timesteps
+from src.diffusion import get_ordered_timesteps
+from src.utils import nearest_multiple
 import torch.utils
 import torch.utils.data
 import tqdm
@@ -27,7 +32,6 @@ import diffusers
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    StableDiffusionXLImg2ImgPipeline,
     StableDiffusionImg2ImgPipeline,
     UNet2DConditionModel,
 )
@@ -72,6 +76,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 @dataclass(init=True)
 class LoraTrainState:
+    job_id: str = None
     project_name: str = "ImagineDriving"
     project_dir: str = None
     cache_dir: str = None
@@ -101,11 +106,11 @@ class LoraTrainState:
     val_freq: int = 10
 
     train_noise_strength: float = 0.5
-    train_noise_num_steps: int = 50
+    train_noise_num_steps: int = None
     val_noise_num_steps: int = 30
     val_noise_strength: float = 0.25
 
-    keep_vae_full: bool = True
+    keep_vae_full: bool = False
 
     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
     noise_offset: float = 0
@@ -180,6 +185,19 @@ _dtype_conversion = {
 }
 
 
+def init_job_id(train_state: LoraTrainState) -> None:
+    if train_state.job_id is not None:
+        return 
+
+    if "SLURM_JOB_ID" in os.environ:
+        train_state.job_id = os.environ["SLURM_JOB_ID"]
+        return
+
+    logging.warning(f"Could not find SLURM_JOB_ID or predefined job_id, setting job_id to 0")
+    train_state.job_id = "0"
+    return 
+
+
 def find_checkpoint_paths(cp_dir: str, cp_prefix: str = "checkpoint", cp_delim="-"):
     cp_paths = os.listdir(cp_dir)
     cp_paths = [d for d in cp_paths if d.startswith(cp_prefix)]
@@ -230,9 +248,6 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-def get_meta_word(meta):
-    return f"{meta['dataset']} - {meta['scene']} - {meta['sample']}"
-
 def compute_vae_encodings(batch, vae):
     images = batch.pop("rgb")
     pixel_values = torch.stack(list(images))
@@ -241,6 +256,7 @@ def compute_vae_encodings(batch, vae):
 
     with torch.no_grad():
         model_input = vae.encode(pixel_values).latent_dist.sample()
+
     model_input = model_input * vae.config.scaling_factor
     return {"model_input": model_input.cpu()}
 
@@ -401,8 +417,12 @@ def save_model_hook(loaded_models, weights, output_dir, accelerator, models, lor
             weights.pop()
 
     # TODO: Extend for more models
+    dst_dir = Path(output_dir, lora_train_state.job_id)
+    if not dst_dir.exists():
+        dst_dir.mkdir(exist_ok=True, parents=True)
+
     StableDiffusionImg2ImgPipeline.save_lora_weights(
-        save_directory=output_dir,
+        save_directory=str(dst_dir),
         unet_lora_layers=layers_to_save.get("unet"),
         text_encoder_lora_layers=layers_to_save.get("text_encoder"),
     )
@@ -476,10 +496,6 @@ def unwrap_model(accelerator: Accelerator, model):
     return model
 
 
-def nearest_multiple(x: float | int, m: int) -> int:
-    return int(int(x / m) * m)
-
-
 def prepare_preprocessors(models, lora_train_state: LoraTrainState):
     crop_height = lora_train_state.crop_height or lora_train_state.image_height
     crop_width = lora_train_state.crop_width or lora_train_state.image_width
@@ -543,15 +559,6 @@ def prepare_preprocessors(models, lora_train_state: LoraTrainState):
     preprocessors["val"]["prompt"] = functools.partial(preprocess_prompt, models=models)
 
     return preprocessors
-
-
-def get_diffusion_cls(
-    model_id: str,
-) -> StableDiffusionImg2ImgPipeline | StableDiffusionXLImg2ImgPipeline:
-    if is_sdxl_model(model_id):
-        return StableDiffusionXLImg2ImgPipeline
-    else:
-        return StableDiffusionImg2ImgPipeline
 
 
 def save_lora_weights(
@@ -638,61 +645,11 @@ def get_diffusion_loss(
     return loss
 
 
-def get_random_timesteps(noise_strength, total_num_timesteps, device, batch_size):
-    # Sample a random timestep for each image
-    timesteps = torch.randint(
-        int((1 - noise_strength) * total_num_timesteps),
-        total_num_timesteps,
-        (batch_size,),
-        device=device,
-        dtype=torch.long,
-    )
-    return timesteps
-
-
-def draw_from_bins(start, end, n_draws, device, include_last: bool = False):
-    values = torch.zeros(n_draws+int(include_last), dtype=torch.long, device=device)
-    buckets = torch.round(torch.linspace(start, end, n_draws+1)).int()
-
-    for i in range(n_draws):
-        values[i] = torch.randint(buckets[i], buckets[i+1], (1,))
-
-    if include_last:
-        values[-1] = end
-        
-    return values
-
-
-def get_ordered_timesteps(noise_strength, total_num_timesteps, device, num_timesteps=None, sample_from_bins: bool = True):
-    if num_timesteps is None:
-        num_timesteps = total_num_timesteps
-
-    start_step = int((1 - noise_strength) * total_num_timesteps)
-    end_step = total_num_timesteps-1
-
-    # Make sure the last one is total_num_timesteps-1
-    if sample_from_bins:
-        timesteps = draw_from_bins(
-            start_step,
-            end_step,
-            num_timesteps-1,
-            include_last=True,
-            device=device
-        )
-    else:
-        timesteps = torch.round(torch.linspace(
-            start_step,
-            end_step,
-            num_timesteps,
-            device=device
-        )).to(torch.long)
-    return timesteps
-
-
 def save_checkpoint(accelerator: Accelerator, lora_train_state: LoraTrainState) -> None:
     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+    output_dir = os.path.join(lora_train_state.output_dir, lora_train_state.job_id)
     if lora_train_state.checkpoints_total_limit is not None:
-        cp_paths = find_checkpoint_paths(lora_train_state.output_dir)
+        cp_paths = find_checkpoint_paths(output_dir)
 
         # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
         if len(cp_paths) >= lora_train_state.checkpoints_total_limit:
@@ -705,17 +662,19 @@ def save_checkpoint(accelerator: Accelerator, lora_train_state: LoraTrainState) 
             logger.info(f"removing checkpoints: {', '.join(cps_to_remove)}")
 
             for cp_path in cps_to_remove:
-                cp_path = os.path.join(lora_train_state.output_dir, cp_path)
+                cp_path = os.path.join(output_dir, cp_path)
                 shutil.rmtree(cp_path)
 
     cp_path = os.path.join(
-        lora_train_state.output_dir, f"checkpoint-{lora_train_state.global_step}"
+        output_dir, f"checkpoint-{lora_train_state.global_step}"
     )
     accelerator.save_state(cp_path)
     logger.info(f"Saved state to {cp_path}")
 
 
 def resume_from_checkpoint(accelerator, train_state: LoraTrainState):
+    raise NotImplementedError
+    # TOOD: Update with new codebaie
     if train_state.resume_from_checkpoint:
 
         if train_state.resume_from_checkpoint == "latest":
@@ -808,11 +767,11 @@ def prepare_models(lora_train_state: LoraTrainState, device):
     # We only train the additional adapter LoRA layers
     if "vae" in models:
         models["vae"].requires_grad_(False)
-        models["vae"].to(device, dtype=vae_dtype)
+        models["vae"].to(device=device, dtype=vae_dtype)
 
     if "unet" in models:
         models["unet"].requires_grad_(False)
-        models["unet"].to(device, dtype=weights_dtype)
+        models["unet"].to(device=device, dtype=weights_dtype)
 
         if "unet" in lora_train_state.trainable_models:
             models["unet"].add_adapter(
@@ -826,7 +785,7 @@ def prepare_models(lora_train_state: LoraTrainState, device):
 
     if "text_encoder" in models:
         models["text_encoder"].requires_grad_(False)
-        models["text_encoder"].to(device, dtype=weights_dtype)
+        models["text_encoder"].to(device=device, dtype=weights_dtype)
 
         if "text_encoder" in lora_train_state.trainable_models:
             models["text_encoder"].add_adapter(
@@ -874,15 +833,15 @@ def validate_model(
     pipeline_args = {}
 
     if "vae" in models:
-        pipeline_args["vae"] = models["vae"]
+        pipeline_args["vae"] = models["vae"].to(dtype=vae_dtype, device=accelerator.device)
 
     if "text_encoder" in models:
         pipeline_args["text_encoder"] = unwrap_model(
             accelerator, models["text_encoder"]
-        )
+        ).to(dtype=weights_dtype, device=accelerator.device)
 
     if "unet" in models:
-        pipeline_args["unet"] = unwrap_model(accelerator, models["unet"])
+        pipeline_args["unet"] = unwrap_model(accelerator, models["unet"]).to(dtype=weights_dtype, device=accelerator.device)
 
     # TODO: Support SDXL
     pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
@@ -898,6 +857,7 @@ def validate_model(
     noise_scheduler.set_timesteps(train_state.val_noise_num_steps)
 
     # Often we end up using the same prompt, just reuse the previous one then, no need to re-embed
+    use_cached_tokens = not "text_encoder" in train_state.trainable_models
     cached_input_ids = None
     cached_prompt_embeds = None
 
@@ -914,7 +874,7 @@ def validate_model(
         ]
 
         if "input_ids" in batch:
-            if cached_input_ids and torch.all(batch["input_ids"] == cached_input_ids):
+            if use_cached_tokens and cached_input_ids and torch.all(batch["input_ids"] == cached_input_ids):
                 pipeline_kwargs["prompt_embeds"] = cached_prompt_embeds.to(device=accelerator.device)
             else:
                 with torch.no_grad():
@@ -923,8 +883,10 @@ def validate_model(
                         batch["input_ids"].to(device=accelerator.device),
                         using_sdxl=is_sdxl_model(train_state.model_id)
                     )["embeds"]
-                cached_input_ids = batch["input_ids"]
-                cached_prompt_embeds = pipeline_kwargs["prompt_embeds"].cpu()
+
+                if use_cached_tokens:
+                    cached_input_ids = batch["input_ids"]
+                    cached_prompt_embeds = pipeline_kwargs["prompt_embeds"].cpu()
 
         output_imgs = pipeline(
             **pipeline_kwargs,
@@ -1164,9 +1126,11 @@ def main(args):
     # ========================
     # ===   Setup script   ===
     # ========================
-
     config = setup_project(args.config_path)
     train_state = LoraTrainState(**config)
+
+    init_job_id(train_state)
+    logging.info(f"Launching script under id: {train_state.job_id}")
 
     using_sdxl = is_sdxl_model(train_state.model_id)
     if (train_state.vae_id is not None) and (
@@ -1222,6 +1186,7 @@ def main(args):
 
     if accelerator.is_main_process:
         Path(train_state.output_dir).mkdir(exist_ok=True, parents=True)
+        Path(train_state.output_dir, train_state.job_id).mkdir(exist_ok=True)
         Path(train_state.logging_dir).mkdir(exist_ok=True)
 
         if train_state.push_to_hub:
@@ -1245,7 +1210,7 @@ def main(args):
             wandb.init(
                 project=train_state.wandb_project or get_env("WANDB_PROJECT"),
                 entity=train_state.wandb_entity or get_env("WANDB_ENTITY"),
-                dir=os.path.join(train_state.logging_dir, "wandb") if train_state.logging_dir else get_env("WANDB_DIR"),
+                dir=train_state.logging_dir if train_state.logging_dir else get_env("WANDB_DIR"),
                 group=train_state.wandb_group or get_env("WANDB_GROUP"),
                 reinit=True,
                 config=asdict(train_state),

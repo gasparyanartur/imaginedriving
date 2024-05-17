@@ -693,3 +693,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
                 matches.append((sample_self, sample_other))
 
         return matches
+
+
+def get_meta_word(meta):
+    return f"{meta['dataset']} - {meta['scene']} - {meta['sample']}"

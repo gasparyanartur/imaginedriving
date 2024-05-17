@@ -149,3 +149,7 @@ def set_if_no_key(config, key, val):
         config[key] = val
 
     return val
+
+
+def nearest_multiple(x: float | int, m: int) -> int:
+    return int(int(x / m) * m)
