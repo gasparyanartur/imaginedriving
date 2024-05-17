@@ -6,7 +6,7 @@ CACHE_DIR: null     # null: $(PROJ_DIR)/.cache
 datasets:
   source_images:
     dataset: pandaset
-    path: "/home/s0001900/dev/datasets/pandaset"
+    path: "/home/s0001899/Dev/pandaset"
     data_getters:
       rgb:
         camera: "front_camera"
@@ -30,4 +30,4 @@ model:
     base_strength: 0.1
     base_num_steps: 50
 
-output_dir: /home/s0001900/dev/output/diffusion
+output_dir: /home/s0001899/Dev/output/
