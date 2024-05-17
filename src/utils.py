@@ -135,10 +135,10 @@ def set_env(key: str, val: any) -> None:
     os.environ[key] = str(val)
 
 
-def get_env(key: str) -> str | Path:
-    val = os.environ.get(key)
+def get_env(key: str, default_val: any = None) -> str | Path:
+    val = os.environ.get(key, default_val)
 
-    if val and (val[0] == "/") and (val_path := Path(val)).exists():
+    if val and isinstance(val, str) and (val[0] == "/") and (val_path := Path(val)).exists():
         return val_path
 
     return val
@@ -149,3 +149,7 @@ def set_if_no_key(config, key, val):
         config[key] = val
 
     return val
+
+
+def nearest_multiple(x: float | int, m: int) -> int:
+    return int(int(x / m) * m)

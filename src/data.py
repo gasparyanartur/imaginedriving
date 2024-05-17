@@ -64,8 +64,8 @@ def setup_project(config_path: Path):
 
 
     config = read_yaml(config_path)
-    project_dir = config.get("project_path", get_env("PROJECT_DIR") or Path.cwd())
-    cache_dir = config.get("cache_dir", get_env("CACHE_DIR", project_dir / ".cache"))
+    project_dir = config.get("project_path") or get_env("PROJECT_DIR", Path.cwd())
+    cache_dir = config.get("cache_dir") or get_env("CACHE_DIR", project_dir / ".cache")
 
     set_env("HF_HUB_CACHE", cache_dir / "hf")  # Huggingface cache dir
     set_env("MPLCONFIGDIR", cache_dir / "mpl")  # Matplotlib cache dir
@@ -693,3 +693,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
                 matches.append((sample_self, sample_other))
 
         return matches
+
+
+def get_meta_word(meta):
+    return f"{meta['dataset']} - {meta['scene']} - {meta['sample']}"
