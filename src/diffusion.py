@@ -123,6 +123,9 @@ class SDPipe(DiffusionModel):
 
         configs.update(kwargs)
 
+        if "base_model_id" not in configs and "model_id" in configs:
+            configs["base_model_id"] = configs["model_id"]
+
         base_model_id = configs.get("base_model_id", ModelId.sd_v1_5)
         refiner_model_id = configs.get("refiner_model_id", None)
         low_mem_mode = configs.get("low_mem_mode", False)
@@ -452,18 +455,19 @@ def upcast_vae(vae):
 
     return vae
 
+
 def get_noised_img(img, timestep, pipe, noise_scheduler, seed=None):
     vae = pipe.vae
     img_processor = pipe.image_processor
 
     with torch.no_grad():
-        model_input = encode_img(img_processor, vae, img, sample_latent=True, device=vae.device, seed=seed)  
+        model_input = encode_img(
+            img_processor, vae, img, sample_latent=True, device=vae.device, seed=seed
+        )
         noise = torch.randn_like(model_input, device=vae.device)
         timestep = noise_scheduler.timesteps[timestep]
         timesteps = torch.tensor([timestep], device=vae.device)
-        noisy_model_input = noise_scheduler.add_noise(
-            model_input, noise, timesteps
-        )
+        noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
         img_pred = decode_img(img_processor, vae, noisy_model_input)
 
     return img_pred
@@ -535,9 +539,7 @@ def encode_tokens(text_encoder, tokens, using_sdxl):
 
     prompt_embeds = text_encoder(tokens)
 
-    return {
-        "embeds": prompt_embeds.last_hidden_state
-    }
+    return {"embeds": prompt_embeds.last_hidden_state}
 
 
 def get_diffusion_cls(
@@ -562,11 +564,11 @@ def get_random_timesteps(noise_strength, total_num_timesteps, device, batch_size
 
 
 def draw_from_bins(start, end, n_draws, device, include_last: bool = False):
-    values = torch.zeros(n_draws+int(include_last), dtype=torch.long, device=device)
-    buckets = torch.round(torch.linspace(start, end, n_draws+1)).int()
+    values = torch.zeros(n_draws + int(include_last), dtype=torch.long, device=device)
+    buckets = torch.round(torch.linspace(start, end, n_draws + 1)).int()
 
     for i in range(n_draws):
-        values[i] = torch.randint(buckets[i], buckets[i+1], (1,))
+        values[i] = torch.randint(buckets[i], buckets[i + 1], (1,))
 
     if include_last:
         values[-1] = end
@@ -574,27 +576,26 @@ def draw_from_bins(start, end, n_draws, device, include_last: bool = False):
     return values
 
 
-def get_ordered_timesteps(noise_strength, total_num_timesteps, device, num_timesteps=None, sample_from_bins: bool = True):
+def get_ordered_timesteps(
+    noise_strength,
+    total_num_timesteps,
+    device,
+    num_timesteps=None,
+    sample_from_bins: bool = True,
+):
     if num_timesteps is None:
         num_timesteps = total_num_timesteps
 
     start_step = int((1 - noise_strength) * total_num_timesteps)
-    end_step = total_num_timesteps-1
+    end_step = total_num_timesteps - 1
 
     # Make sure the last one is total_num_timesteps-1
     if sample_from_bins:
         timesteps = draw_from_bins(
-            start_step,
-            end_step,
-            num_timesteps-1,
-            include_last=True,
-            device=device
+            start_step, end_step, num_timesteps - 1, include_last=True, device=device
         )
     else:
-        timesteps = torch.round(torch.linspace(
-            start_step,
-            end_step,
-            num_timesteps,
-            device=device
-        )).to(torch.long)
+        timesteps = torch.round(
+            torch.linspace(start_step, end_step, num_timesteps, device=device)
+        ).to(torch.long)
     return timesteps

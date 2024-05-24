@@ -82,13 +82,15 @@ def validate_same_len(*iters) -> None:
         iter_len = len(iterator)
 
         if (prev_iter_len is not None) and (iter_len != prev_iter_len):
-            raise ValueError(f"Expected same length on iterators, but received {[len(i) for i in iters]}")
-        
+            raise ValueError(
+                f"Expected same length on iterators, but received {[len(i) for i in iters]}"
+            )
+
         prev_iter_len = iter_len
 
 
 def combine_kwargs(kwargs, extra_kwargs):
-    extra_kwargs = extra_kwargs or {} 
+    extra_kwargs = extra_kwargs or {}
     kwargs = dict(kwargs, **extra_kwargs)
     return kwargs
 
@@ -110,7 +112,10 @@ def get_parameter_combinations(parameters):
 
     return recurse_param_combinations(names, values, idxs, set())
 
-def recurse_param_combinations(names: list[str], values: list[tuple[Any]], idxs: tuple[int], memory):
+
+def recurse_param_combinations(
+    names: list[str], values: list[tuple[Any]], idxs: tuple[int], memory
+):
     if idxs in memory:
         return []
 
@@ -127,7 +132,7 @@ def recurse_param_combinations(names: list[str], values: list[tuple[Any]], idxs:
             continue
 
         combs.extend(recurse_param_combinations(names, values, new_idxs, memory))
-    
+
     return combs
 
 
@@ -138,7 +143,12 @@ def set_env(key: str, val: any) -> None:
 def get_env(key: str, default_val: any = None) -> str | Path:
     val = os.environ.get(key, default_val)
 
-    if val and isinstance(val, str) and (val[0] == "/") and (val_path := Path(val)).exists():
+    if (
+        val
+        and isinstance(val, str)
+        and (val[0] == "/")
+        and (val_path := Path(val)).exists()
+    ):
         return val_path
 
     return val
