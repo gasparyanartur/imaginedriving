@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import Dataset
 from torch import Tensor
 import torchvision
-torchvision.disable_beta_transforms_warning(); from torchvision.transforms import v2 as transform
+torchvision.disable_beta_transforms_warning(); from torchvision.transforms import v2 as tvtf
 import torchvision
 import logging
 
@@ -23,7 +23,8 @@ from src.utils import get_env, set_env, set_if_no_key
 
 
 
-norm_img_pipeline = transform.Compose([transform.ConvertImageDtype(torch.float32)])
+norm_img_pipeline = tvtf.Compose([tvtf.ConvertImageDtype(torch.float32)])
+norm_img_crop_pipeline = tvtf.Compose([tvtf.ConvertImageDtype(torch.float32), tvtf.CenterCrop((1024, 1024)), tvtf.Resize((512, 512))])
 suffixes = {
     ("rgb", "pandaset"): ".jpg",
     ("rgb", "neurad"): ".jpg",
@@ -94,7 +95,7 @@ def load_img_paths_from_dir(dir_path: Path):
 
 
 def read_image(
-    img_path: Path, tf_pipeline: transform.Compose = norm_img_pipeline
+    img_path: Path, tf_pipeline: tvtf.Compose = norm_img_pipeline
 ) -> Tensor:
     img = torchvision.io.read_image(str(img_path))
     img = tf_pipeline(img)
@@ -443,16 +444,16 @@ class RGBDataGetter(DataGetter):
         elif height is None:
             height = width
 
-        self.base_transform = transform.Compose(
+        self.base_transform = tvtf.Compose(
             [
-                transform.ConvertImageDtype(dtype) if rescale else transform.ToDtype(dtype),
-                transform.Resize((height, width))
+                tvtf.ConvertImageDtype(dtype) if rescale else tvtf.ToDtype(dtype),
+                tvtf.Resize((height, width))
             ]
         )
-        self.extra_transform: transform.Compose = None
+        self.extra_transform: tvtf.Compose = None
 
-    def set_extra_transforms(self, *transforms: transform.Transform) -> None:
-        self.extra_transform = transform.Compose(transforms)
+    def set_extra_transforms(self, *transforms: tvtf.Transform) -> None:
+        self.extra_transform = tvtf.Compose(transforms)
 
     def get_data(self, dataset_path: Path, info: SampleInfo) -> Tensor:
         rgb = read_image(self.get_data_path(dataset_path, info), self.base_transform)
