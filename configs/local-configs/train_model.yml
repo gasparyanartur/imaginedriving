@@ -1,71 +1,115 @@
 project_name: ImagineDriving
 
-PROJ_DIR: null      # null: $(cwd)
-CACHE_DIR: null     # null: $(PROJ_DIR)/.cache
+project_dir: null      # null: $(cwd)
+cache_dir: null     # null: $(PROJ_DIR)/.cache
 
 datasets:
   train_data:
     dataset: pandaset
-    path: "/home/s0001900/dev/datasets/pandaset"
+    path: "data/pandaset"
     data_getters:
       rgb:
         camera: "front_camera"
-        height: 1080
-        width: 1920
-
       prompt: 
         type: static
-        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        positive_prompt: ""
         negative_prompt: ""
 
       meta: {}
 
     data_tree: 
       pandaset: 
-        001-005: "*"
-        001:
-          - 03
-          - 05
-          - 07
+        #001-124: "0::1"
+        #001: ":::"
+        001: [01]
+          
 
   val_data: 
-    train_data:
     dataset: pandaset
-    path: "/home/s0001900/dev/datasets/pandaset"
+    path: "data/pandaset"
     data_getters:
       rgb:
         camera: "front_camera"
-        height: 1080
-        width: 1920
-      
+
       prompt: 
         type: static
-        positive_prompt: "dashcam video, self-driving car, urban driving scene"
+        positive_prompt: ""
         negative_prompt: ""
 
       meta: {}
 
     data_tree: 
       pandaset: 
-        006: "*"
+        #139-158: "0::16"
+        #101: "0::16"
+        #001: ":::"
+        001: [01]
 
 
-model:
-  model_id: "runwayml/stable-diffusion-v1-5"
-  revision: null
-  variant: null
-  max_train_samples: null
-  seed: 0
-  train_batch_size: 16
-  learning_rate: 0.0001
-  adam_beta1: 0.9
-  adam_beta2: 0.999
-  adam_weight_decay: 0.01
-  adam_epsilon: 0.00000001
-  max_grad_norm: 1.0
-  mixed_precision: null
-  lora_rank: 4
-  mixed_precision: True
+model_id: stabilityai/stable-diffusion-2-1
+revision: null
+variant: null
 
-output_dir: /home/s0001900/dev/output/finetune/sd_v1-5
-log_with: wandb
+weights_dtype: fp32
+vae_dtype: null
+
+max_train_samples: null
+seed: 0
+train_batch_size: 16
+dataloader_num_workers: 8
+
+max_grad_norm: 1.0
+
+n_epochs: 1000
+val_freq: 1
+checkpointing_steps: 50
+
+train_noise_strength: 0.4
+train_noise_num_steps: null
+val_noise_num_steps: 50
+val_noise_strength: 0.3
+
+learning_rate: 0.0001
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.01
+adam_epsilon: 0.00000001
+
+lr_scheduler: "constant"
+lr_warmup_steps: 1000
+
+#lr_scheduler: "cosine_with_restarts"
+#lr_warmup_steps: 1000
+#lr_scheduler_kwargs:
+#  num_cycles: 2
+
+#center_crop: True
+#flip_prob: 0
+
+center_crop: False
+flip_prob: 0.5
+
+#crop_height: null
+#crop_width: null
+crop_height: 512
+crop_width: 512
+resize_factor: 1.0
+
+image_height: 1080
+image_width: 1920
+
+debug_loss: False
+use_recreation_loss: False
+
+#compile_models: [unet]
+compile_models: []
+
+lora_rank: 128
+trainable_models:
+  - unet
+  - controlnet
+
+logging_dir: /staging/agp/masterthesis/nerf-thesis-shared/logs/finetune/
+output_dir: /staging/agp/masterthesis/nerf-thesis-shared/output/finetune/sd_v2_1
+loggers: 
+  - wandb

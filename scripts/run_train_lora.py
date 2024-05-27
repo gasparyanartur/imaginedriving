@@ -131,7 +131,45 @@ class LoraTrainState:
     adam_epsilon: float = 1e-08
     snr_gamma: float = None
     max_grad_norm: float = 1.0
+
     lora_rank: int = 4
+    lora_target_ranks: dict[str, Any] = field(default_factory=lambda: {
+        "unet": {
+            "downblocks": {
+                "attn": 4,
+                "resnet": 4, 
+                "ff": 8,
+                "proj": 8
+            },
+            "midblocks": {
+                "attn": 8,
+                "resnet": 8, 
+                "ff": 16,
+                "proj": 16
+            },
+            "upblocks": {
+                "attn": 8,
+                "resnet": 8, 
+                "ff": 16,
+                "proj": 16
+            }
+        },
+        "controlnet": {
+            "downblocks": {
+                "attn": 8,
+                "resnet": 8, 
+                "ff": 16,
+                "proj": 16
+            },
+            "midblocks": {
+                "attn": 8,
+                "resnet": 8, 
+                "ff": 16,
+                "proj": 16
+            }
+        }
+    })
+    lora_peft_type: str = "LORA"        # LORA, LOHA, or LOKR. LOKR seems best for this task https://arxiv.org/pdf/2309.14859
 
     rec_loss_strength: float = 0.4
 
@@ -779,7 +817,8 @@ def prepare_models(lora_train_state: LoraTrainState, device):
                     r=lora_train_state.lora_rank,
                     lora_alpha=lora_train_state.lora_rank,
                     init_lora_weights="gaussian",
-                    target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+                    target_modules=lora_train_state.lora_target_modules,
+                    peft_type=lora_train_state.lora_peft_type
                 )
         )
 
