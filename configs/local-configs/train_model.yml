@@ -104,12 +104,16 @@ use_recreation_loss: False
 #compile_models: [unet]
 compile_models: []
 
-lora_rank: 128
+lora_rank_linear: 4
+lora_rank_conv2d: 4
+
+control_lora_rank_linear: 4
+control_lora_rank_conv2d: 4
+
 trainable_models:
   - unet
   - controlnet
 
-logging_dir: /staging/agp/masterthesis/nerf-thesis-shared/logs/finetune/
-output_dir: /staging/agp/masterthesis/nerf-thesis-shared/output/finetune/sd_v2_1
-loggers: 
-  - wandb
+logging_dir: /logs/finetune/
+output_dir: /output/finetune/sd_v2_1
+loggers: []
