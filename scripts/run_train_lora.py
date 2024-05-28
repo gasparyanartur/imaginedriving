@@ -10,7 +10,7 @@ from dataclasses import dataclass, asdict, field
 import math
 import itertools as it
 from src.data import get_meta_word
-from src.diffusion import get_diffusion_cls, parse_target_ranks
+from src.diffusion import get_diffusion_cls
 from src.diffusion import get_random_timesteps
 from src.diffusion import get_ordered_timesteps
 from src.utils import nearest_multiple
@@ -68,7 +68,6 @@ from src.diffusion import is_sdxl_model, is_sdxl_vae, get_noised_img
 from src.diffusion import tokenize_prompt
 from src.diffusion import encode_tokens
 from src.utils import get_env
-from src.control_lora import ControlLoRAModel
 
 
 check_min_version("0.27.0")
@@ -76,7 +75,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 @dataclass(init=True)
-class TrainState:
+class LoraTrainState:
     job_id: str = None
     project_name: str = "ImagineDriving"
     project_dir: str = None
@@ -133,17 +132,7 @@ class TrainState:
     snr_gamma: float = None
     max_grad_norm: float = 1.0
 
-
-    lora_rank_linear: int = 4
-    lora_rank_conv2d: int = 4
-    use_dora: bool = True
-
-    add_controlnet: bool = False 
-    conditioning_channels: int = 3
-    control_lora_rank_linear: int = 4
-    control_lora_rank_conv2d: int = 4
-
-
+    lora_rank: int = 4
     lora_target_ranks: dict[str, Any] = field(default_factory=lambda: {
         "unet": {
             "downblocks": {
@@ -234,7 +223,7 @@ _dtype_conversion = {
 }
 
 
-def init_job_id(train_state: TrainState) -> None:
+def init_job_id(train_state: LoraTrainState) -> None:
     if train_state.job_id is not None:
         return 
 
@@ -439,7 +428,7 @@ def collate_fn(batch: list[dict[str, Any]], accelerator: Accelerator) -> dict[li
     return collated
 
 
-def save_model_hook(loaded_models, weights, output_dir, accelerator, models, train_state):
+def save_model_hook(loaded_models, weights, output_dir, accelerator, models, lora_train_state):
     if not accelerator.is_main_process:
         return
 
@@ -448,7 +437,7 @@ def save_model_hook(loaded_models, weights, output_dir, accelerator, models, tra
     layers_to_save = {}
 
     for loaded_model in loaded_models:
-        # Map the list of loaded_models given by accelerator to keys given in train_state.
+        # Map the list of loaded_models given by accelerator to keys given in lora_train_state.
         # NOTE: This mapping is done by type, so two objects of the same type will be treated as the same object.
         # TODO: Find a better way of mapping this.
 
@@ -466,10 +455,9 @@ def save_model_hook(loaded_models, weights, output_dir, accelerator, models, tra
             weights.pop()
 
     # TODO: Extend for more models
-    dst_dir = Path(output_dir, train_state.job_id)
+    dst_dir = Path(output_dir, lora_train_state.job_id)
     if not dst_dir.exists():
         dst_dir.mkdir(exist_ok=True, parents=True)
-
 
     StableDiffusionImg2ImgPipeline.save_lora_weights(
         save_directory=str(dst_dir),
@@ -483,12 +471,12 @@ def load_model_hook(
     input_dir,
     accelerator: Accelerator,
     models,
-    train_state: TrainState,
+    lora_train_state: LoraTrainState,
 ):
     loaded_models_dict = {}
 
     while loaded_models:
-        # Map the list of loaded_models given by accelerator to keys given in train_state.
+        # Map the list of loaded_models given by accelerator to keys given in lora_train_state.
         # NOTE: This mapping is done by type, so two objects of the same type will be treated as the same object.
         # TODO: Find a better way of mapping this.
 
@@ -531,11 +519,11 @@ def load_model_hook(
         )
 
     # Make sure the trainable params are in float32.
-    if train_state.weights_dtype in _lower_dtypes:
+    if lora_train_state.weights_dtype in _lower_dtypes:
         models_to_cast = [
             loaded_model
             for model_name, loaded_model in loaded_models_dict.items()
-            if model_name in train_state.trainable_models
+            if model_name in lora_train_state.trainable_models
         ]
         cast_training_params(models_to_cast, dtype=torch.float32)
 
@@ -546,18 +534,18 @@ def unwrap_model(accelerator: Accelerator, model):
     return model
 
 
-def prepare_preprocessors(models, train_state: TrainState):
-    crop_height = train_state.crop_height or train_state.image_height
-    crop_width = train_state.crop_width or train_state.image_width
-    resize_factor = train_state.resize_factor or 1
+def prepare_preprocessors(models, lora_train_state: LoraTrainState):
+    crop_height = lora_train_state.crop_height or lora_train_state.image_height
+    crop_width = lora_train_state.crop_width or lora_train_state.image_width
+    resize_factor = lora_train_state.resize_factor or 1
 
     crop_size = (
         nearest_multiple(crop_height * resize_factor, 8),
         nearest_multiple(crop_width * resize_factor, 8),
     )
     downsample_size = (
-        nearest_multiple(train_state.image_height * resize_factor, 8),
-        nearest_multiple(train_state.image_width * resize_factor, 8),
+        nearest_multiple(lora_train_state.image_height * resize_factor, 8),
+        nearest_multiple(lora_train_state.image_width * resize_factor, 8),
     )
 
     preprocessors = {"train": {}, "val": {}}
@@ -573,17 +561,17 @@ def prepare_preprocessors(models, train_state: TrainState):
             downsample_size, interpolation=transforms.InterpolationMode.BILINEAR
         )
 
-    if train_state.flip_prob > 0:
+    if lora_train_state.flip_prob > 0:
         _train_rgb_preprocess_steps["flipper"] = transforms.RandomHorizontalFlip(
-            p=train_state.flip_prob
+            p=lora_train_state.flip_prob
         )
 
-    if (crop_height != train_state.image_height) or (
-        crop_width != train_state.image_width
+    if (crop_height != lora_train_state.image_height) or (
+        crop_width != lora_train_state.image_width
     ):
         _train_rgb_preprocess_steps["cropper"] = (
             transforms.CenterCrop(crop_size)
-            if train_state.center_crop
+            if lora_train_state.center_crop
             else transforms.RandomCrop(crop_size)
         )
         _val_rgb_preprocess_steps["cropper"] = transforms.CenterCrop(crop_size)
@@ -592,7 +580,7 @@ def prepare_preprocessors(models, train_state: TrainState):
         preprocess_rgb,
         preprocessors=_train_rgb_preprocess_steps,
         target_size=crop_size,
-        center_crop=train_state.center_crop,
+        center_crop=lora_train_state.center_crop,
     )
 
     preprocessors["val"]["rgb"] = functools.partial(
@@ -612,7 +600,7 @@ def prepare_preprocessors(models, train_state: TrainState):
 
 
 def save_lora_weights(
-    accelerator: Accelerator, models, train_state: TrainState
+    accelerator: Accelerator, models, train_state: LoraTrainState
 ) -> None:
     lora_state_dicts = {}
 
@@ -632,7 +620,7 @@ def save_lora_weights(
 
 
 def get_diffusion_noise(
-    size: Iterable[int], device: torch.device, train_state: TrainState
+    size: Iterable[int], device: torch.device, train_state: LoraTrainState
 ) -> Tensor:
     noise = torch.randn(size, device=device)
 
@@ -646,7 +634,7 @@ def get_diffusion_noise(
 
 
 def get_diffusion_loss(
-    models, train_state: TrainState, model_input, model_pred, noise, timesteps
+    models, train_state: LoraTrainState, model_input, model_pred, noise, timesteps
 ):
     noise_scheduler = models["noise_scheduler"]
 
@@ -695,15 +683,15 @@ def get_diffusion_loss(
     return loss
 
 
-def save_checkpoint(accelerator: Accelerator, train_state: TrainState) -> None:
+def save_checkpoint(accelerator: Accelerator, lora_train_state: LoraTrainState) -> None:
     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-    output_dir = os.path.join(train_state.output_dir, train_state.job_id)
-    if train_state.checkpoints_total_limit is not None:
+    output_dir = os.path.join(lora_train_state.output_dir, lora_train_state.job_id)
+    if lora_train_state.checkpoints_total_limit is not None:
         cp_paths = find_checkpoint_paths(output_dir)
 
         # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-        if len(cp_paths) >= train_state.checkpoints_total_limit:
-            num_to_remove = len(cp_paths) - train_state.checkpoints_total_limit + 1
+        if len(cp_paths) >= lora_train_state.checkpoints_total_limit:
+            num_to_remove = len(cp_paths) - lora_train_state.checkpoints_total_limit + 1
             cps_to_remove = cp_paths[0:num_to_remove]
 
             logger.info(
@@ -716,13 +704,13 @@ def save_checkpoint(accelerator: Accelerator, train_state: TrainState) -> None:
                 shutil.rmtree(cp_path)
 
     cp_path = os.path.join(
-        output_dir, f"checkpoint-{train_state.global_step}"
+        output_dir, f"checkpoint-{lora_train_state.global_step}"
     )
     accelerator.save_state(cp_path)
     logger.info(f"Saved state to {cp_path}")
 
 
-def resume_from_checkpoint(accelerator, train_state: TrainState):
+def resume_from_checkpoint(accelerator, train_state: LoraTrainState):
     raise NotImplementedError
     # TOOD: Update with new codebaie
     if train_state.resume_from_checkpoint:
@@ -754,75 +742,65 @@ def resume_from_checkpoint(accelerator, train_state: TrainState):
         train_state.initial_global_step = 0
 
 
-def prepare_models(train_state: TrainState, device):
+def prepare_models(lora_train_state: LoraTrainState, device):
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
 
-    if is_sdxl_vae(train_state.vae_id) or train_state.keep_vae_full:
+    if is_sdxl_vae(lora_train_state.vae_id) or lora_train_state.keep_vae_full:
         # The VAE in SDXL is in float32 to avoid NaN losses.
-        train_state.vae_dtype = "fp32"
+        lora_train_state.vae_dtype = "fp32"
     else:
-        train_state.vae_dtype = train_state.weights_dtype
+        lora_train_state.vae_dtype = lora_train_state.weights_dtype
 
-    weights_dtype = _dtype_conversion[train_state.weights_dtype]
-    vae_dtype = _dtype_conversion[train_state.vae_dtype]
+    weights_dtype = _dtype_conversion[lora_train_state.weights_dtype]
+    vae_dtype = _dtype_conversion[lora_train_state.vae_dtype]
 
     models = {}
     models["noise_scheduler"] = DDPMScheduler.from_pretrained(
-        train_state.model_id, subfolder="scheduler"
+        lora_train_state.model_id, subfolder="scheduler"
     )
     models["tokenizer"] = AutoTokenizer.from_pretrained(
-        train_state.model_id,
+        lora_train_state.model_id,
         subfolder="tokenizer",
-        revision=train_state.revision,
+        revision=lora_train_state.revision,
         use_fast=False,
     )
     text_encoder_cls = import_encoder_class_from_model_name_or_path(
-        train_state.model_id, train_state.revision, subfolder="text_encoder"
+        lora_train_state.model_id, lora_train_state.revision, subfolder="text_encoder"
     )
     models["text_encoder"] = text_encoder_cls.from_pretrained(
-        train_state.model_id,
+        lora_train_state.model_id,
         subfolder="text_encoder",
-        revision=train_state.revision,
-        variant=train_state.variant,
+        revision=lora_train_state.revision,
+        variant=lora_train_state.variant,
     )
     models["vae"] = (
-        AutoencoderKL.from_pretrained(train_state.vae_id, subfolder=None)
+        AutoencoderKL.from_pretrained(lora_train_state.vae_id, subfolder=None)
         if (
-            train_state.vae_id
+            lora_train_state.vae_id
             # Need VAE fix for stable diffusion XL, see https://github.com/huggingface/diffusers/pull/4038
         )
         else AutoencoderKL.from_pretrained(
-            train_state.model_id,
+            lora_train_state.model_id,
             subfolder="vae",
-            revision=train_state.revision,
-            variant=train_state.variant,
+            revision=lora_train_state.revision,
+            variant=lora_train_state.variant,
         )
     )
     models["unet"] = UNet2DConditionModel.from_pretrained(
-        train_state.model_id,
+        lora_train_state.model_id,
         subfolder="unet",
-        revision=train_state.revision,
-        variant=train_state.variant,
+        revision=lora_train_state.revision,
+        variant=lora_train_state.variant,
     )
-
     models["image_processor"] = VaeImageProcessor()
-
-    if train_state.add_controlnet:
-        models["controlnet"] = ControlLoRAModel.from_unet(
-            unet=models["unet"],
-            conditioning_channels=train_state.conditioning_channels, 
-            lora_linear_rank=train_state.control_lora_rank_linear, 
-            lora_linear_rank=train_state.control_lora_rank_conv2d,
-            use_dora=train_state.use_dora
-        )
 
     # ===================
     # === Config Lora ===
     # ===================
 
-    for model in train_state.compile_models:
-        models[model] = torch.compile(models[model], backend=train_state.torch_backend)
+    for model in lora_train_state.compile_models:
+        models[model] = torch.compile(models[model], backend=lora_train_state.torch_backend)
 
     # We only train the additional adapter LoRA layers
     if "vae" in models:
@@ -833,18 +811,14 @@ def prepare_models(train_state: TrainState, device):
         models["unet"].requires_grad_(False)
         models["unet"].to(device=device, dtype=weights_dtype)
 
-        if "unet" in train_state.trainable_models:
-            unet_target_ranks = train_state.lora_target_ranks["unet"]
-            unet_ranks = parse_target_ranks(unet_target_ranks)
-
+        if "unet" in lora_train_state.trainable_models:
             models["unet"].add_adapter(
-                LoraConfig( 
-                    r=train_state.lora_rank_linear,
-                    lora_alpha=train_state.lora_rank_linear,
+                LoraConfig(
+                    r=lora_train_state.lora_rank,
+                    lora_alpha=lora_train_state.lora_rank,
                     init_lora_weights="gaussian",
-                    target_modules="|".join(unet_ranks.keys()),
-                    peft_type=unet_ranks,
-                    use_dora=train_state.use_dora
+                    target_modules=lora_train_state.lora_target_modules,
+                    peft_type=lora_train_state.lora_peft_type
                 )
         )
 
@@ -852,40 +826,24 @@ def prepare_models(train_state: TrainState, device):
         models["text_encoder"].requires_grad_(False)
         models["text_encoder"].to(device=device, dtype=weights_dtype)
 
-        if "text_encoder" in train_state.trainable_models:
-            raise NotImplementedError
-            # TODO: Update adapters
+        if "text_encoder" in lora_train_state.trainable_models:
             models["text_encoder"].add_adapter(
                 LoraConfig(
-                    r=train_state.lora_rank,
-                    lora_alpha=train_state.lora_rank,
+                    r=lora_train_state.lora_rank,
+                    lora_alpha=lora_train_state.lora_rank,
                     init_lora_weights="gaussian",
                     target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
                 )
             )
 
-    if "controlnet" in models:
-        # TODO: Update to modern LoRA implementation
-        # TODO: FIX THIS
-        # ...
-
-
-
-    # Sanity check
-    for model_name in train_state.trainable_models:
-        if not model_name in models:
-            raise ValueError(f"Found trainable model {model_name} not in models")
-
-    if train_state.gradient_checkpointing:
-        if "controlnet" in train_state.trainable_models:
-            raise ValueError(f"Cannot enable gradient checkpointing with ControlNet")
-
-        for model_name in train_state.trainable_models:
-            models[model_name].enable_gradient_checkpointing()
+    for model_name in lora_train_state.trainable_models:
+        if model_name in models:
+            if lora_train_state.gradient_checkpointing:
+                models[model_name].enable_gradient_checkpointing()
 
     # Make sure the trainable params are in float32.
     cast_training_params(
-        [models[model_name] for model_name in train_state.trainable_models],
+        [models[model_name] for model_name in lora_train_state.trainable_models],
         dtype=torch.float32,
     )
 
@@ -894,7 +852,7 @@ def prepare_models(train_state: TrainState, device):
 
 def validate_model(
     accelerator,
-    train_state: TrainState,
+    train_state: LoraTrainState,
     dataloader: torch.utils.data.DataLoader,
     models,
     metrics: dict[str, Any],
@@ -925,7 +883,6 @@ def validate_model(
         pipeline_args["unet"] = unwrap_model(accelerator, models["unet"]).to(dtype=weights_dtype, device=accelerator.device)
 
     # TODO: Support SDXL
-    
     pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
         train_state.model_id,
         torch_dtype=weights_dtype,
@@ -1040,7 +997,7 @@ def train_epoch(
     accelerator: Accelerator,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
-    train_state: TrainState,
+    train_state: LoraTrainState,
     dataloader: torch.utils.data.DataLoader,
     models,
     params_to_optimize,
@@ -1209,7 +1166,7 @@ def main(args):
     # ===   Setup script   ===
     # ========================
     config = setup_project(args.config_path)
-    train_state = TrainState(**config)
+    train_state = LoraTrainState(**config)
 
     init_job_id(train_state)
     logging.info(f"Launching script under id: {train_state.job_id}")
@@ -1319,7 +1276,7 @@ def main(args):
             save_model_hook,
             accelerator=accelerator,
             models=models,
-            train_state=train_state,
+            lora_train_state=train_state,
         )
     )
     accelerator.register_load_state_pre_hook(
@@ -1327,7 +1284,7 @@ def main(args):
             load_model_hook,
             accelerator=accelerator,
             models=models,
-            train_state=train_state,
+            lora_train_state=train_state,
         )
     )
 
