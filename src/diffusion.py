@@ -10,7 +10,11 @@ import re
 import torch
 from torch import Tensor
 
-from diffusers import StableDiffusionXLImg2ImgPipeline, StableDiffusionImg2ImgPipeline
+from diffusers import (
+    StableDiffusionXLImg2ImgPipeline,
+    StableDiffusionImg2ImgPipeline,
+    StableDiffusionControlNetImg2ImgPipeline,
+)
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import (
     retrieve_latents,
 )
@@ -18,6 +22,7 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers import AutoencoderKL
 from diffusers.models.controlnet import ControlNetModel, ControlNetOutput
 
+from src.control_lora import ControlLoRAModel
 from src.utils import (
     get_device,
     validate_same_len,
@@ -27,8 +32,8 @@ from src.data import save_image, DynamicDataset, suffixes
 from src.data import save_yaml
 
 
-default_prompt = "dashcam recording, urban driving scene, video, autonomous driving, detailed cars, traffic scene, pandaset, kitti, high resolution, realistic, detailed, camera video, dslr, ultra quality, sharp focus, crystal clear, 8K UHD, 10 Hz capture frequency 1/2.7 CMOS sensor, 1920x1080"
-default_negative_prompt = "face, human features, unrealistic, artifacts, blurry, noisy image, NeRF, oil-painting, art, drawing, poor geometry, oversaturated, undersaturated, distorted, bad image, bad photo"
+default_prompt = ""
+default_negative_prompt = ""
 
 
 @dataclass
@@ -57,8 +62,12 @@ def is_sdxl_vae(model_id: str) -> bool:
 
 
 def prep_model(
-    pipe, device=get_device(), low_mem_mode: bool = False, compile: bool = True
-):
+    pipe: Union[StableDiffusionControlNetImg2ImgPipeline, StableDiffusionImg2ImgPipeline],
+    device: torch.device = get_device(),
+    low_mem_mode: bool = False,
+    compile: bool = True,
+    num_inference_steps: int = 50,
+) -> Union[StableDiffusionControlNetImg2ImgPipeline, StableDiffusionImg2ImgPipeline]:
     if compile:
         try:
             pipe.unet = torch.compile(pipe.unet, fullgraph=True)
@@ -69,6 +78,9 @@ def prep_model(
         pipe.enable_model_cpu_offload()
     else:
         pipe = pipe.to(device)
+
+    pipe.set_progress_bar_config(disable=True)
+    pipe.noise_scheduler.set_timesteps(num_inference_steps)
 
     return pipe
 
@@ -116,49 +128,68 @@ class SDPipe(DiffusionModel):
     def __init__(
         self,
         configs: dict[str, Any] = None,
+        models: dict[str, Any] = None,
         device: torch.device = get_device(),
         **kwargs,
     ) -> None:
         super().__init__()
-        if configs is None:
-            configs = {}
+        configs = configs or {}
+        models = models or {}
 
         configs.update(kwargs)
 
         if "base_model_id" not in configs and "model_id" in configs:
             configs["base_model_id"] = configs["model_id"]
 
+        model_type = configs.get("model_type", "base_sd")
         base_model_id = configs.get("base_model_id", ModelId.sd_v1_5)
         refiner_model_id = configs.get("refiner_model_id", None)
         low_mem_mode = configs.get("low_mem_mode", False)
         compile_model = configs.get("compile_model", False)
+        num_inference_steps = configs.get("num_inference_steps", 50)
+
+        common_kwargs = {
+            "variant": configs.get("variant"),
+            "torch_dtype": DTYPE_CONVERSION[configs.get("dtype", "fp32")],
+            "use_safetensors": True,
+        }
 
         self.use_refiner = refiner_model_id is not None
+
 
         if self.use_refiner:
             raise NotImplementedError
 
-        self.base_pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-            base_model_id,
-            torch_dtype=torch.float16,
-            variant="fp16",
-            use_safetensors=True,
-        )
-        self.base_pipe = prep_model(
-            self.base_pipe,
+        match model_type:
+            case "base_sd":
+                self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+                    base_model_id,
+                    vae=models.get("vae"),
+                    unet=models.get("unet"),
+                    text_encoder=models.get("text_encoder") ** common_kwargs,
+                )
+            case "controlnet":
+                self.pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
+                    base_model_id, **common_kwargs
+                )
+                
+        self.use_controlnet = model_type == "controlnet"
+
+        self.pipe = prep_model(
+            self.pipe,
             low_mem_mode=low_mem_mode,
             device=device,
             compile=compile_model,
+            num_inference_steps=num_inference_steps
         )
 
         if self.use_refiner:
+            raise NotImplementedError
             self.refiner_pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
                 refiner_model_id,
-                text_encoder_2=self.base_pipe.text_encoder_2,
-                vae=self.base_pipe.vae,
-                torch_dtype=torch.float16,
-                use_safetensors=True,
-                variant="fp16",
+                text_encoder_2=self.pipe.text_encoder_2,
+                vae=self.pipe.vae,
+                **common_kwargs,
             )
             self.refiner_pipe = prep_model(
                 self.refiner_pipe,
@@ -166,8 +197,7 @@ class SDPipe(DiffusionModel):
                 device=device,
                 compile=compile_model,
             )
-        self.tokenizer = self.base_pipe.tokenizer
-        self.text_encoder = self.base_pipe.text_encoder
+
         self.device = device
 
     def diffuse_sample(
@@ -190,7 +220,6 @@ class SDPipe(DiffusionModel):
         base_kwargs: dict[str, any] = None,
         refiner_kwargs: dict[str, any] = None,
     ):
-
         image = sample["rgb"]
         batch_size = len(image)
 
@@ -225,7 +254,7 @@ class SDPipe(DiffusionModel):
 
             negative_prompt_embeds = negative_prompt_embeds.expand(batch_size, -1, -1)
 
-        image = self.base_pipe(
+        image = self.pipe(
             image=image,
             generator=base_gen,
             output_type="latent" if self.use_refiner else "pt",
@@ -258,14 +287,6 @@ class SDPipe(DiffusionModel):
             ).images
 
         return {"rgb": image}
-
-    @property
-    def vae(self) -> AutoencoderKL:
-        return self.base_pipe.vae
-
-    @property
-    def image_processor(self) -> VaeImageProcessor:
-        return self.base_pipe.image_processor
 
 
 class SDXLPipe(DiffusionModel):
@@ -403,7 +424,7 @@ def encode_img(
     img: Tensor,
     device,
     seed: int = None,
-    sample_latent: bool = False,
+    sample_mode: str = "sample",
 ) -> Tensor:
     img = img_processor.preprocess(img)
 
@@ -414,18 +435,15 @@ def encode_img(
         img = img.float()
 
     latents = vae.encode(img.to(device))
-    if sample_latent:
-        latents = latents.latent_dist.sample()
-
-    else:
-        if needs_upcasting:
-            vae.to(original_vae_dtype)
-
-        latents = retrieve_latents(
-            latents, generator=(torch.manual_seed(seed) if seed is not None else None)
-        )
-
+    latents = retrieve_latents(
+        latents,
+        generator=(torch.manual_seed(seed) if seed is not None else None),
+        sample_mode=sample_mode,
+    )
     latents = latents * vae.config.scaling_factor
+
+    if needs_upcasting:
+        vae.to(original_vae_dtype)
 
     return latents
 
@@ -603,215 +621,241 @@ def get_ordered_timesteps(
     return timesteps
 
 
-
-
-
-
-
 class PeftCompatibleControlNet(ControlNetModel):
     def forward(
-            self,
-            sample: torch.FloatTensor,
-            timestep: Union[torch.Tensor, float, int],
-            encoder_hidden_states: torch.Tensor,
-            controlnet_cond: torch.FloatTensor,
-            conditioning_scale: float = 1.0,
-            class_labels: Optional[torch.Tensor] = None,
-            timestep_cond: Optional[torch.Tensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
-            cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-            guess_mode: bool = False,
-            return_dict: bool = True,
-        ) -> Union[ControlNetOutput, Tuple[Tuple[torch.FloatTensor, ...], torch.FloatTensor]]:
-            """
-            The [`ControlNetModel`] forward method.
+        self,
+        sample: torch.FloatTensor,
+        timestep: Union[torch.Tensor, float, int],
+        encoder_hidden_states: torch.Tensor,
+        controlnet_cond: torch.FloatTensor,
+        conditioning_scale: float = 1.0,
+        class_labels: Optional[torch.Tensor] = None,
+        timestep_cond: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        guess_mode: bool = False,
+        return_dict: bool = True,
+    ) -> Union[
+        ControlNetOutput, Tuple[Tuple[torch.FloatTensor, ...], torch.FloatTensor]
+    ]:
+        """
+        The [`ControlNetModel`] forward method.
 
-            Args:
-                sample (`torch.FloatTensor`):
-                    The noisy input tensor.
-                timestep (`Union[torch.Tensor, float, int]`):
-                    The number of timesteps to denoise an input.
-                encoder_hidden_states (`torch.Tensor`):
-                    The encoder hidden states.
-                controlnet_cond (`torch.FloatTensor`):
-                    The conditional input tensor of shape `(batch_size, sequence_length, hidden_size)`.
-                conditioning_scale (`float`, defaults to `1.0`):
-                    The scale factor for ControlNet outputs.
-                class_labels (`torch.Tensor`, *optional*, defaults to `None`):
-                    Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
-                timestep_cond (`torch.Tensor`, *optional*, defaults to `None`):
-                    Additional conditional embeddings for timestep. If provided, the embeddings will be summed with the
-                    timestep_embedding passed through the `self.time_embedding` layer to obtain the final timestep
-                    embeddings.
-                attention_mask (`torch.Tensor`, *optional*, defaults to `None`):
-                    An attention mask of shape `(batch, key_tokens)` is applied to `encoder_hidden_states`. If `1` the mask
-                    is kept, otherwise if `0` it is discarded. Mask will be converted into a bias, which adds large
-                    negative values to the attention scores corresponding to "discard" tokens.
-                added_cond_kwargs (`dict`):
-                    Additional conditions for the Stable Diffusion XL UNet.
-                cross_attention_kwargs (`dict[str]`, *optional*, defaults to `None`):
-                    A kwargs dictionary that if specified is passed along to the `AttnProcessor`.
-                guess_mode (`bool`, defaults to `False`):
-                    In this mode, the ControlNet encoder tries its best to recognize the input content of the input even if
-                    you remove all prompts. A `guidance_scale` between 3.0 and 5.0 is recommended.
-                return_dict (`bool`, defaults to `True`):
-                    Whether or not to return a [`~models.controlnet.ControlNetOutput`] instead of a plain tuple.
+        Args:
+            sample (`torch.FloatTensor`):
+                The noisy input tensor.
+            timestep (`Union[torch.Tensor, float, int]`):
+                The number of timesteps to denoise an input.
+            encoder_hidden_states (`torch.Tensor`):
+                The encoder hidden states.
+            controlnet_cond (`torch.FloatTensor`):
+                The conditional input tensor of shape `(batch_size, sequence_length, hidden_size)`.
+            conditioning_scale (`float`, defaults to `1.0`):
+                The scale factor for ControlNet outputs.
+            class_labels (`torch.Tensor`, *optional*, defaults to `None`):
+                Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
+            timestep_cond (`torch.Tensor`, *optional*, defaults to `None`):
+                Additional conditional embeddings for timestep. If provided, the embeddings will be summed with the
+                timestep_embedding passed through the `self.time_embedding` layer to obtain the final timestep
+                embeddings.
+            attention_mask (`torch.Tensor`, *optional*, defaults to `None`):
+                An attention mask of shape `(batch, key_tokens)` is applied to `encoder_hidden_states`. If `1` the mask
+                is kept, otherwise if `0` it is discarded. Mask will be converted into a bias, which adds large
+                negative values to the attention scores corresponding to "discard" tokens.
+            added_cond_kwargs (`dict`):
+                Additional conditions for the Stable Diffusion XL UNet.
+            cross_attention_kwargs (`dict[str]`, *optional*, defaults to `None`):
+                A kwargs dictionary that if specified is passed along to the `AttnProcessor`.
+            guess_mode (`bool`, defaults to `False`):
+                In this mode, the ControlNet encoder tries its best to recognize the input content of the input even if
+                you remove all prompts. A `guidance_scale` between 3.0 and 5.0 is recommended.
+            return_dict (`bool`, defaults to `True`):
+                Whether or not to return a [`~models.controlnet.ControlNetOutput`] instead of a plain tuple.
 
-            Returns:
-                [`~models.controlnet.ControlNetOutput`] **or** `tuple`:
-                    If `return_dict` is `True`, a [`~models.controlnet.ControlNetOutput`] is returned, otherwise a tuple is
-                    returned where the first element is the sample tensor.
-            """
-            # check channel order
-            channel_order = self.config.controlnet_conditioning_channel_order
+        Returns:
+            [`~models.controlnet.ControlNetOutput`] **or** `tuple`:
+                If `return_dict` is `True`, a [`~models.controlnet.ControlNetOutput`] is returned, otherwise a tuple is
+                returned where the first element is the sample tensor.
+        """
+        # check channel order
+        channel_order = self.config.controlnet_conditioning_channel_order
 
-            if channel_order == "rgb":
-                # in rgb order by default
-                ...
-            elif channel_order == "bgr":
-                controlnet_cond = torch.flip(controlnet_cond, dims=[1])
-            else:
-                raise ValueError(f"unknown `controlnet_conditioning_channel_order`: {channel_order}")
-
-            # prepare attention_mask
-            if attention_mask is not None:
-                attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
-                attention_mask = attention_mask.unsqueeze(1)
-
-            # 1. time
-            timesteps = timestep
-            if not torch.is_tensor(timesteps):
-                # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-                # This would be a good case for the `match` statement (Python 3.10+)
-                is_mps = sample.device.type == "mps"
-                if isinstance(timestep, float):
-                    dtype = torch.float32 if is_mps else torch.float64
-                else:
-                    dtype = torch.int32 if is_mps else torch.int64
-                timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
-            elif len(timesteps.shape) == 0:
-                timesteps = timesteps[None].to(sample.device)
-
-            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-            timesteps = timesteps.expand(sample.shape[0])
-
-            t_emb = self.time_proj(timesteps)
-
-            # timesteps does not contain any weights and will always return f32 tensors
-            # but time_embedding might actually be running in fp16. so we need to cast here.
-            # there might be better ways to encapsulate this.
-            t_emb = t_emb.to(dtype=sample.dtype)
-
-            emb = self.time_embedding(t_emb, timestep_cond)
-            aug_emb = None
-
-            if self.class_embedding is not None:
-                if class_labels is None:
-                    raise ValueError("class_labels should be provided when num_class_embeds > 0")
-
-                if self.config.class_embed_type == "timestep":
-                    class_labels = self.time_proj(class_labels)
-
-                class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
-                emb = emb + class_emb
-
-            if self.config.addition_embed_type is not None:
-                if self.config.addition_embed_type == "text":
-                    aug_emb = self.add_embedding(encoder_hidden_states)
-
-                elif self.config.addition_embed_type == "text_time":
-                    if "text_embeds" not in added_cond_kwargs:
-                        raise ValueError(
-                            f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `text_embeds` to be passed in `added_cond_kwargs`"
-                        )
-                    text_embeds = added_cond_kwargs.get("text_embeds")
-                    if "time_ids" not in added_cond_kwargs:
-                        raise ValueError(
-                            f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `time_ids` to be passed in `added_cond_kwargs`"
-                        )
-                    time_ids = added_cond_kwargs.get("time_ids")
-                    time_embeds = self.add_time_proj(time_ids.flatten())
-                    time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
-
-                    add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
-                    add_embeds = add_embeds.to(emb.dtype)
-                    aug_emb = self.add_embedding(add_embeds)
-
-            emb = emb + aug_emb if aug_emb is not None else emb
-
-            # 2. pre-process
-            sample = self.conv_in(sample)
-
-            controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
-            sample = sample + controlnet_cond
-
-            # 3. down
-            down_block_res_samples = (sample,)
-            for downsample_block in self.down_blocks:
-                if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
-                    sample, res_samples = downsample_block(
-                        hidden_states=sample,
-                        temb=emb,
-                        encoder_hidden_states=encoder_hidden_states,
-                        attention_mask=attention_mask,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                    )
-                else:
-                    sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
-
-                down_block_res_samples += res_samples
-
-            # 4. mid
-            if self.mid_block is not None:
-                if hasattr(self.mid_block, "has_cross_attention") and self.mid_block.has_cross_attention:
-                    sample = self.mid_block(
-                        sample,
-                        emb,
-                        encoder_hidden_states=encoder_hidden_states,
-                        attention_mask=attention_mask,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                    )
-                else:
-                    sample = self.mid_block(sample, emb)
-
-            # 5. Control net blocks
-
-            controlnet_down_block_res_samples = ()
-
-            #controlnet_down_blocks = next((b for a, b in self.controlnet_down_blocks.named_children() if a == "modules_to_save"))["default"]
-            controlnet_down_blocks = next((b for a, b in self.controlnet_down_blocks.named_children() if a == "original_module"))
-            for down_block_res_sample, controlnet_block in zip(down_block_res_samples, controlnet_down_blocks):
-                down_block_res_sample = controlnet_block(down_block_res_sample)
-                controlnet_down_block_res_samples = controlnet_down_block_res_samples + (down_block_res_sample,)
-
-            down_block_res_samples = controlnet_down_block_res_samples
-
-            mid_block_res_sample = self.controlnet_mid_block(sample)
-
-            # 6. scaling
-            if guess_mode and not self.config.global_pool_conditions:
-                scales = torch.logspace(-1, 0, len(down_block_res_samples) + 1, device=sample.device)  # 0.1 to 1.0
-                scales = scales * conditioning_scale
-                down_block_res_samples = [sample * scale for sample, scale in zip(down_block_res_samples, scales)]
-                mid_block_res_sample = mid_block_res_sample * scales[-1]  # last one
-            else:
-                down_block_res_samples = [sample * conditioning_scale for sample in down_block_res_samples]
-                mid_block_res_sample = mid_block_res_sample * conditioning_scale
-
-            if self.config.global_pool_conditions:
-                down_block_res_samples = [
-                    torch.mean(sample, dim=(2, 3), keepdim=True) for sample in down_block_res_samples
-                ]
-                mid_block_res_sample = torch.mean(mid_block_res_sample, dim=(2, 3), keepdim=True)
-
-            if not return_dict:
-                return (down_block_res_samples, mid_block_res_sample)
-
-            return ControlNetOutput(
-                down_block_res_samples=down_block_res_samples, mid_block_res_sample=mid_block_res_sample
+        if channel_order == "rgb":
+            # in rgb order by default
+            ...
+        elif channel_order == "bgr":
+            controlnet_cond = torch.flip(controlnet_cond, dims=[1])
+        else:
+            raise ValueError(
+                f"unknown `controlnet_conditioning_channel_order`: {channel_order}"
             )
 
+        # prepare attention_mask
+        if attention_mask is not None:
+            attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
+            attention_mask = attention_mask.unsqueeze(1)
+
+        # 1. time
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+            # This would be a good case for the `match` statement (Python 3.10+)
+            is_mps = sample.device.type == "mps"
+            if isinstance(timestep, float):
+                dtype = torch.float32 if is_mps else torch.float64
+            else:
+                dtype = torch.int32 if is_mps else torch.int64
+            timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
+        elif len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(sample.device)
+
+        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        timesteps = timesteps.expand(sample.shape[0])
+
+        t_emb = self.time_proj(timesteps)
+
+        # timesteps does not contain any weights and will always return f32 tensors
+        # but time_embedding might actually be running in fp16. so we need to cast here.
+        # there might be better ways to encapsulate this.
+        t_emb = t_emb.to(dtype=sample.dtype)
+
+        emb = self.time_embedding(t_emb, timestep_cond)
+        aug_emb = None
+
+        if self.class_embedding is not None:
+            if class_labels is None:
+                raise ValueError(
+                    "class_labels should be provided when num_class_embeds > 0"
+                )
+
+            if self.config.class_embed_type == "timestep":
+                class_labels = self.time_proj(class_labels)
+
+            class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
+            emb = emb + class_emb
+
+        if self.config.addition_embed_type is not None:
+            if self.config.addition_embed_type == "text":
+                aug_emb = self.add_embedding(encoder_hidden_states)
+
+            elif self.config.addition_embed_type == "text_time":
+                if "text_embeds" not in added_cond_kwargs:
+                    raise ValueError(
+                        f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `text_embeds` to be passed in `added_cond_kwargs`"
+                    )
+                text_embeds = added_cond_kwargs.get("text_embeds")
+                if "time_ids" not in added_cond_kwargs:
+                    raise ValueError(
+                        f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `time_ids` to be passed in `added_cond_kwargs`"
+                    )
+                time_ids = added_cond_kwargs.get("time_ids")
+                time_embeds = self.add_time_proj(time_ids.flatten())
+                time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
+
+                add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
+                add_embeds = add_embeds.to(emb.dtype)
+                aug_emb = self.add_embedding(add_embeds)
+
+        emb = emb + aug_emb if aug_emb is not None else emb
+
+        # 2. pre-process
+        sample = self.conv_in(sample)
+
+        controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
+        sample = sample + controlnet_cond
+
+        # 3. down
+        down_block_res_samples = (sample,)
+        for downsample_block in self.down_blocks:
+            if (
+                hasattr(downsample_block, "has_cross_attention")
+                and downsample_block.has_cross_attention
+            ):
+                sample, res_samples = downsample_block(
+                    hidden_states=sample,
+                    temb=emb,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=attention_mask,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                )
+            else:
+                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+
+            down_block_res_samples += res_samples
+
+        # 4. mid
+        if self.mid_block is not None:
+            if (
+                hasattr(self.mid_block, "has_cross_attention")
+                and self.mid_block.has_cross_attention
+            ):
+                sample = self.mid_block(
+                    sample,
+                    emb,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=attention_mask,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                )
+            else:
+                sample = self.mid_block(sample, emb)
+
+        # 5. Control net blocks
+
+        controlnet_down_block_res_samples = ()
+
+        # controlnet_down_blocks = next((b for a, b in self.controlnet_down_blocks.named_children() if a == "modules_to_save"))["default"]
+        controlnet_down_blocks = next(
+            (
+                b
+                for a, b in self.controlnet_down_blocks.named_children()
+                if a == "original_module"
+            )
+        )
+        for down_block_res_sample, controlnet_block in zip(
+            down_block_res_samples, controlnet_down_blocks
+        ):
+            down_block_res_sample = controlnet_block(down_block_res_sample)
+            controlnet_down_block_res_samples = controlnet_down_block_res_samples + (
+                down_block_res_sample,
+            )
+
+        down_block_res_samples = controlnet_down_block_res_samples
+
+        mid_block_res_sample = self.controlnet_mid_block(sample)
+
+        # 6. scaling
+        if guess_mode and not self.config.global_pool_conditions:
+            scales = torch.logspace(
+                -1, 0, len(down_block_res_samples) + 1, device=sample.device
+            )  # 0.1 to 1.0
+            scales = scales * conditioning_scale
+            down_block_res_samples = [
+                sample * scale for sample, scale in zip(down_block_res_samples, scales)
+            ]
+            mid_block_res_sample = mid_block_res_sample * scales[-1]  # last one
+        else:
+            down_block_res_samples = [
+                sample * conditioning_scale for sample in down_block_res_samples
+            ]
+            mid_block_res_sample = mid_block_res_sample * conditioning_scale
+
+        if self.config.global_pool_conditions:
+            down_block_res_samples = [
+                torch.mean(sample, dim=(2, 3), keepdim=True)
+                for sample in down_block_res_samples
+            ]
+            mid_block_res_sample = torch.mean(
+                mid_block_res_sample, dim=(2, 3), keepdim=True
+            )
+
+        if not return_dict:
+            return (down_block_res_samples, mid_block_res_sample)
+
+        return ControlNetOutput(
+            down_block_res_samples=down_block_res_samples,
+            mid_block_res_sample=mid_block_res_sample,
+        )
 
 
 def get_matching(model, patterns: Iterable[Union[re.Pattern, str]] = (".*",)):
@@ -825,7 +869,6 @@ def get_matching(model, patterns: Iterable[Union[re.Pattern, str]] = (".*",)):
             if pattern.match(name):
                 li.append((name, mod))
     return li
-
 
 
 def parse_target_ranks(target_ranks, prefix=r""):
@@ -853,15 +896,12 @@ def parse_target_ranks(target_ranks, prefix=r""):
 
             case "upblocks":
                 assert isinstance(item, dict)
-                parsed_targets.update(
-                    parse_target_ranks(item, rf"{prefix}.*up_blocks")
-                )
+                parsed_targets.update(parse_target_ranks(item, rf"{prefix}.*up_blocks"))
 
             case "attn":
                 assert isinstance(item, int)
                 parsed_targets[f"{prefix}.*attn.*to_[kvq]"] = item
-                parsed_targets[ rf"{prefix}.*attn.*to_out\.0"] = item
-
+                parsed_targets[rf"{prefix}.*attn.*to_out\.0"] = item
 
             case "resnet":
                 assert isinstance(item, int)
@@ -882,3 +922,11 @@ def parse_target_ranks(target_ranks, prefix=r""):
                 raise NotImplementedError(f"Unrecognized target: {name}")
 
     return parsed_targets
+
+
+LOWER_DTYPES = {"fp16", "bf16"}
+DTYPE_CONVERSION = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}

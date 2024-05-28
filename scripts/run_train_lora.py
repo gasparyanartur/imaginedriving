@@ -13,6 +13,8 @@ from src.data import get_meta_word
 from src.diffusion import get_diffusion_cls, parse_target_ranks
 from src.diffusion import get_random_timesteps
 from src.diffusion import get_ordered_timesteps
+from src.diffusion import LOWER_DTYPES
+from src.diffusion import DTYPE_CONVERSION
 from src.utils import nearest_multiple
 import torch.utils
 import torch.utils.data
@@ -69,6 +71,7 @@ from src.diffusion import tokenize_prompt
 from src.diffusion import encode_tokens
 from src.utils import get_env
 from src.control_lora import ControlLoRAModel
+from src.diffusion import SDPipe
 
 
 check_min_version("0.27.0")
@@ -110,6 +113,7 @@ class TrainState:
     train_noise_num_steps: int = None
     val_noise_num_steps: int = 30
     val_noise_strength: float = 0.25
+    use_cached_tokens: bool = True
 
     keep_vae_full: bool = False
 
@@ -224,14 +228,6 @@ class TrainState:
     use_recreation_loss: bool = False
 
     seed: int = None
-
-
-_lower_dtypes = {"fp16", "bf16"}
-_dtype_conversion = {
-    "fp32": torch.float32,
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-}
 
 
 def init_job_id(train_state: TrainState) -> None:
@@ -531,7 +527,7 @@ def load_model_hook(
         )
 
     # Make sure the trainable params are in float32.
-    if train_state.weights_dtype in _lower_dtypes:
+    if train_state.weights_dtype in LOWER_DTYPES:
         models_to_cast = [
             loaded_model
             for model_name, loaded_model in loaded_models_dict.items()
@@ -764,8 +760,8 @@ def prepare_models(train_state: TrainState, device):
     else:
         train_state.vae_dtype = train_state.weights_dtype
 
-    weights_dtype = _dtype_conversion[train_state.weights_dtype]
-    vae_dtype = _dtype_conversion[train_state.vae_dtype]
+    weights_dtype = DTYPE_CONVERSION[train_state.weights_dtype]
+    vae_dtype = DTYPE_CONVERSION[train_state.vae_dtype]
 
     models = {}
     models["noise_scheduler"] = DDPMScheduler.from_pretrained(
@@ -866,9 +862,8 @@ def prepare_models(train_state: TrainState, device):
 
     if "controlnet" in models:
         # TODO: Update to modern LoRA implementation
-        # TODO: FIX THIS
-        # ...
-
+        # TODO: Determine if this needs to be set right 
+        ...
 
 
     # Sanity check
@@ -906,49 +901,54 @@ def validate_model(
     if using_wandb:
         import wandb
 
-    weights_dtype = _dtype_conversion[train_state.weights_dtype]
-    vae_dtype = _dtype_conversion[train_state.vae_dtype]
-    noise_scheduler = models["noise_scheduler"]
+    weights_dtype = DTYPE_CONVERSION[train_state.weights_dtype]
+    vae_dtype = DTYPE_CONVERSION[train_state.vae_dtype]
+
+    assert "noise_scheduler" in models and "unet" in models
+
 
     # create pipeline
-    pipeline_args = {}
+    pipeline_args = {
+        "model_type": "sd_base", "model_id": train_state.model_id,
+        "torch_dtype": weights_dtype,
+        "revision": train_state.revision,
+        "variant": train_state.variant,
+        "num_inference_steps": train_state.val_noise_num_steps
+    }
+    pipeline_models = {"scheduler": noise_scheduler}
 
     if "vae" in models:
-        pipeline_args["vae"] = models["vae"].to(dtype=vae_dtype, device=accelerator.device)
+        pipeline_models["vae"] = models["vae"].to(dtype=vae_dtype, device=accelerator.device)
 
     if "text_encoder" in models:
-        pipeline_args["text_encoder"] = unwrap_model(
+        pipeline_models["text_encoder"] = unwrap_model(
             accelerator, models["text_encoder"]
         ).to(dtype=weights_dtype, device=accelerator.device)
 
     if "unet" in models:
-        pipeline_args["unet"] = unwrap_model(accelerator, models["unet"]).to(dtype=weights_dtype, device=accelerator.device)
+        pipeline_models["unet"] = unwrap_model(accelerator, models["unet"]).to(dtype=weights_dtype, device=accelerator.device)
 
-    # TODO: Support SDXL
-    
-    pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
-        train_state.model_id,
-        torch_dtype=weights_dtype,
-        revision=train_state.revision,
-        variant=train_state.variant,
-        **pipeline_args,
-    )
+    if "controlnet" in models:
+        pipeline_models["controlnet"] = unwrap_model(accelerator, models["model"]).to(dtype=weights_dtype, device=accelerator.device)
 
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-    noise_scheduler.set_timesteps(train_state.val_noise_num_steps)
+    pipeline = SDPipe(pipeline_args, pipeline_models, accelerator.device)
+    noise_scheduler = pipeline.pipe.noise_scheduler
 
     # Often we end up using the same prompt, just reuse the previous one then, no need to re-embed
-    use_cached_tokens = not "text_encoder" in train_state.trainable_models
+    use_cached_tokens = (not "text_encoder" in train_state.trainable_models) and train_state.use_cached_tokens
     cached_input_ids = None
     cached_prompt_embeds = None
 
     for step, batch in enumerate(dataloader):
         pipeline_kwargs = {}
 
-        pipeline_kwargs["image"] = batch["rgb"].to(dtype=vae_dtype, device=accelerator.device)
+        pipeline_kwargs["rgb"] = batch["rgb"].to(dtype=vae_dtype, device=accelerator.device)
         batch_size = len(batch["rgb"])
         random_seeds = np.arange(batch_size * step, batch_size * (step + 1))
+
+        if "controlnet" in models:
+            for conditioning in train_state.conditioning_signals:
+                pipeline_kwargs[conditioning] = batch[conditioning]
 
         pipeline_kwargs["generator"] = [
             torch.Generator(device=accelerator.device).manual_seed(int(seed))
@@ -957,7 +957,7 @@ def validate_model(
 
         if "input_ids" in batch:
             if use_cached_tokens and cached_input_ids and torch.all(batch["input_ids"] == cached_input_ids):
-                pipeline_kwargs["prompt_embeds"] = cached_prompt_embeds.to(device=accelerator.device)
+                pipeline_kwargs["prompt_embeds"] = cached_prompt_embeds
             else:
                 with torch.no_grad():
                     pipeline_kwargs["prompt_embeds"] = encode_tokens(
@@ -968,11 +968,13 @@ def validate_model(
 
                 if use_cached_tokens:
                     cached_input_ids = batch["input_ids"]
-                    cached_prompt_embeds = pipeline_kwargs["prompt_embeds"].cpu()
+                    cached_prompt_embeds = pipeline_kwargs["prompt_embeds"]
 
         output_imgs = pipeline(
             **pipeline_kwargs,
-            output_type="pt",
+            model_kwargs={
+                    
+            }
             strength=train_state.val_noise_strength,
         ).images.to(dtype=weights_dtype, device=accelerator.device)
 
@@ -1046,8 +1048,8 @@ def train_epoch(
     params_to_optimize,
     progress_bar: tqdm.tqdm,
 ):
-    weights_dtype = _dtype_conversion[train_state.weights_dtype]
-    vae_dtype = _dtype_conversion[train_state.vae_dtype]
+    weights_dtype = DTYPE_CONVERSION[train_state.weights_dtype]
+    vae_dtype = DTYPE_CONVERSION[train_state.vae_dtype]
     using_sdxl = is_sdxl_model(train_state.model_id)
     noise_scheduler = models["noise_scheduler"]
 
@@ -1225,7 +1227,7 @@ def main(args):
 
     accelerator = Accelerator(
         gradient_accumulation_steps=train_state.gradient_accumulation_steps,
-        mixed_precision=train_state.weights_dtype if train_state.weights_dtype in _lower_dtypes else "no",
+        mixed_precision=train_state.weights_dtype if train_state.weights_dtype in LOWER_DTYPES else "no",
         log_with=train_state.loggers,
         project_config=ProjectConfiguration(
             project_dir=train_state.output_dir,
