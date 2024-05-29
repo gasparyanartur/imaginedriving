@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import logging
 import re
+import itertools as it
 
 import torch
 from torch import nn, Tensor
@@ -56,6 +57,8 @@ DTYPE_CONVERSION = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
 }
+
+CN_SIGNAL_PATTERN = re.compile(r"cn_(?P<type>\w+)_(?P<num_channels>\d+)_(?P<note>\w+)")
 
 
 def _make_metric(name, device, **kwargs):
@@ -112,6 +115,88 @@ def prep_hf_pipe(
     return pipe
 
 
+
+def _prepare_image(kwargs, image):
+    image = batch_if_not_iterable(image)
+    batch_size = len(image)
+
+    if image.size(1) == 3:
+        channel_first = True
+    elif image.size(3) == 3:
+        channel_first = False
+    else:
+        raise ValueError(f"Image needs to be BCHW or BHWC, received {image.shape}")
+
+    if not channel_first:
+        image = image.permute(0, 3, 1, 2)  # Diffusion model is channel first
+
+    kwargs["image"] = image
+    return channel_first, batch_size
+
+
+def _prepare_prompt(sample: dict[str, Any], tokenizer: CLIPTokenizer, text_encoder: CLIPTextModel, batch_size: int) -> None:
+    # Convert any existing prompts to prompt embeddings, utilizing memoization.
+    # Ensure there is at least one prompt embedding passed to the pipeline.
+    prompt_embed_keys = []
+    for prefix, suffix in it.product(["", "negative_"], ["", "_two"]):
+        prompt_key = f"{prefix}prompt{suffix}"
+        prompt_embed_key = f"{prefix}prompt_embeds{suffix}"
+
+        if prompt_key in sample:
+            prompt_embed_keys.append(prompt_embed_key)
+            prompt = sample.pop(prompt_key)
+            if prompt_embed_key not in sample:
+                with torch.no_grad():
+                    sample[prompt_embed_key] = embed_prompt(
+                        tokenizer, text_encoder, prompt
+                    )
+
+        if prompt_embed_key in sample:
+            prompt_embed_keys.append(prompt_embed_key)
+
+    # If no promp embed keys were passed, create one from an empty prompt
+    if not prompt_embed_keys:
+        prompt_embed_keys.append("prompt_embeds")
+        with torch.no_grad():
+            sample["prompt_embeds"] = embed_prompt(
+                tokenizer, text_encoder, ""
+            )
+
+    # Ensure batch size of prompts matches batch size of images
+    for prompt_embed_key in prompt_embed_keys:
+        sample[prompt_key] = batch_if_not_iterable(sample[prompt_key], single_dim=2)
+
+        embed_size = sample[prompt_embed_key].shape
+        if embed_size[0] == 1 and batch_size > 1:
+            sample[prompt_embed_key] = sample[prompt_embed_key].expand(
+                batch_size * embed_size[0], embed_size[1], embed_size[2]
+            )
+
+
+def _prepare_generator(sample: dict["str", Any], batch_size: int):
+    if "generator" in sample:
+        sample["generator"] = batch_if_not_iterable(sample["generator"])
+        if (
+            len(sample["generator"]) <= 1
+            and batch_size > 1
+        ):
+            raise ValueError(f"Number of generators must match number of images")
+
+
+@dataclass(init=True, slots=True, frozen=True)
+class ConditioningSignalInfo:
+    type: str
+    num_channels: int
+    note: str
+    name: str
+
+    @staticmethod
+    def from_signal_name(name: str):
+        group = CN_SIGNAL_PATTERN.match(name).groupdict()
+        group["num_channels"] = int(group["num_channels"])
+        return ConditioningSignalInfo(**group)
+
+
 @dataclass
 class DiffusionModelConfig:
     model_type: str = DiffusionModelType.sd
@@ -139,10 +224,16 @@ class DiffusionModelConfig:
 
     losses: Tuple[str, ...] = ("mse",)
 
-
-@dataclass
-class ControlNetConfig:
     conditioning_signals: Tuple[str, ...] = ()
+    """ The name of the conditioning signals used for the controlnet.
+
+        The signal should match the format `cn_{type}_{dim}_{note}`. 
+            Eg. cn_rgb_3_frontleft, cn_depth_1_frone.
+        During inference, the input must contain this signal as a key.
+
+        Does nothing unless the model is a controlnet.
+    """
+
 
 
 class DiffusionModel(ABC):
@@ -150,7 +241,10 @@ class DiffusionModel(ABC):
 
     @abstractmethod
     def get_diffusion_output(
-        self, sample: Dict[str, Any], *args, **kwargs
+        self, sample: Dict[str, Any],
+        pipeline_kwargs: Optional[Dict[str, Any]] = None,
+        *args,
+        **kwargs
     ) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -186,6 +280,8 @@ class DiffusionModel(ABC):
         return model(config=config, **kwargs)
 
 
+
+
 class MockDiffusionModel(DiffusionModel):
     def __init__(
         self, config: DiffusionModelConfig, device=get_device(), *args, **kwargs
@@ -205,6 +301,7 @@ class MockDiffusionModel(DiffusionModel):
     def get_diffusion_output(
         self,
         sample: Dict[str, Any],
+        pipeline_kwargs: Optional[Dict[str, Any]] = None,
         *args,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -246,7 +343,6 @@ class MockDiffusionModel(DiffusionModel):
             loss_dict[loss_name] = loss(rgb_pred, rgb_gt)
 
         return loss_dict
-
 
 
 class StableDiffusionModel(DiffusionModel):
@@ -305,6 +401,7 @@ class StableDiffusionModel(DiffusionModel):
     def get_diffusion_output(
         self,
         sample: Dict[str, Any],
+        pipeline_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         """Denoise image with diffusion model.
@@ -323,79 +420,166 @@ class StableDiffusionModel(DiffusionModel):
         - original_size (sdxl)
         - target_size (sdxl)
         """
-        image = sample["rgb"]
-        image = batch_if_not_iterable(image)
-
         batch_size = len(image)
 
-        if image.size(1) == 3:
-            channel_first = True
-        elif image.size(3) == 3:
-            channel_first = False
-        else:
-            raise ValueError(f"Image needs to be BCHW or BHWC, received {image.shape}")
-
-        if not channel_first:
-            image = image.permute(0, 3, 1, 2)  # Diffusion model is channel first
-
-        kwargs = kwargs or {}
-        kwargs["image"] = image
-        kwargs["output_type"] = kwargs.get("output_type", "pt")
-        kwargs["strength"] = kwargs.get("strength", self.config.noise_strength)
-        kwargs["num_inference_steps"] = kwargs.get(
+        pipeline_kwargs = pipeline_kwargs or {}
+        pipeline_kwargs["image"] = sample["rgb"]
+        pipeline_kwargs["output_type"] = pipeline_kwargs.get("output_type", "pt")
+        pipeline_kwargs["strength"] = pipeline_kwargs.get("strength", self.config.noise_strength)
+        pipeline_kwargs["num_inference_steps"] = pipeline_kwargs.get(
             "num_inference_steps", self.config.num_inference_steps
         )
 
-        if "generator" in kwargs:
-            kwargs["generator"] = batch_if_not_iterable(kwargs["generator"])
+        channel_first, batch_size = _prepare_image(pipeline_kwargs)
+        _prepare_generator(pipeline_kwargs)
+        _prepare_prompt(pipeline_kwargs, self.pipe.tokenizer, self.pipe.text_encoder, batch_size)
 
-
-        if (
-            "generator" in kwargs
-            and len(kwargs["generator"]) <= 1
-            and batch_size > 1
-        ):
-            raise ValueError(f"Number of generators must match number of images")
-
-        # Convert any existing prompts to prompt embeddings, utilizing memoization.
-        # Ensure there is at least one prompt embedding passed to the pipeline.
-        prompt_embed_keys = []
-        for prefix, suffix in it.product(["", "negative_"], ["", "_two"]):
-            prompt_key = f"{prefix}prompt{suffix}"
-            prompt_embed_key = f"{prefix}prompt_embeds{suffix}"
-
-            if prompt_key in kwargs:
-                prompt_embed_keys.append(prompt_embed_key)
-                prompt = kwargs.pop(prompt_key)
-                if prompt_embed_key not in kwargs:
-                    with torch.no_grad():
-                        kwargs[prompt_embed_key] = embed_prompt(
-                            self.pipe.tokenizer, self.pipe.text_encoder, prompt
-                        )
-
-            if prompt_embed_key in kwargs:
-                prompt_embed_keys.append(prompt_embed_key)
-
-        # If no promp embed keys were passed, create one from an empty prompt
-        if not prompt_embed_keys:
-            prompt_embed_keys.append("prompt_embeds")
-            with torch.no_grad():
-                kwargs["prompt_embeds"] = embed_prompt(
-                    self.pipe.tokenizer, self.pipe.text_encoder, ""
-                )
-
-        # Ensure batch size of prompts matches batch size of images
-        for prompt_embed_key in prompt_embed_keys:
-            kwargs[prompt_key] = batch_if_not_iterable(kwargs[prompt_key], single_dim=2)
-
-            embed_size = kwargs[prompt_embed_key].shape
-            if embed_size[0] == 1 and batch_size > 1:
-                kwargs[prompt_embed_key] = kwargs[prompt_embed_key].expand(
-                    batch_size * embed_size[0], embed_size[1], embed_size[2]
-                )
 
         image = self.pipe(
-            **kwargs,
+            **pipeline_kwargs,
+        ).images
+
+        if isinstance(image, list):
+            image = torch.stack(image)
+
+        if not channel_first:
+            image = image.permute(0, 2, 3, 1)
+
+        return {"rgb": image}
+
+    def get_diffusion_metrics(
+        self, batch_pred: Dict[str, Any], batch_gt: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        # Currently only handles RGB case, assumes all metrics take in an RGB image.
+        rgb_pred = batch_pred["rgb"]
+        rgb_gt = batch_gt["rgb"]
+
+        return {
+            metric_name: metric(rgb_pred, rgb_gt)
+            for metric_name, metric in self.diffusion_metrics.items()
+        }
+
+    def get_diffusion_losses(
+        self,
+        batch_pred: Dict[str, Any],
+        batch_gt: Dict[str, Any],
+        metrics_dict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # Currently only handles RGB case, assumes all metrics take in an RGB image.
+        rgb_pred = batch_pred["rgb"]
+        rgb_gt = batch_gt["rgb"]
+
+        loss_dict = {}
+        for loss_name, loss in self.diffusion_losses.items():
+            if loss_name in metrics_dict:
+                loss_dict[loss_name] = metrics_dict[loss_name]
+                continue
+
+            loss_dict[loss_name] = loss(rgb_pred, rgb_gt)
+
+        return loss_dict
+
+
+
+class ControlNetDiffusionModel(DiffusionModel):
+    def __init__(
+        self,
+        config: DiffusionModelConfig,
+        device: torch.device = get_device(),
+        dtype: torch.dtype = torch.float16,
+        use_safetensors: bool = True,
+        variant: Optional[str] = None,
+        unet: UNet2DConditionModel = None,
+        vae: AutoencoderKL = None,
+        tokenizer: CLIPTokenizer = None,
+        scheduler: KarrasDiffusionSchedulers = None,
+        controlnet: ControlNetModel = None,
+        verbose: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+
+        self.config = config
+        self.device = device
+
+        # For now, assume each image based signal always
+        for signal_name in self.config.conditioning_signals:
+            signal_info = ConditioningSignalInfo.from_signal_name(signal_name)
+
+                
+
+        self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+            config.model_id,
+            torch_dtype=dtype,
+            variant=variant,
+            use_safetensors=use_safetensors,
+            unet=unet,
+            vae=vae,
+            tokenizer=tokenizer,
+            scheduler=scheduler
+        )
+
+        self.pipe = prep_hf_pipe(
+            self.pipe,
+            low_mem_mode=config.low_mem_mode,
+            device=device,
+            compile=config.compile_model,
+            num_inference_steps=config.num_inference_steps
+        )
+
+        if config.lora_weights:
+            self.pipe.load_lora_weights(config.lora_weights)
+
+        if verbose:
+            logging.info(f"Ignoring unrecognized kwargs: {kwargs.keys()}")
+
+        self.diffusion_metrics = {
+            metric_name: _make_metric(metric_name, device)
+            for metric_name in config.metrics
+        }
+        self.diffusion_losses = {
+            loss_name: _make_metric(loss_name, device) for loss_name in config.losses
+        }
+
+    def get_diffusion_output(
+        self,
+        sample: Dict[str, Any],
+        pipeline_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ):
+        """Denoise image with diffusion model.
+
+        Interesting kwargs:
+        - image
+        - generator
+        - output_type
+        - strength
+        - num_inference_steps
+        - prompt_embeds
+        - negative_prompt_embeds
+
+        - denoising_start (sdxl)
+        - denoising_end (sdxl)
+        - original_size (sdxl)
+        - target_size (sdxl)
+        """
+        batch_size = len(image)
+
+        pipeline_kwargs = pipeline_kwargs or {}
+        pipeline_kwargs["image"] = sample["rgb"]
+        pipeline_kwargs["output_type"] = pipeline_kwargs.get("output_type", "pt")
+        pipeline_kwargs["strength"] = pipeline_kwargs.get("strength", self.config.noise_strength)
+        pipeline_kwargs["num_inference_steps"] = pipeline_kwargs.get(
+            "num_inference_steps", self.config.num_inference_steps
+        )
+
+        channel_first, batch_size = _prepare_image(pipeline_kwargs)
+        _prepare_generator(pipeline_kwargs)
+        _prepare_prompt(pipeline_kwargs, self.pipe.tokenizer, self.pipe.text_encoder, batch_size)
+
+
+        image = self.pipe(
+            **pipeline_kwargs,
         ).images
 
         if isinstance(image, list):
