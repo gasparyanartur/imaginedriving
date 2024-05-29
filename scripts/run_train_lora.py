@@ -71,7 +71,7 @@ from src.diffusion import tokenize_prompt
 from src.diffusion import encode_tokens
 from src.utils import get_env
 from src.control_lora import ControlLoRAModel
-from src.diffusion import SDPipe
+from src.diffusion import StableDiffusionModel, DiffusionModelConfig
 
 
 check_min_version("0.27.0")
@@ -931,7 +931,7 @@ def validate_model(
     if "controlnet" in models:
         pipeline_models["controlnet"] = unwrap_model(accelerator, models["model"]).to(dtype=weights_dtype, device=accelerator.device)
 
-    pipeline = SDPipe(pipeline_args, pipeline_models, accelerator.device)
+    pipeline = StableDiffusionModel(pipeline_args, accelerator.device, dtype=weights_dtype, **pipeline_models)
     noise_scheduler = pipeline.pipe.noise_scheduler
 
     # Often we end up using the same prompt, just reuse the previous one then, no need to re-embed

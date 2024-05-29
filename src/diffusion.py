@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Union, Optional, Tuple, Dict, Iterable, Any
+from typing import Union, Optional, Tuple, Dict, Iterable, Any, List
 from functools import lru_cache
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -8,10 +8,9 @@ import logging
 import re
 
 import torch
-from torch import Tensor
+from torch import nn, Tensor
 
 from diffusers import (
-    StableDiffusionXLImg2ImgPipeline,
     StableDiffusionImg2ImgPipeline,
     StableDiffusionControlNetImg2ImgPipeline,
 )
@@ -20,7 +19,23 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2im
 )
 from diffusers.image_processor import VaeImageProcessor
 from diffusers import AutoencoderKL
-from diffusers.models.controlnet import ControlNetModel, ControlNetOutput
+from diffusers.models.controlnet import ControlNetModel, ControlNetOutput, UNet2DConditionModel, AutoencoderKL
+from diffusers.schedulers import KarrasDiffusionSchedulers
+
+from diffusers import StableDiffusionImg2ImgPipeline
+from diffusers.image_processor import VaeImageProcessor
+from diffusers import AutoencoderKL
+
+
+import torchvision
+
+torchvision.disable_beta_transforms_warning()
+from torchvision.transforms import v2 as transform
+from torchmetrics.image import PeakSignalNoiseRatio
+
+from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+
+from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
 from src.control_lora import ControlLoRAModel
 from src.utils import (
@@ -35,33 +50,42 @@ from src.data import save_yaml
 default_prompt = ""
 default_negative_prompt = ""
 
+LOWER_DTYPES = {"fp16", "bf16"}
+DTYPE_CONVERSION = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
+
+
+def _make_metric(name, device, **kwargs):
+    match name:
+        case "psnr":
+            metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
+
+        case "mse":
+            metric = nn.MSELoss().to(device)
+
+        case _:
+            raise NotImplementedError
+
+    return metric
 
 @dataclass
-class ModelId:
+class DiffusionModelId:
     sd_v1_5 = "runwayml/stable-diffusion-v1-5"
     sd_v2_1 = "stabilityai/stable-diffusion-2-1"
     sdxl_base_v1_0 = "stabilityai/stable-diffusion-xl-base-1.0"
     sdxl_refiner_v1_0 = "stabilityai/stable-diffusion-xl-refiner-1.0"
     sdxl_turbo_v1_0 = "stabilityai/sdxl-turbo"
 
+@dataclass
+class DiffusionModelType:
+    sd: str = "sd"
+    cn: str = "cn"
+    mock: str = "mock"
 
-sdxl_models = {
-    ModelId.sdxl_base_v1_0,
-    ModelId.sdxl_refiner_v1_0,
-    ModelId.sdxl_turbo_v1_0,
-}
-sd_models = {ModelId.sd_v1_5}
-
-
-def is_sdxl_model(model_id: str) -> bool:
-    return model_id in sdxl_models
-
-
-def is_sdxl_vae(model_id: str) -> bool:
-    return model_id == "madebyollin/sdxl-vae-fp16-fix" or is_sdxl_model(model_id)
-
-
-def prep_model(
+def prep_hf_pipe(
     pipe: Union[StableDiffusionControlNetImg2ImgPipeline, StableDiffusionImg2ImgPipeline],
     device: torch.device = get_device(),
     low_mem_mode: bool = False,
@@ -82,340 +106,337 @@ def prep_model(
     pipe.set_progress_bar_config(disable=True)
     pipe.noise_scheduler.set_timesteps(num_inference_steps)
 
+    pipe.safety_checker = None
+    pipe.requires_safety_checker = False
+
     return pipe
 
 
+@dataclass
+class DiffusionModelConfig:
+    model_type: str = DiffusionModelType.sd
+    model_id: str = DiffusionModelId.sd_v2_1
+
+    low_mem_mode: bool = False
+    """If applicable, prioritize options which lower GPU memory requirements at the expense of performance."""
+
+    compile_model: bool = False
+    """If applicable, compile Diffusion pipeline using available torch backend."""
+
+    lora_weights: Optional[str] = None
+    """Path to lora weights for the base diffusion model. Loads if applicable."""
+
+    noise_strength: Optional[float] = 0.2
+    """How much noise to apply during inference. 1.0 means complete gaussian."""
+
+    num_inference_steps: Optional[int] = 50
+    """Across how many timesteps the diffusion denoising occurs. Higher number gives better diffusion at expense of performance."""
+
+    enable_progress_bar: bool = False
+    """Create a progress bar for the denoising timesteps during inference."""
+
+    metrics: Tuple[str, ...] = ("psnr", "mse")
+
+    losses: Tuple[str, ...] = ("mse",)
+
+
+@dataclass
+class ControlNetConfig:
+    conditioning_signals: Tuple[str, ...] = ()
+
+
 class DiffusionModel(ABC):
-    load_model = None
+    config: DiffusionModelConfig
 
     @abstractmethod
-    def diffuse_sample(self, sample: dict[str, Any], *args, **kwargs) -> dict[str, Any]:
+    def get_diffusion_output(
+        self, sample: Dict[str, Any], *args, **kwargs
+    ) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def diffuse_to_dir(
+    @abstractmethod
+    def get_diffusion_metrics(
+        self, batch_pred: Dict[str, Any], batch_gt: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_diffusion_losses(
         self,
-        src_dataset: DynamicDataset,
-        dst_dir: Path,
-        id_range: tuple[int, int, int] = None,
-        **kwargs,
-    ) -> None:
-        assert "meta" in src_dataset.data_getters
-
-        dst_dir.mkdir(exist_ok=True, parents=True)
-
-        id_range = id_range or (0, 0, 0)
-        for sample in src_dataset.iter_range(*id_range, verbose=True):
-            meta = sample["meta"]
-            dst_path = dst_dir / meta["dataset"] / meta["scene"] / meta["sample"]
-            dst_path = dst_path.with_suffix(suffixes["rgb", src_dataset.name])
-            dst_path.parent.mkdir(exist_ok=True, parents=True)
-
-            diff_img = self.diffuse_sample(sample, **kwargs)["rgb"]
-            save_image(dst_path, diff_img)
-
-    @property
-    @abstractmethod
-    def vae(self):
+        batch_pred: Dict[str, Any],
+        batch_gt: Dict[str, Any],
+        metrics_dict: Dict[str, Any],
+    ) -> Dict[str, Any]:
         raise NotImplementedError
 
-    @property
-    @abstractmethod
-    def image_processor(self):
-        raise NotImplementedError
+    @classmethod
+    def from_config(cls, config: DiffusionModelConfig, **kwargs) -> "DiffusionModel":
+        model_type_to_constructor = {
+            DiffusionModelType.sd: StableDiffusionModel,
+            DiffusionModelType.cn: ControlNetDiffusionModel,
+            DiffusionModelType.mock: MockDiffusionModel,
+        }
+        model = model_type_to_constructor[config.model_type]
+
+        if config.compile_model and config.lora_weights:
+            logging.warning(
+                "Compiling the model currently leads to a bug when a LoRA is loaded, proceed with caution"
+            )
+
+        return model(config=config, **kwargs)
 
 
-class SDPipe(DiffusionModel):
+class MockDiffusionModel(DiffusionModel):
     def __init__(
-        self,
-        configs: dict[str, Any] = None,
-        models: dict[str, Any] = None,
-        device: torch.device = get_device(),
-        **kwargs,
+        self, config: DiffusionModelConfig, device=get_device(), *args, **kwargs
     ) -> None:
         super().__init__()
-        configs = configs or {}
-        models = models or {}
+        self.mse = nn.MSELoss()
+        self.config = config
 
-        configs.update(kwargs)
-
-        if "base_model_id" not in configs and "model_id" in configs:
-            configs["base_model_id"] = configs["model_id"]
-
-        model_type = configs.get("model_type", "base_sd")
-        base_model_id = configs.get("base_model_id", ModelId.sd_v1_5)
-        refiner_model_id = configs.get("refiner_model_id", None)
-        low_mem_mode = configs.get("low_mem_mode", False)
-        compile_model = configs.get("compile_model", False)
-        num_inference_steps = configs.get("num_inference_steps", 50)
-
-        common_kwargs = {
-            "variant": configs.get("variant"),
-            "torch_dtype": DTYPE_CONVERSION[configs.get("dtype", "fp32")],
-            "use_safetensors": True,
+        self.diffusion_metrics = {
+            metric_name: _make_metric(metric_name, device)
+            for metric_name in config.metrics
+        }
+        self.diffusion_losses = {
+            loss_name: _make_metric(loss_name, device) for loss_name in config.losses
         }
 
-        self.use_refiner = refiner_model_id is not None
-
-
-        if self.use_refiner:
-            raise NotImplementedError
-
-        match model_type:
-            case "base_sd":
-                self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-                    base_model_id,
-                    vae=models.get("vae"),
-                    unet=models.get("unet"),
-                    text_encoder=models.get("text_encoder") ** common_kwargs,
-                )
-            case "controlnet":
-                self.pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
-                    base_model_id, **common_kwargs
-                )
-                
-        self.use_controlnet = model_type == "controlnet"
-
-        self.pipe = prep_model(
-            self.pipe,
-            low_mem_mode=low_mem_mode,
-            device=device,
-            compile=compile_model,
-            num_inference_steps=num_inference_steps
-        )
-
-        if self.use_refiner:
-            raise NotImplementedError
-            self.refiner_pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-                refiner_model_id,
-                text_encoder_2=self.pipe.text_encoder_2,
-                vae=self.pipe.vae,
-                **common_kwargs,
-            )
-            self.refiner_pipe = prep_model(
-                self.refiner_pipe,
-                low_mem_mode=low_mem_mode,
-                device=device,
-                compile=compile_model,
-            )
-
-        self.device = device
-
-    def diffuse_sample(
+    def get_diffusion_output(
         self,
-        sample: dict[str, Any],
-        base_strength: float = 0.2,
-        refiner_strength: float = 0.2,
-        base_denoising_start: int = None,
-        base_denoising_end: int = None,
-        refiner_denoising_start: int = None,
-        refiner_denoising_end: int = None,
-        original_size: tuple[int, int] = (1024, 1024),
-        target_size: tuple[int, int] = (1024, 1024),
-        prompt: str = default_prompt,
-        negative_prompt: str = default_negative_prompt,
-        base_num_steps: int = 50,
-        refiner_num_steps: int = 50,
-        base_gen: torch.Generator | Iterable[torch.Generator] = None,
-        refiner_gen: torch.Generator | Iterable[torch.Generator] = None,
-        base_kwargs: dict[str, any] = None,
-        refiner_kwargs: dict[str, any] = None,
-    ):
+        sample: Dict[str, Any],
+        *args,
+        **kwargs,
+    ) -> Dict[str, Any]:
         image = sample["rgb"]
-        batch_size = len(image)
 
-        image = batch_if_not_iterable(image)
-        base_gen = batch_if_not_iterable(base_gen)
-        refiner_gen = batch_if_not_iterable(refiner_gen)
-        validate_same_len(image, base_gen, refiner_gen)
-
-        if base_gen:
-            base_gen = base_gen * batch_size
-
-        if refiner_gen:
-            refiner_gen = refiner_gen * batch_size
-
-        base_kwargs = base_kwargs or {}
-        if prompt is not None:
-            with torch.no_grad():
-                tokens = tokenize_prompt(self.tokenizer, prompt).to(self.device)
-                prompt_embeds = encode_tokens(
-                    self.text_encoder, tokens, using_sdxl=False
-                )["embeds"]
-            prompt_embeds = prompt_embeds.expand(batch_size, -1, -1)
-
-        if negative_prompt is not None:
-            with torch.no_grad():
-                negative_tokens = tokenize_prompt(self.tokenizer, negative_prompt).to(
-                    self.device
-                )
-                negative_prompt_embeds = encode_tokens(
-                    self.text_encoder, negative_tokens, using_sdxl=False
-                )["embeds"]
-
-            negative_prompt_embeds = negative_prompt_embeds.expand(batch_size, -1, -1)
-
-        image = self.pipe(
-            image=image,
-            generator=base_gen,
-            output_type="latent" if self.use_refiner else "pt",
-            strength=base_strength,
-            denoising_start=base_denoising_start,
-            denoising_end=base_denoising_end,
-            num_inference_steps=base_num_steps,
-            original_size=original_size,
-            target_size=target_size,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            **base_kwargs,
-        ).images
-
-        if self.use_refiner:
-            refiner_kwargs = refiner_kwargs or {}
-            image = self.refiner_pipe(
-                image=image,
-                generator=refiner_gen,
-                output_type="pt",
-                strength=refiner_strength,
-                denoising_start=refiner_denoising_start,
-                denoising_end=refiner_denoising_end,
-                num_inference_steps=refiner_num_steps,
-                original_size=original_size,
-                target_size=target_size,
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                **refiner_kwargs,
-            ).images
+        if len(image.shape) == 3:
+            image = image[None, ...]
 
         return {"rgb": image}
 
+    def get_diffusion_metrics(
+        self, batch_pred: Dict[str, Any], batch_gt: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        # Currently only handles RGB case, assumes all metrics take in an RGB image.
+        rgb_pred = batch_pred["rgb"]
+        rgb_gt = batch_gt["rgb"]
 
-class SDXLPipe(DiffusionModel):
+        return {
+            metric_name: metric(rgb_pred, rgb_gt)
+            for metric_name, metric in self.diffusion_metrics.items()
+        }
+
+    def get_diffusion_losses(
+        self,
+        batch_pred: Dict[str, Any],
+        batch_gt: Dict[str, Any],
+        metrics_dict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # Currently only handles RGB case, assumes all metrics take in an RGB image.
+        rgb_pred = batch_pred["rgb"]
+        rgb_gt = batch_gt["rgb"]
+
+        loss_dict = {}
+        for loss_name, loss in self.diffusion_losses.items():
+            if loss_name in metrics_dict:
+                loss_dict[loss_name] = metrics_dict[loss_name]
+                continue
+
+            loss_dict[loss_name] = loss(rgb_pred, rgb_gt)
+
+        return loss_dict
+
+
+
+class StableDiffusionModel(DiffusionModel):
     def __init__(
         self,
-        configs: dict[str, Any] = None,
+        config: DiffusionModelConfig,
         device: torch.device = get_device(),
+        dtype: torch.dtype = torch.float16,
+        use_safetensors: bool = True,
+        variant: Optional[str] = None,
+        unet: UNet2DConditionModel = None,
+        vae: AutoencoderKL = None,
+        tokenizer: CLIPTokenizer = None,
+        scheduler: KarrasDiffusionSchedulers = None,
+        verbose: bool = True,
+        **kwargs,
     ) -> None:
         super().__init__()
-        # TODO: add model compilation
-        # TODO: Combine with regular SD pipe
-        raise NotImplementedError
 
-        if configs is None:
-            configs = {
-                "base_model_id": ModelId.sdxl_base_v1_0,
-                "refiner_model_id": None,
-            }
+        self.config = config
+        self.device = device
 
-        base_model_id = configs.get("base_model_id")
-        refiner_model_id = configs.get("refiner_model_id")
-        low_mem_mode = configs.get("low_mem_mode")
-        self.use_refiner = refiner_model_id is not None
-
-        self.base_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-            base_model_id,
-            torch_dtype=torch.float16,
-            variant="fp16",
-            use_safetensors=True,
+        self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+            config.model_id,
+            torch_dtype=dtype,
+            variant=variant,
+            use_safetensors=use_safetensors,
+            unet=unet,
+            vae=vae,
+            tokenizer=tokenizer,
+            scheduler=scheduler
         )
 
-        if low_mem_mode:
-            self.base_pipe.enable_model_cpu_offload()
-        else:
-            self.base_pipe = self.base_pipe.to(device)
+        self.pipe = prep_hf_pipe(
+            self.pipe,
+            low_mem_mode=config.low_mem_mode,
+            device=device,
+            compile=config.compile_model,
+            num_inference_steps=config.num_inference_steps
+        )
 
-        if self.use_refiner:
-            self.refiner_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                refiner_model_id,
-                text_encoder_2=self.base_pipe.text_encoder_2,
-                vae=self.base_pipe.vae,
-                torch_dtype=torch.float16,
-                use_safetensors=True,
-                variant="fp16",
-            )
+        if config.lora_weights:
+            self.pipe.load_lora_weights(config.lora_weights)
 
-            if low_mem_mode:
-                self.refiner_pipe.enable_model_cpu_offload()
-            else:
-                self.refiner_pipe = self.refiner_pipe.to(device)
+        if verbose:
+            logging.info(f"Ignoring unrecognized kwargs: {kwargs.keys()}")
 
-    def diffuse_sample(
+        self.diffusion_metrics = {
+            metric_name: _make_metric(metric_name, device)
+            for metric_name in config.metrics
+        }
+        self.diffusion_losses = {
+            loss_name: _make_metric(loss_name, device) for loss_name in config.losses
+        }
+
+    def get_diffusion_output(
         self,
-        sample: dict[str, Any],
-        base_strength: float = 0.2,
-        refiner_strength: float = 0.2,
-        base_denoising_start: int = None,
-        base_denoising_end: int = None,
-        refiner_denoising_start: int = None,
-        refiner_denoising_end: int = None,
-        original_size: tuple[int, int] = (1024, 1024),
-        target_size: tuple[int, int] = (1024, 1024),
-        prompt: str = default_prompt,
-        negative_prompt: str = default_negative_prompt,
-        base_num_steps: int = 50,
-        refiner_num_steps: int = 50,
-        base_gen: torch.Generator | Iterable[torch.Generator] = None,
-        refiner_gen: torch.Generator | Iterable[torch.Generator] = None,
-        base_kwargs: dict[str, any] = None,
-        refiner_kwargs: dict[str, any] = None,
+        sample: Dict[str, Any],
+        **kwargs,
     ):
+        """Denoise image with diffusion model.
+
+        Interesting kwargs:
+        - image
+        - generator
+        - output_type
+        - strength
+        - num_inference_steps
+        - prompt_embeds
+        - negative_prompt_embeds
+
+        - denoising_start (sdxl)
+        - denoising_end (sdxl)
+        - original_size (sdxl)
+        - target_size (sdxl)
+        """
         image = sample["rgb"]
-
         image = batch_if_not_iterable(image)
-        base_gen = batch_if_not_iterable(base_gen)
-        refiner_gen = batch_if_not_iterable(refiner_gen)
-        validate_same_len(image, base_gen, refiner_gen)
 
-        base_kwargs = base_kwargs or {}
-        image = self.base_pipe(
-            image=image,
-            generator=base_gen,
-            output_type="latent" if self.use_refiner else "pt",
-            strength=base_strength,
-            denoising_start=base_denoising_start,
-            denoising_end=base_denoising_end,
-            num_inference_steps=base_num_steps,
-            original_size=original_size,
-            target_size=target_size,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            **base_kwargs,
+        batch_size = len(image)
+
+        if image.size(1) == 3:
+            channel_first = True
+        elif image.size(3) == 3:
+            channel_first = False
+        else:
+            raise ValueError(f"Image needs to be BCHW or BHWC, received {image.shape}")
+
+        if not channel_first:
+            image = image.permute(0, 3, 1, 2)  # Diffusion model is channel first
+
+        kwargs = kwargs or {}
+        kwargs["image"] = image
+        kwargs["output_type"] = kwargs.get("output_type", "pt")
+        kwargs["strength"] = kwargs.get("strength", self.config.noise_strength)
+        kwargs["num_inference_steps"] = kwargs.get(
+            "num_inference_steps", self.config.num_inference_steps
+        )
+
+        if "generator" in kwargs:
+            kwargs["generator"] = batch_if_not_iterable(kwargs["generator"])
+
+
+        if (
+            "generator" in kwargs
+            and len(kwargs["generator"]) <= 1
+            and batch_size > 1
+        ):
+            raise ValueError(f"Number of generators must match number of images")
+
+        # Convert any existing prompts to prompt embeddings, utilizing memoization.
+        # Ensure there is at least one prompt embedding passed to the pipeline.
+        prompt_embed_keys = []
+        for prefix, suffix in it.product(["", "negative_"], ["", "_two"]):
+            prompt_key = f"{prefix}prompt{suffix}"
+            prompt_embed_key = f"{prefix}prompt_embeds{suffix}"
+
+            if prompt_key in kwargs:
+                prompt_embed_keys.append(prompt_embed_key)
+                prompt = kwargs.pop(prompt_key)
+                if prompt_embed_key not in kwargs:
+                    with torch.no_grad():
+                        kwargs[prompt_embed_key] = embed_prompt(
+                            self.pipe.tokenizer, self.pipe.text_encoder, prompt
+                        )
+
+            if prompt_embed_key in kwargs:
+                prompt_embed_keys.append(prompt_embed_key)
+
+        # If no promp embed keys were passed, create one from an empty prompt
+        if not prompt_embed_keys:
+            prompt_embed_keys.append("prompt_embeds")
+            with torch.no_grad():
+                kwargs["prompt_embeds"] = embed_prompt(
+                    self.pipe.tokenizer, self.pipe.text_encoder, ""
+                )
+
+        # Ensure batch size of prompts matches batch size of images
+        for prompt_embed_key in prompt_embed_keys:
+            kwargs[prompt_key] = batch_if_not_iterable(kwargs[prompt_key], single_dim=2)
+
+            embed_size = kwargs[prompt_embed_key].shape
+            if embed_size[0] == 1 and batch_size > 1:
+                kwargs[prompt_embed_key] = kwargs[prompt_embed_key].expand(
+                    batch_size * embed_size[0], embed_size[1], embed_size[2]
+                )
+
+        image = self.pipe(
+            **kwargs,
         ).images
 
-        if self.use_refiner:
-            refiner_kwargs = refiner_kwargs or {}
-            image = self.refiner_pipe(
-                image=image,
-                generator=refiner_gen,
-                output_type="pt",
-                strength=refiner_strength,
-                denoising_start=refiner_denoising_start,
-                denoising_end=refiner_denoising_end,
-                num_inference_steps=refiner_num_steps,
-                original_size=original_size,
-                target_size=target_size,
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                **refiner_kwargs,
-            ).images
+        if isinstance(image, list):
+            image = torch.stack(image)
+
+        if not channel_first:
+            image = image.permute(0, 2, 3, 1)
 
         return {"rgb": image}
 
-    @property
-    def vae(self) -> AutoencoderKL:
-        return self.base_pipe.vae
+    def get_diffusion_metrics(
+        self, batch_pred: Dict[str, Any], batch_gt: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        # Currently only handles RGB case, assumes all metrics take in an RGB image.
+        rgb_pred = batch_pred["rgb"]
+        rgb_gt = batch_gt["rgb"]
 
-    @property
-    def image_processor(self) -> VaeImageProcessor:
-        return self.base_pipe.image_processor
+        return {
+            metric_name: metric(rgb_pred, rgb_gt)
+            for metric_name, metric in self.diffusion_metrics.items()
+        }
 
+    def get_diffusion_losses(
+        self,
+        batch_pred: Dict[str, Any],
+        batch_gt: Dict[str, Any],
+        metrics_dict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # Currently only handles RGB case, assumes all metrics take in an RGB image.
+        rgb_pred = batch_pred["rgb"]
+        rgb_gt = batch_gt["rgb"]
 
-model_name_to_constructor = {
-    "sdxl_base": SDXLPipe,
-    "sdxl_full": SDXLPipe,
-    "sd_base": SDPipe,
-    "sd_full": SDPipe,
-    None: SDXLPipe,
-}
+        loss_dict = {}
+        for loss_name, loss in self.diffusion_losses.items():
+            if loss_name in metrics_dict:
+                loss_dict[loss_name] = metrics_dict[loss_name]
+                continue
+
+            loss_dict[loss_name] = loss(rgb_pred, rgb_gt)
+
+        return loss_dict
 
 
 def encode_img(
@@ -493,55 +514,10 @@ def get_noised_img(img, timestep, pipe, noise_scheduler, seed=None):
     return img_pred
 
 
-def load_img2img_model(
-    model_config_params: dict[str, Any], device=get_device()
-) -> DiffusionModel:
-    logging.info(f"Loading diffusion model...")
-
-    model_name = model_config_params.get("model_name")
-    constructor = model_name_to_constructor.get(model_name)
-    if not constructor:
-        raise NotImplementedError
-
-    model = constructor(configs=model_config_params, device=device)
-    logging.info(f"Finished loading diffusion model")
-    return model
-
-
-DiffusionModel.load_model = load_img2img_model
-
-
-def diffusion_from_config_to_dir(
-    src_dataset: DynamicDataset,
-    dst_dir: Path,
-    model_config: dict[str, Any],
-    model: DiffusionModel = None,
-    id_range: tuple[int, int, int] = None,
-    device=get_device(),
-):
-    if model_config is not None:
-        model_config_params = model_config["model_config_params"]
-        model_forward_params = model_config["model_forward_params"]
-    else:
-        model_config_params = {}
-        model_forward_params = {}
-
-    if model is None:
-        model = load_img2img_model(
-            model_config_params=model_config_params, device=device
-        )
-
-    dst_dir.mkdir(exist_ok=True, parents=True)
-    model.diffuse_to_dir(
-        src_dataset, dst_dir, id_range=id_range, **model_forward_params
-    )
-    save_yaml(dst_dir / "config.yml", model_config)
-
-    logging.info(f"Finished diffusion.")
-
-
 @lru_cache(maxsize=4)
-def tokenize_prompt(tokenizer, prompt):
+def tokenize_prompt(
+    tokenizer: CLIPTokenizer, prompt: Union[str, Iterable[str]]
+) -> torch.Tensor:
     text_inputs = tokenizer(
         prompt,
         padding="max_length",
@@ -553,23 +529,43 @@ def tokenize_prompt(tokenizer, prompt):
     return tokens
 
 
-def encode_tokens(text_encoder, tokens, using_sdxl):
-    if using_sdxl:
-        raise NotImplementedError
+def encode_tokens(
+    text_encoder: Union[CLIPTextModel, CLIPTextModelWithProjection],
+    tokens: torch.Tensor,
+) -> torch.Tensor:
+    prompt_embeds = text_encoder(tokens.to(text_encoder.device))
+    return prompt_embeds.last_hidden_state
 
-    prompt_embeds = text_encoder(tokens)
 
-    return {"embeds": prompt_embeds.last_hidden_state}
+@lru_cache(maxsize=4)
+def _embed_hashable_prompt(
+    tokenizer: CLIPTokenizer,
+    text_encoder: Union[CLIPTextModel, CLIPTextModelWithProjection],
+    prompt: Union[str, Tuple[str, ...]],
+) -> torch.Tensor:
+    tokens = tokenize_prompt(tokenizer, prompt)
+    embeddings = encode_tokens(text_encoder, tokens)
+    return embeddings
 
 
-def get_diffusion_cls(
-    model_id: str,
-) -> StableDiffusionImg2ImgPipeline | StableDiffusionXLImg2ImgPipeline:
-    if is_sdxl_model(model_id):
-        return StableDiffusionXLImg2ImgPipeline
+def embed_prompt(
+    tokenizer: CLIPTokenizer,
+    text_encoder: Union[CLIPTextModel, CLIPTextModelWithProjection],
+    prompt: Union[str, Tuple[str, ...]],
+    use_cache: bool = True
+) -> torch.Tensor:
+    if not isinstance(
+        prompt, str
+    ):  # Convert list to tuple to make it hashable for memoization
+        prompt = tuple(prompt)
+
+    if use_cache:
+        embeddings = _embed_hashable_prompt(tokenizer, text_encoder, prompt)
     else:
-        return StableDiffusionImg2ImgPipeline
-
+        tokens = tokenize_prompt(tokenizer, prompt)
+        embeddings = encode_tokens(text_encoder, tokens)
+    
+    return embeddings
 
 def get_random_timesteps(noise_strength, total_num_timesteps, device, batch_size):
     # Sample a random timestep for each image
@@ -619,243 +615,6 @@ def get_ordered_timesteps(
             torch.linspace(start_step, end_step, num_timesteps, device=device)
         ).to(torch.long)
     return timesteps
-
-
-class PeftCompatibleControlNet(ControlNetModel):
-    def forward(
-        self,
-        sample: torch.FloatTensor,
-        timestep: Union[torch.Tensor, float, int],
-        encoder_hidden_states: torch.Tensor,
-        controlnet_cond: torch.FloatTensor,
-        conditioning_scale: float = 1.0,
-        class_labels: Optional[torch.Tensor] = None,
-        timestep_cond: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
-        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        guess_mode: bool = False,
-        return_dict: bool = True,
-    ) -> Union[
-        ControlNetOutput, Tuple[Tuple[torch.FloatTensor, ...], torch.FloatTensor]
-    ]:
-        """
-        The [`ControlNetModel`] forward method.
-
-        Args:
-            sample (`torch.FloatTensor`):
-                The noisy input tensor.
-            timestep (`Union[torch.Tensor, float, int]`):
-                The number of timesteps to denoise an input.
-            encoder_hidden_states (`torch.Tensor`):
-                The encoder hidden states.
-            controlnet_cond (`torch.FloatTensor`):
-                The conditional input tensor of shape `(batch_size, sequence_length, hidden_size)`.
-            conditioning_scale (`float`, defaults to `1.0`):
-                The scale factor for ControlNet outputs.
-            class_labels (`torch.Tensor`, *optional*, defaults to `None`):
-                Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
-            timestep_cond (`torch.Tensor`, *optional*, defaults to `None`):
-                Additional conditional embeddings for timestep. If provided, the embeddings will be summed with the
-                timestep_embedding passed through the `self.time_embedding` layer to obtain the final timestep
-                embeddings.
-            attention_mask (`torch.Tensor`, *optional*, defaults to `None`):
-                An attention mask of shape `(batch, key_tokens)` is applied to `encoder_hidden_states`. If `1` the mask
-                is kept, otherwise if `0` it is discarded. Mask will be converted into a bias, which adds large
-                negative values to the attention scores corresponding to "discard" tokens.
-            added_cond_kwargs (`dict`):
-                Additional conditions for the Stable Diffusion XL UNet.
-            cross_attention_kwargs (`dict[str]`, *optional*, defaults to `None`):
-                A kwargs dictionary that if specified is passed along to the `AttnProcessor`.
-            guess_mode (`bool`, defaults to `False`):
-                In this mode, the ControlNet encoder tries its best to recognize the input content of the input even if
-                you remove all prompts. A `guidance_scale` between 3.0 and 5.0 is recommended.
-            return_dict (`bool`, defaults to `True`):
-                Whether or not to return a [`~models.controlnet.ControlNetOutput`] instead of a plain tuple.
-
-        Returns:
-            [`~models.controlnet.ControlNetOutput`] **or** `tuple`:
-                If `return_dict` is `True`, a [`~models.controlnet.ControlNetOutput`] is returned, otherwise a tuple is
-                returned where the first element is the sample tensor.
-        """
-        # check channel order
-        channel_order = self.config.controlnet_conditioning_channel_order
-
-        if channel_order == "rgb":
-            # in rgb order by default
-            ...
-        elif channel_order == "bgr":
-            controlnet_cond = torch.flip(controlnet_cond, dims=[1])
-        else:
-            raise ValueError(
-                f"unknown `controlnet_conditioning_channel_order`: {channel_order}"
-            )
-
-        # prepare attention_mask
-        if attention_mask is not None:
-            attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
-            attention_mask = attention_mask.unsqueeze(1)
-
-        # 1. time
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            # This would be a good case for the `match` statement (Python 3.10+)
-            is_mps = sample.device.type == "mps"
-            if isinstance(timestep, float):
-                dtype = torch.float32 if is_mps else torch.float64
-            else:
-                dtype = torch.int32 if is_mps else torch.int64
-            timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
-        elif len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
-
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
-
-        t_emb = self.time_proj(timesteps)
-
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=sample.dtype)
-
-        emb = self.time_embedding(t_emb, timestep_cond)
-        aug_emb = None
-
-        if self.class_embedding is not None:
-            if class_labels is None:
-                raise ValueError(
-                    "class_labels should be provided when num_class_embeds > 0"
-                )
-
-            if self.config.class_embed_type == "timestep":
-                class_labels = self.time_proj(class_labels)
-
-            class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
-            emb = emb + class_emb
-
-        if self.config.addition_embed_type is not None:
-            if self.config.addition_embed_type == "text":
-                aug_emb = self.add_embedding(encoder_hidden_states)
-
-            elif self.config.addition_embed_type == "text_time":
-                if "text_embeds" not in added_cond_kwargs:
-                    raise ValueError(
-                        f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `text_embeds` to be passed in `added_cond_kwargs`"
-                    )
-                text_embeds = added_cond_kwargs.get("text_embeds")
-                if "time_ids" not in added_cond_kwargs:
-                    raise ValueError(
-                        f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `time_ids` to be passed in `added_cond_kwargs`"
-                    )
-                time_ids = added_cond_kwargs.get("time_ids")
-                time_embeds = self.add_time_proj(time_ids.flatten())
-                time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
-
-                add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
-                add_embeds = add_embeds.to(emb.dtype)
-                aug_emb = self.add_embedding(add_embeds)
-
-        emb = emb + aug_emb if aug_emb is not None else emb
-
-        # 2. pre-process
-        sample = self.conv_in(sample)
-
-        controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
-        sample = sample + controlnet_cond
-
-        # 3. down
-        down_block_res_samples = (sample,)
-        for downsample_block in self.down_blocks:
-            if (
-                hasattr(downsample_block, "has_cross_attention")
-                and downsample_block.has_cross_attention
-            ):
-                sample, res_samples = downsample_block(
-                    hidden_states=sample,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states,
-                    attention_mask=attention_mask,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                )
-            else:
-                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
-
-            down_block_res_samples += res_samples
-
-        # 4. mid
-        if self.mid_block is not None:
-            if (
-                hasattr(self.mid_block, "has_cross_attention")
-                and self.mid_block.has_cross_attention
-            ):
-                sample = self.mid_block(
-                    sample,
-                    emb,
-                    encoder_hidden_states=encoder_hidden_states,
-                    attention_mask=attention_mask,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                )
-            else:
-                sample = self.mid_block(sample, emb)
-
-        # 5. Control net blocks
-
-        controlnet_down_block_res_samples = ()
-
-        # controlnet_down_blocks = next((b for a, b in self.controlnet_down_blocks.named_children() if a == "modules_to_save"))["default"]
-        controlnet_down_blocks = next(
-            (
-                b
-                for a, b in self.controlnet_down_blocks.named_children()
-                if a == "original_module"
-            )
-        )
-        for down_block_res_sample, controlnet_block in zip(
-            down_block_res_samples, controlnet_down_blocks
-        ):
-            down_block_res_sample = controlnet_block(down_block_res_sample)
-            controlnet_down_block_res_samples = controlnet_down_block_res_samples + (
-                down_block_res_sample,
-            )
-
-        down_block_res_samples = controlnet_down_block_res_samples
-
-        mid_block_res_sample = self.controlnet_mid_block(sample)
-
-        # 6. scaling
-        if guess_mode and not self.config.global_pool_conditions:
-            scales = torch.logspace(
-                -1, 0, len(down_block_res_samples) + 1, device=sample.device
-            )  # 0.1 to 1.0
-            scales = scales * conditioning_scale
-            down_block_res_samples = [
-                sample * scale for sample, scale in zip(down_block_res_samples, scales)
-            ]
-            mid_block_res_sample = mid_block_res_sample * scales[-1]  # last one
-        else:
-            down_block_res_samples = [
-                sample * conditioning_scale for sample in down_block_res_samples
-            ]
-            mid_block_res_sample = mid_block_res_sample * conditioning_scale
-
-        if self.config.global_pool_conditions:
-            down_block_res_samples = [
-                torch.mean(sample, dim=(2, 3), keepdim=True)
-                for sample in down_block_res_samples
-            ]
-            mid_block_res_sample = torch.mean(
-                mid_block_res_sample, dim=(2, 3), keepdim=True
-            )
-
-        if not return_dict:
-            return (down_block_res_samples, mid_block_res_sample)
-
-        return ControlNetOutput(
-            down_block_res_samples=down_block_res_samples,
-            mid_block_res_sample=mid_block_res_sample,
-        )
 
 
 def get_matching(model, patterns: Iterable[Union[re.Pattern, str]] = (".*",)):
@@ -924,9 +683,4 @@ def parse_target_ranks(target_ranks, prefix=r""):
     return parsed_targets
 
 
-LOWER_DTYPES = {"fp16", "bf16"}
-DTYPE_CONVERSION = {
-    "fp32": torch.float32,
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-}
+
