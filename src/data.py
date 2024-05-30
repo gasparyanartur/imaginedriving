@@ -7,6 +7,7 @@ from pathlib import Path
 import json
 import yaml
 from functools import cache
+import re
 
 import numpy as np
 import pandas as pd
@@ -14,26 +15,33 @@ import torch
 from torch.utils.data import Dataset
 from torch import Tensor
 import torchvision
-torchvision.disable_beta_transforms_warning(); from torchvision.transforms import v2 as tvtf
+
+torchvision.disable_beta_transforms_warning()
+from torchvision.transforms import v2 as tvtf
 import torchvision
 import logging
 
 from src.utils import get_env, set_env, set_if_no_key
 
 
-
-
 norm_img_pipeline = tvtf.Compose([tvtf.ConvertImageDtype(torch.float32)])
-norm_img_crop_pipeline = tvtf.Compose([tvtf.ConvertImageDtype(torch.float32), tvtf.CenterCrop((1024, 1024)), tvtf.Resize((512, 512))])
+norm_img_crop_pipeline = tvtf.Compose(
+    [
+        tvtf.ConvertImageDtype(torch.float32),
+        tvtf.CenterCrop((1024, 1024)),
+        tvtf.Resize((512, 512)),
+    ]
+)
 suffixes = {
     ("rgb", "pandaset"): ".jpg",
     ("rgb", "neurad"): ".jpg",
-    ("lidar", "pandaset"): ".pkl.gz", 
+    ("lidar", "pandaset"): ".pkl.gz",
     ("lidar", "neurad"): ".pkl.gz",
     ("pose", "pandaset"): ".json",
-    ("intrinsics", "pandaset"): ".json"
+    ("intrinsics", "pandaset"): ".json",
 }
 RANGE_SEP = ":"
+CN_SIGNAL_PATTERN = re.compile(r"cn_(?P<type>\w+)_(?P<num_channels>\d+)_(?P<note>\w+)")
 
 
 def get_dataset_from_path(path: Path) -> str:
@@ -58,11 +66,10 @@ def setup_project(config_path: Path):
         config_path = project_dir / "proj_config.yml"
         if not config_path.exists():
             raise ValueError(f"No config path specified")
-            
+
     else:
         if not config_path.exists():
             raise ValueError(f"Could not find config at specified path: {config_path}")
-
 
     config = read_yaml(config_path)
     project_dir = config.get("project_path") or get_env("PROJECT_DIR", Path.cwd())
@@ -94,9 +101,7 @@ def load_img_paths_from_dir(dir_path: Path):
     return img_paths
 
 
-def read_image(
-    img_path: Path, tf_pipeline: tvtf.Compose = norm_img_pipeline
-) -> Tensor:
+def read_image(img_path: Path, tf_pipeline: tvtf.Compose = norm_img_pipeline) -> Tensor:
     img = torchvision.io.read_image(str(img_path))
     img = tf_pipeline(img)
 
@@ -159,14 +164,14 @@ def read_data_tree(
             if isinstance(scene, str):
                 if scene == "*":
                     sample_list = (None, None, None)
-                    
+
                 elif RANGE_SEP in scene:
                     sample_list = scene.strip().split(RANGE_SEP)
                     assert len(sample_list) == 3
 
-                    start_range = int(sample_list[0]) if sample_list[0] != '' else None
-                    end_range = int(sample_list[1]) if sample_list[1] != '' else None
-                    skip_range = int(sample_list[2]) if sample_list[2] != '' else None
+                    start_range = int(sample_list[0]) if sample_list[0] != "" else None
+                    end_range = int(sample_list[1]) if sample_list[1] != "" else None
+                    skip_range = int(sample_list[2]) if sample_list[2] != "" else None
 
                     sample_list = (start_range, end_range, skip_range)
 
@@ -208,6 +213,8 @@ def read_data_tree(
         dataset_dict[dataset_name] = scene_dict
     return dataset_dict
 
+def meta_to_str(meta: dict[str, Any]) -> str:
+    return f"{meta['dataset']} - {meta['scene']} - {meta['sample']}"
 
 @dataclass
 class SampleInfo:
@@ -245,9 +252,9 @@ class InfoGetter(ABC):
 
                 if isinstance(sample_list, tuple) and len(sample_list) == 3:
                     start_range, end_range, skip_range = sample_list
-                    sample_list = sorted(self.get_sample_names_in_scene(
-                        dataset_path, scene_name
-                    ))
+                    sample_list = sorted(
+                        self.get_sample_names_in_scene(dataset_path, scene_name)
+                    )
 
                     if start_range is None:
                         start_range = 0
@@ -258,7 +265,10 @@ class InfoGetter(ABC):
                     if skip_range is None:
                         skip_range = 1
 
-                    sample_list = [sample_list[i] for i in range(start_range, end_range, skip_range)]
+                    sample_list = [
+                        sample_list[i]
+                        for i in range(start_range, end_range, skip_range)
+                    ]
 
                 if not isinstance(sample_list, list):
                     raise NotImplementedError
@@ -313,13 +323,13 @@ class PandasetInfoGetter(InfoGetter):
         data_type = "rgb" if specs is None else specs.get("data_type", "rgb")
 
         if data_type in {"rgb", "lidar"}:
-            sample_path = (sample_dir_path / info.sample)
+            sample_path = sample_dir_path / info.sample
 
         elif data_type == "pose":
-            sample_path = (sample_dir_path / "poses")
+            sample_path = sample_dir_path / "poses"
 
         elif data_type == "intrinsics":
-            sample_path = (sample_dir_path / "intrinsics")
+            sample_path = sample_dir_path / "intrinsics"
 
         suffix = suffixes[data_type, self.dataset_name]
         sample_path = sample_path.with_suffix(suffix)
@@ -331,7 +341,9 @@ class NeuRADInfoGetter(InfoGetter):
     def __init__(self):
         super().__init__("neurad")
 
-    def _get_sample_dir_path(self, dataset_path: Path, scene: str, specs: dict[str, Any] = None) -> Path:
+    def _get_sample_dir_path(
+        self, dataset_path: Path, scene: str, specs: dict[str, Any] = None
+    ) -> Path:
         if specs is None:
             shift = "0meter"
             data_type = "rgb"
@@ -347,10 +359,9 @@ class NeuRADInfoGetter(InfoGetter):
         match data_type:
             case "rgb":
                 return dataset_path / scene / shift / split / data_type / camera
-                
+
             case _:
                 raise NotImplementedError
-
 
     def get_sample_names_in_scene(
         self, dataset_path: Path, scene: str, specs: dict[str, Any] = None
@@ -377,7 +388,9 @@ class NeuRADInfoGetter(InfoGetter):
 
 
 class DataGetter(ABC):
-    def __init__(self, info_getter: InfoGetter, data_spec: dict[str, Any], data_type: str) -> None:
+    def __init__(
+        self, info_getter: InfoGetter, data_spec: dict[str, Any], data_type: str
+    ) -> None:
         super().__init__()
         self.info_getter = info_getter
         self.data_spec = data_spec
@@ -400,9 +413,7 @@ class MetaDataGetter(DataGetter):
         super().__init__(info_getter, data_spec, "meta")
 
     def get_data(self, dataset_path: Path, info: SampleInfo):
-        result = {
-            **asdict(info)
-        }
+        result = {**asdict(info)}
         return result
 
 
@@ -413,7 +424,7 @@ class PromptDataGetter(DataGetter):
         data_spec: dict[str, Any],
     ):
         super().__init__(info_getter, data_spec, "prompt")
-        
+
         match self.data_spec.get("type", "static"):
             case "static":
                 self.positive_prompt = self.data_spec.get("positive_prompt", "")
@@ -423,7 +434,11 @@ class PromptDataGetter(DataGetter):
                 raise NotImplementedError
 
     def get_data(self, dataset_path: Path, info: SampleInfo):
-        return {"positive_prompt": self.positive_prompt, "negative_prompt": self.negative_prompt}
+        return {
+            "positive_prompt": self.positive_prompt,
+            "negative_prompt": self.negative_prompt,
+        }
+
 
 class RGBDataGetter(DataGetter):
     def __init__(
@@ -447,7 +462,7 @@ class RGBDataGetter(DataGetter):
         self.base_transform = tvtf.Compose(
             [
                 tvtf.ConvertImageDtype(dtype) if rescale else tvtf.ToDtype(dtype),
-                tvtf.Resize((height, width))
+                tvtf.Resize((height, width)),
             ]
         )
         self.extra_transform: tvtf.Compose = None
@@ -484,11 +499,10 @@ class LidarDataGetter(DataGetter):
         elif height is None:
             height = width
 
-        
     def get_data(self, dataset_path: Path, info: SampleInfo) -> Tensor:
         path = self.get_data_path(dataset_path, info)
         data = pd.read_pickle(path)
-        
+
         return data
 
 
@@ -500,8 +514,9 @@ class PoseDataGetter(DataGetter):
     ):
         super().__init__(info_getter, data_spec, "pose")
 
-        
-    def get_data(self, dataset_path: Path, info: SampleInfo) -> dict[str, dict[str, float]]:
+    def get_data(
+        self, dataset_path: Path, info: SampleInfo
+    ) -> dict[str, dict[str, float]]:
         file_path = self.get_data_path(dataset_path, info)
         poses = load_json(file_path)
         pose_idx = int(info.sample)
@@ -517,14 +532,13 @@ class IntrinsicsDataGetter(DataGetter):
     ):
         super().__init__(info_getter, data_spec, "intrinsics")
 
-        
-    def get_data(self, dataset_path: Path, info: SampleInfo) -> dict[str, dict[str, float]]:
+    def get_data(
+        self, dataset_path: Path, info: SampleInfo
+    ) -> dict[str, dict[str, float]]:
         file_path = self.get_data_path(dataset_path, info)
 
         data = load_json(file_path)
         return data
-
-
 
 
 info_getter_builders: dict[str, Callable[[], InfoGetter]] = {
@@ -538,7 +552,7 @@ data_getter_builders: dict[str, Callable[[InfoGetter, dict[str, Any]], DataGette
     "lidar": LidarDataGetter,
     "prompt": PromptDataGetter,
     "intrinsics": IntrinsicsDataGetter,
-    "pose": PoseDataGetter
+    "pose": PoseDataGetter,
 }
 
 
@@ -550,7 +564,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         info_getter: InfoGetter,
         data_getters: dict[str, DataGetter],
         data_transforms: dict[str, Callable[[str], int]] = None,
-        preprocess_func = None
+        preprocess_func=None,
     ):
         self.sample_infos: list[SampleInfo] = info_getter.parse_tree(
             dataset_path, data_tree
@@ -600,16 +614,31 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
 
         data_getters = {}
 
-        for data_type, spec in dataset_config["data_getters"].items():
-            if data_type not in data_getter_builders:
-                raise NotImplementedError(f"Could not find a builder for {data_type}")
+        for spec_name, spec in dataset_config["data_getters"].items():
+            data_type = spec.get("data_type")
+            if not data_type:
+                if spec_name in data_getter_builders:
+                    data_type = spec_name
+
+                elif cn_signal_match := CN_SIGNAL_PATTERN.match():
+                    groups = cn_signal_match.groupdict()
+                    data_type = groups["data_type"]
+
+                else:
+                    raise NotImplementedError(
+                        f"Could not find a builder for {data_type}"
+                    )
+
+            spec["name"] = spec_name
 
             data_getter_factory = data_getter_builders[data_type]
             data_getter = data_getter_factory(info_getter, spec)
 
-            data_getters[data_type] = data_getter
+            data_getters[spec_name] = data_getter
 
-        return DynamicDataset(dataset_path, data_tree, info_getter, data_getters, **kwargs)
+        return DynamicDataset(
+            dataset_path, data_tree, info_getter, data_getters, **kwargs
+        )
 
     @property
     def name(self) -> str:
@@ -618,12 +647,12 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
     def iter_range(
         self, id: int = 0, id_start: int = 0, id_stop: int = 0, verbose: bool = True
     ):
-        """ Iterate cyclically with a range, such that a specific offset is matched with the right index.
+        """Iterate cyclically with a range, such that a specific offset is matched with the right index.
             Example: (id: 14, id_start: 10, id_stop: 25)
                 id=10 should be assigned i=0, id=11 gets i=1, etc...
                 This continues until id=25, after which it repeats at id=10.
-                We therefore get the map: 
-                {10: 0, 11: 1, 12: 2, 13: 3, 14: 4, ..., 
+                We therefore get the map:
+                {10: 0, 11: 1, 12: 2, 13: 3, 14: 4, ...,
                  10: 15, 11: 16, 12: 17, 13: 18, 14: 19, ...}
                 Thus, id=14 will be assigned indexes 4, 19, 34, 49, ..., until the dataset is exhausted.
 
@@ -663,7 +692,7 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
 
         for data_type, getter in self.data_getters.items():
             data = getter.get_data(self.dataset_path, info)
-            
+
             for data_transform in self.data_transforms[data_type]:
                 data = data_transform(data)
 
@@ -696,5 +725,3 @@ class DynamicDataset(Dataset):  # Dataset / Scene / Sample
         return matches
 
 
-def get_meta_word(meta):
-    return f"{meta['dataset']} - {meta['scene']} - {meta['sample']}"

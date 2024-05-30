@@ -14,13 +14,16 @@ from torch import nn, Tensor
 from diffusers import (
     StableDiffusionImg2ImgPipeline,
     StableDiffusionControlNetImg2ImgPipeline,
+    UNet2DConditionModel,
+    AutoencoderKL
 )
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import (
     retrieve_latents,
 )
 from diffusers.image_processor import VaeImageProcessor
-from diffusers import AutoencoderKL
-from diffusers.models.controlnet import ControlNetModel, ControlNetOutput, UNet2DConditionModel, AutoencoderKL
+from diffusers.models.controlnet import (
+    ControlNetModel,
+)
 from diffusers.schedulers import KarrasDiffusionSchedulers
 
 from diffusers import StableDiffusionImg2ImgPipeline
@@ -36,7 +39,12 @@ from torchmetrics.image import PeakSignalNoiseRatio
 
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
-from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+from transformers import (
+    CLIPImageProcessor,
+    CLIPTextModel,
+    CLIPTokenizer,
+    CLIPVisionModelWithProjection,
+)
 
 from src.control_lora import ControlLoRAModel
 from src.utils import (
@@ -44,7 +52,7 @@ from src.utils import (
     validate_same_len,
     batch_if_not_iterable,
 )
-from src.data import save_image, DynamicDataset, suffixes
+from src.data import CN_SIGNAL_PATTERN, save_image, DynamicDataset, suffixes
 from src.data import save_yaml
 
 
@@ -57,9 +65,6 @@ DTYPE_CONVERSION = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
 }
-
-CN_SIGNAL_PATTERN = re.compile(r"cn_(?P<type>\w+)_(?P<num_channels>\d+)_(?P<note>\w+)")
-
 
 def _make_metric(name, device, **kwargs):
     match name:
@@ -74,6 +79,7 @@ def _make_metric(name, device, **kwargs):
 
     return metric
 
+
 @dataclass
 class DiffusionModelId:
     sd_v1_5 = "runwayml/stable-diffusion-v1-5"
@@ -82,14 +88,18 @@ class DiffusionModelId:
     sdxl_refiner_v1_0 = "stabilityai/stable-diffusion-xl-refiner-1.0"
     sdxl_turbo_v1_0 = "stabilityai/sdxl-turbo"
 
+
 @dataclass
 class DiffusionModelType:
     sd: str = "sd"
     cn: str = "cn"
     mock: str = "mock"
 
+
 def prep_hf_pipe(
-    pipe: Union[StableDiffusionControlNetImg2ImgPipeline, StableDiffusionImg2ImgPipeline],
+    pipe: Union[
+        StableDiffusionControlNetImg2ImgPipeline, StableDiffusionImg2ImgPipeline
+    ],
     device: torch.device = get_device(),
     low_mem_mode: bool = False,
     compile: bool = True,
@@ -115,7 +125,6 @@ def prep_hf_pipe(
     return pipe
 
 
-
 def _prepare_image(kwargs, image):
     image = batch_if_not_iterable(image)
     batch_size = len(image)
@@ -134,7 +143,9 @@ def _prepare_image(kwargs, image):
     return channel_first, batch_size
 
 
-def combine_conditioning_info(sample: Dict[str, Tensor], conditioning_signal_infos: list["ConditioningSignalInfo"]) -> torch.Tensor:
+def combine_conditioning_info(
+    sample: Dict[str, Tensor], conditioning_signal_infos: list["ConditioningSignalInfo"]
+) -> torch.Tensor:
     signals = []
 
     for signal_info in conditioning_signal_infos:
@@ -143,7 +154,9 @@ def combine_conditioning_info(sample: Dict[str, Tensor], conditioning_signal_inf
 
         if signal.size(1) != signal_info.num_channels:
             if signal.size(-1) != signal_info.num_channels:
-                raise ValueError(f"Invalid shape for conditioning signal: {signal_info}, received tensor with shape {signal.shape}")
+                raise ValueError(
+                    f"Invalid shape for conditioning signal: {signal_info}, received tensor with shape {signal.shape}"
+                )
 
             signal = signal.permute(0, 2, 3, 1)
 
@@ -152,11 +165,22 @@ def combine_conditioning_info(sample: Dict[str, Tensor], conditioning_signal_inf
     return torch.cat(signals, dim=1)
 
 
-def _prepare_conditioning(kwargs: Dict[str, Any], sample: Dict[str, Tensor], conditioning_signal_infos: list["ConditioningSignalInfo"]) -> None:
-    kwargs["control_image"] = combine_conditioning_info(sample, conditioning_signal_infos)
+def _prepare_conditioning(
+    kwargs: Dict[str, Any],
+    sample: Dict[str, Tensor],
+    conditioning_signal_infos: list["ConditioningSignalInfo"],
+) -> None:
+    kwargs["control_image"] = combine_conditioning_info(
+        sample, conditioning_signal_infos
+    )
 
 
-def _prepare_prompt(sample: dict[str, Any], tokenizer: CLIPTokenizer, text_encoder: CLIPTextModel, batch_size: int) -> None:
+def _prepare_prompt(
+    sample: dict[str, Any],
+    tokenizer: CLIPTokenizer,
+    text_encoder: CLIPTextModel,
+    batch_size: int,
+) -> None:
     # Convert any existing prompts to prompt embeddings, utilizing memoization.
     # Ensure there is at least one prompt embedding passed to the pipeline.
     prompt_embed_keys = []
@@ -180,9 +204,7 @@ def _prepare_prompt(sample: dict[str, Any], tokenizer: CLIPTokenizer, text_encod
     if not prompt_embed_keys:
         prompt_embed_keys.append("prompt_embeds")
         with torch.no_grad():
-            sample["prompt_embeds"] = embed_prompt(
-                tokenizer, text_encoder, ""
-            )
+            sample["prompt_embeds"] = embed_prompt(tokenizer, text_encoder, "")
 
     # Ensure batch size of prompts matches batch size of images
     for prompt_embed_key in prompt_embed_keys:
@@ -198,10 +220,7 @@ def _prepare_prompt(sample: dict[str, Any], tokenizer: CLIPTokenizer, text_encod
 def _prepare_generator(sample: dict["str", Any], batch_size: int):
     if "generator" in sample:
         sample["generator"] = batch_if_not_iterable(sample["generator"])
-        if (
-            len(sample["generator"]) <= 1
-            and batch_size > 1
-        ):
+        if len(sample["generator"]) <= 1 and batch_size > 1:
             raise ValueError(f"Number of generators must match number of images")
 
 
@@ -266,16 +285,16 @@ class DiffusionModelConfig:
     lora_conv2d_rank: int = 4
 
 
-
 class DiffusionModel(ABC):
     config: DiffusionModelConfig
 
     @abstractmethod
     def get_diffusion_output(
-        self, sample: Dict[str, Any],
+        self,
+        sample: Dict[str, Any],
         pipeline_kwargs: Optional[Dict[str, Any]] = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -309,8 +328,6 @@ class DiffusionModel(ABC):
             )
 
         return model(config=config, **kwargs)
-
-
 
 
 class MockDiffusionModel(DiffusionModel):
@@ -404,7 +421,7 @@ class StableDiffusionModel(DiffusionModel):
             unet=unet,
             vae=vae,
             tokenizer=tokenizer,
-            scheduler=scheduler
+            scheduler=scheduler,
         )
 
         self.pipe = prep_hf_pipe(
@@ -412,7 +429,7 @@ class StableDiffusionModel(DiffusionModel):
             low_mem_mode=config.low_mem_mode,
             device=device,
             compile=config.compile_model,
-            num_inference_steps=config.num_inference_steps
+            num_inference_steps=config.num_inference_steps,
         )
 
         if config.lora_weights:
@@ -456,15 +473,18 @@ class StableDiffusionModel(DiffusionModel):
         pipeline_kwargs = pipeline_kwargs or {}
         pipeline_kwargs["image"] = sample["rgb"]
         pipeline_kwargs["output_type"] = pipeline_kwargs.get("output_type", "pt")
-        pipeline_kwargs["strength"] = pipeline_kwargs.get("strength", self.config.noise_strength)
+        pipeline_kwargs["strength"] = pipeline_kwargs.get(
+            "strength", self.config.noise_strength
+        )
         pipeline_kwargs["num_inference_steps"] = pipeline_kwargs.get(
             "num_inference_steps", self.config.num_inference_steps
         )
 
         channel_first, batch_size = _prepare_image(pipeline_kwargs)
         _prepare_generator(pipeline_kwargs)
-        _prepare_prompt(pipeline_kwargs, self.pipe.tokenizer, self.pipe.text_encoder, batch_size)
-
+        _prepare_prompt(
+            pipeline_kwargs, self.pipe.tokenizer, self.pipe.text_encoder, batch_size
+        )
 
         image = self.pipe(
             **pipeline_kwargs,
@@ -511,7 +531,6 @@ class StableDiffusionModel(DiffusionModel):
         return loss_dict
 
 
-
 class ControlNetDiffusionModel(DiffusionModel):
     def __init__(
         self,
@@ -538,8 +557,10 @@ class ControlNetDiffusionModel(DiffusionModel):
             for signal_name in self.config.conditioning_signals
         ]
 
-        self.conditioning_channels = sum(signal.num_channels for signal in self.conditioning_signal_infos)
-        
+        self.conditioning_channels = sum(
+            signal.num_channels for signal in self.conditioning_signal_infos
+        )
+
         if config.controlnet_weights:
             controlnet = ControlLoRAModel.from_pretrained(config.controlnet_weights)
 
@@ -552,7 +573,7 @@ class ControlNetDiffusionModel(DiffusionModel):
             vae=vae,
             tokenizer=tokenizer,
             scheduler=scheduler,
-            controlnet=controlnet
+            controlnet=controlnet,
         )
 
         self.pipe = prep_hf_pipe(
@@ -560,7 +581,7 @@ class ControlNetDiffusionModel(DiffusionModel):
             low_mem_mode=config.low_mem_mode,
             device=device,
             compile=config.compile_model,
-            num_inference_steps=config.num_inference_steps
+            num_inference_steps=config.num_inference_steps,
         )
 
         if config.lora_weights:
@@ -604,20 +625,20 @@ class ControlNetDiffusionModel(DiffusionModel):
         pipeline_kwargs = pipeline_kwargs or {}
         pipeline_kwargs["image"] = sample["rgb"]
         pipeline_kwargs["output_type"] = pipeline_kwargs.get("output_type", "pt")
-        pipeline_kwargs["strength"] = pipeline_kwargs.get("strength", self.config.noise_strength)
+        pipeline_kwargs["strength"] = pipeline_kwargs.get(
+            "strength", self.config.noise_strength
+        )
         pipeline_kwargs["num_inference_steps"] = pipeline_kwargs.get(
             "num_inference_steps", self.config.num_inference_steps
         )
 
-
-
         channel_first, batch_size = _prepare_image(pipeline_kwargs)
         _prepare_conditioning(pipeline_kwargs, sample, self.conditioning_signal_infos)
- 
 
         _prepare_generator(pipeline_kwargs)
-        _prepare_prompt(pipeline_kwargs, self.pipe.tokenizer, self.pipe.text_encoder, batch_size)
-
+        _prepare_prompt(
+            pipeline_kwargs, self.pipe.tokenizer, self.pipe.text_encoder, batch_size
+        )
 
         image = self.pipe(
             **pipeline_kwargs,
@@ -754,7 +775,6 @@ def tokenize_prompt(
     return tokens
 
 
-
 @lru_cache(maxsize=4)
 def _encode_hashable_tokens(
     text_encoder: Union[CLIPTextModel, CLIPTextModelWithProjection],
@@ -767,7 +787,7 @@ def _encode_hashable_tokens(
 def encode_tokens(
     text_encoder: Union[CLIPTextModel, CLIPTextModelWithProjection],
     tokens: torch.Tensor,
-    use_cache: bool = True
+    use_cache: bool = True,
 ) -> torch.Tensor:
     if use_cache:
         return _encode_hashable_tokens(text_encoder, tokens)
@@ -791,7 +811,7 @@ def embed_prompt(
     tokenizer: CLIPTokenizer,
     text_encoder: Union[CLIPTextModel, CLIPTextModelWithProjection],
     prompt: Union[str, Tuple[str, ...]],
-    use_cache: bool = True
+    use_cache: bool = True,
 ) -> torch.Tensor:
     if not isinstance(
         prompt, str
@@ -803,8 +823,9 @@ def embed_prompt(
     else:
         tokens = tokenize_prompt(tokenizer, prompt)
         embeddings = encode_tokens(text_encoder, tokens)
-    
+
     return embeddings
+
 
 def get_random_timesteps(noise_strength, total_num_timesteps, device, batch_size):
     # Sample a random timestep for each image
@@ -920,6 +941,3 @@ def parse_target_ranks(target_ranks, prefix=r""):
                 raise NotImplementedError(f"Unrecognized target: {name}")
 
     return parsed_targets
-
-
-

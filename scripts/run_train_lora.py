@@ -1,6 +1,6 @@
 # Adapted from https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image_lora.py
 
-from typing import Any
+from typing import Any, Callable, Dict, Tuple, List
 from collections.abc import Iterable
 from pathlib import Path
 from argparse import ArgumentParser
@@ -9,8 +9,8 @@ import os
 from dataclasses import dataclass, asdict, field
 import math
 import itertools as it
-from src.data import get_meta_word
-from src.diffusion import combine_conditioning_info, get_diffusion_cls, parse_target_ranks
+from src.data import meta_to_str
+from src.diffusion import combine_conditioning_info, parse_target_ranks
 from src.diffusion import get_random_timesteps
 from src.diffusion import get_ordered_timesteps
 from src.diffusion import LOWER_DTYPES
@@ -102,7 +102,7 @@ class TrainState:
     variant: str = None
     prediction_type: str = None
 
-    gradient_checkpointing: bool = False
+    enable_gradient_checkpointing: bool = False
     checkpointing_steps: int = 500
     checkpoints_total_limit: int = None
     resume_from_checkpoint: bool = False
@@ -143,12 +143,9 @@ class TrainState:
     lora_rank_conv2d: int = 4
     use_dora: bool = True
 
-    add_controlnet: bool = False 
-    conditioning_channels: int = 3
+    use_controlnet: bool = False 
     control_lora_rank_linear: int = 4
     control_lora_rank_conv2d: int = 4
-
-
     lora_target_ranks: dict[str, Any] = field(default_factory=lambda: {
         "unet": {
             "downblocks": {
@@ -183,7 +180,7 @@ class TrainState:
                 "ff": 16,
                 "proj": 16
             }
-        }
+        }   # ControlNet not implemented atm, refer to `control_lora_rank_linear` and `control_lora_rank_conv2d`
     })
     lora_peft_type: str = "LORA"        # LORA, LOHA, or LOKR. LOKR seems best for this task https://arxiv.org/pdf/2309.14859
 
@@ -228,7 +225,7 @@ class TrainState:
     push_to_hub: bool = False  # Not Implemented
     hub_token: str = None
 
-    debug_loss: bool = False
+    use_debug_loss: bool = False
     use_recreation_loss: bool = False
 
     seed: int = None
@@ -398,10 +395,10 @@ def preprocess_prompt(prompt: list[str], models):
     return {"input_ids": input_ids}
 
 
-def preprocess_sample(batch, preprocessors):
+def preprocess_sample(batch: Dict[str, Any], preprocessors: Dict[str, Callable]) -> Dict[str, Any]:
     sample = {"meta": batch["meta"]}
     
-    for processor_name, processor in preprocessors:
+    for processor_name, processor in preprocessors.items():
         if processor_name == "rgb":
             rgb_out = processor(batch["rgb"])
             sample["rgb"] = rgb_out["rgb"]
@@ -413,7 +410,7 @@ def preprocess_sample(batch, preprocessors):
             prompt_out = processor(batch["prompt"]["positive_prompt"])
             sample["input_ids"] = prompt_out["input_ids"]
 
-        elif processor_name.starts_with("cn_rgb"):
+        elif processor_name.startswith("cn_rgb"):
             rgb_out = processor(batch[processor_name])
             sample[processor_name] = rgb_out["rgb"]
 
@@ -821,12 +818,12 @@ def prepare_models(train_state: TrainState, device):
 
     models["image_processor"] = VaeImageProcessor()
 
-    if train_state.add_controlnet:
+    if train_state.use_controlnet:
         models["controlnet"] = ControlLoRAModel.from_unet(
             unet=models["unet"],
-            conditioning_channels=train_state.conditioning_channels, 
+            conditioning_channels=sum(info.num_channels for info in train_state.conditioning_signal_infos), 
             lora_linear_rank=train_state.control_lora_rank_linear, 
-            lora_linear_rank=train_state.control_lora_rank_conv2d,
+            lora_conv2d_rank=train_state.control_lora_rank_conv2d,
             use_dora=train_state.use_dora
         )
 
@@ -892,7 +889,7 @@ def prepare_models(train_state: TrainState, device):
         if not model_name in models:
             raise ValueError(f"Found trainable model {model_name} not in models")
 
-    if train_state.gradient_checkpointing:
+    if train_state.enable_gradient_checkpointing:
         for model_name in train_state.trainable_models:
             models[model_name].enable_gradient_checkpointing()
 
@@ -1025,21 +1022,21 @@ def validate_model(
                         "ground_truth": [
                             wandb.Image(
                                 img,
-                                caption=get_meta_word(meta),
+                                caption=meta_to_str(meta),
                             )
                             for (img, meta) in (zip(batch["rgb"], batch["meta"]))
                         ],
                         f"{run_prefix}_images": [
                             wandb.Image(
                                 img,
-                                caption=get_meta_word(meta),
+                                caption=meta_to_str(meta),
                             )
                             for (img, meta) in (zip(output_imgs, batch["meta"]))
                         ],
                         "noised_images": [
                             wandb.Image(
                                 img,
-                                caption=get_meta_word(meta),
+                                caption=meta_to_str(meta),
                             )
                             for (img, meta) in (zip(noised_imgs, batch["meta"]))
                         ],
@@ -1112,7 +1109,7 @@ def train_epoch(
                 down_block_res_samples, mid_block_res_sample = models["controlnet"](
                     noisy_model_input,
                     timesteps,
-                    encoder_hidden_states=prompt_hidden_state["embeds"],
+                    encoder_hidden_states=prompt_hidden_state,
                     controlnet_cond=conditioning,
                     return_dict=False
                 ) 
@@ -1134,10 +1131,10 @@ def train_epoch(
                 models, train_state, model_input, model_pred, noise, timesteps
             )
 
-            if train_state.debug_loss and "meta" in batch:
+            if train_state.use_debug_loss and "meta" in batch:
                 for meta in batch["meta"]:
                     accelerator.log(
-                        {"loss_for_" + get_meta_word(meta): loss}, step=train_state.global_step
+                        {"loss_for_" + meta_to_str(meta): loss}, step=train_state.global_step
                     )
 
             # Gather the losses across all processes for logging (if we use distributed training).
