@@ -134,6 +134,24 @@ def _prepare_image(kwargs, image):
     return channel_first, batch_size
 
 
+def _prepare_conditioning(kwargs: Dict[str, Any], sample: Dict[str, Tensor], conditioning_signal_infos: list["ConditioningSignalInfo"]) -> None:
+    signals = []
+
+    for signal_info in conditioning_signal_infos:
+        signal = sample[signal_info.name]
+        signal: Tensor = batch_if_not_iterable(signal)
+
+        if signal.size(1) != signal_info.num_channels:
+            if signal.size(-1) != signal_info.num_channels:
+                raise ValueError(f"Invalid shape for conditioning signal: {signal_info}, received tensor with shape {signal.shape}")
+
+            signal = signal.permute(0, 2, 3, 1)
+
+        signals.append(signal)
+
+    kwargs["control_image"] = torch.cat(signals, dim=1)
+
+
 def _prepare_prompt(sample: dict[str, Any], tokenizer: CLIPTokenizer, text_encoder: CLIPTextModel, batch_size: int) -> None:
     # Convert any existing prompts to prompt embeddings, utilizing memoization.
     # Ensure there is at least one prompt embedding passed to the pipeline.
@@ -194,7 +212,7 @@ class ConditioningSignalInfo:
     def from_signal_name(name: str):
         group = CN_SIGNAL_PATTERN.match(name).groupdict()
         group["num_channels"] = int(group["num_channels"])
-        return ConditioningSignalInfo(**group)
+        return ConditioningSignalInfo(**group, name=name)
 
 
 @dataclass
@@ -209,6 +227,9 @@ class DiffusionModelConfig:
     """If applicable, compile Diffusion pipeline using available torch backend."""
 
     lora_weights: Optional[str] = None
+    """Path to lora weights for the base diffusion model. Loads if applicable."""
+
+    controlnet_weights: Optional[str] = None
     """Path to lora weights for the base diffusion model. Loads if applicable."""
 
     noise_strength: Optional[float] = 0.2
@@ -233,6 +254,9 @@ class DiffusionModelConfig:
 
         Does nothing unless the model is a controlnet.
     """
+
+    lora_linear_rank: int = 4
+    lora_conv2d_rank: int = 4
 
 
 
@@ -502,13 +526,14 @@ class ControlNetDiffusionModel(DiffusionModel):
         self.config = config
         self.device = device
 
-        # For now, assume each image based signal always
-        for signal_name in self.config.conditioning_signals:
-            signal_info = ConditioningSignalInfo.from_signal_name(signal_name)
+        self.conditioning_signal_infos = [
+            ConditioningSignalInfo.from_signal_name(signal_name)
+            for signal_name in self.config.conditioning_signals
+        ]
 
-                
-
-        self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+        self.conditioning_channels = sum(signal.num_channels for signal in self.conditioning_signal_infos)
+        
+        self.pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
             config.model_id,
             torch_dtype=dtype,
             variant=variant,
@@ -516,7 +541,8 @@ class ControlNetDiffusionModel(DiffusionModel):
             unet=unet,
             vae=vae,
             tokenizer=tokenizer,
-            scheduler=scheduler
+            scheduler=scheduler,
+            controlnet=controlnet
         )
 
         self.pipe = prep_hf_pipe(
@@ -573,7 +599,12 @@ class ControlNetDiffusionModel(DiffusionModel):
             "num_inference_steps", self.config.num_inference_steps
         )
 
+
+
         channel_first, batch_size = _prepare_image(pipeline_kwargs)
+        _prepare_conditioning(pipeline_kwargs, sample, self.conditioning_signal_infos)
+ 
+
         _prepare_generator(pipeline_kwargs)
         _prepare_prompt(pipeline_kwargs, self.pipe.tokenizer, self.pipe.text_encoder, batch_size)
 
