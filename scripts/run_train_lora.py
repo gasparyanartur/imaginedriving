@@ -71,7 +71,7 @@ from src.diffusion import tokenize_prompt
 from src.diffusion import encode_tokens
 from src.utils import get_env
 from src.control_lora import ControlLoRAModel
-from src.diffusion import SDPipe
+from src.diffusion import StableDiffusionModel, DiffusionModelConfig
 
 
 check_min_version("0.27.0")
@@ -439,8 +439,6 @@ def save_model_hook(loaded_models, weights, output_dir, accelerator, models, tra
     if not accelerator.is_main_process:
         return
 
-    # there are only two options here. Either are just the unet attn processor layers
-    # or there are the unet and text encoder attn layers
     layers_to_save = {}
 
     for loaded_model in loaded_models:
@@ -472,6 +470,8 @@ def save_model_hook(loaded_models, weights, output_dir, accelerator, models, tra
         unet_lora_layers=layers_to_save.get("unet"),
         text_encoder_lora_layers=layers_to_save.get("text_encoder"),
     )
+    if "controlnet" in layers_to_save:
+        layers_to_save["controlnet"].save_pretrained(str(dst_dir / "controlnet"))
 
 
 def load_model_hook(
@@ -499,7 +499,7 @@ def load_model_hook(
 
     lora_state_dict, _ = LoraLoaderMixin.lora_state_dict(input_dir)
 
-    if "unet" in models:
+    if "unet" in loaded_models_dict:
         unet_state_dict = {
             f'{k.replace("unet.", "")}': v
             for k, v in lora_state_dict.items()
@@ -519,12 +519,17 @@ def load_model_hook(
                     f" {unexpected_keys}. "
                 )
 
-    if "text_encoder" in models:
+    if "text_encoder" in loaded_models_dict:
         _set_state_dict_into_text_encoder(
             lora_state_dict,
             prefix="text_encoder.",
             text_encoder=loaded_models_dict["text_encoder"],
         )
+
+    if "controlnet" in loaded_models_dict:
+        loaded_controlnet = ControlLoRAModel.from_pretrained(input_dir, subfolder="controlnet")
+        loaded_models_dict["controlnet"].load_state_dict(loaded_controlnet.state_dict())
+        loaded_models_dict["controlnet"].tie_weights(models["unet"])
 
     # Make sure the trainable params are in float32.
     if train_state.weights_dtype in LOWER_DTYPES:
@@ -754,12 +759,6 @@ def prepare_models(train_state: TrainState, device):
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
 
-    if is_sdxl_vae(train_state.vae_id) or train_state.keep_vae_full:
-        # The VAE in SDXL is in float32 to avoid NaN losses.
-        train_state.vae_dtype = "fp32"
-    else:
-        train_state.vae_dtype = train_state.weights_dtype
-
     weights_dtype = DTYPE_CONVERSION[train_state.weights_dtype]
     vae_dtype = DTYPE_CONVERSION[train_state.vae_dtype]
 
@@ -861,9 +860,11 @@ def prepare_models(train_state: TrainState, device):
             )
 
     if "controlnet" in models:
-        # TODO: Update to modern LoRA implementation
-        # TODO: Determine if this needs to be set right 
-        ...
+        models["controlnet"].train()
+        if "vae" in models:
+            models["controlnet"].bind_vae(models["vae"])
+        else:
+            logging.warning(f"Could not find a VAE in models to bind with ControlNet. Current models: {models.keys()}" )
 
 
     # Sanity check
@@ -872,9 +873,6 @@ def prepare_models(train_state: TrainState, device):
             raise ValueError(f"Found trainable model {model_name} not in models")
 
     if train_state.gradient_checkpointing:
-        if "controlnet" in train_state.trainable_models:
-            raise ValueError(f"Cannot enable gradient checkpointing with ControlNet")
-
         for model_name in train_state.trainable_models:
             models[model_name].enable_gradient_checkpointing()
 
@@ -931,7 +929,7 @@ def validate_model(
     if "controlnet" in models:
         pipeline_models["controlnet"] = unwrap_model(accelerator, models["model"]).to(dtype=weights_dtype, device=accelerator.device)
 
-    pipeline = SDPipe(pipeline_args, pipeline_models, accelerator.device)
+    pipeline = StableDiffusionModel(pipeline_args, accelerator.device, dtype=weights_dtype, **pipeline_models)
     noise_scheduler = pipeline.pipe.noise_scheduler
 
     # Often we end up using the same prompt, just reuse the previous one then, no need to re-embed
@@ -1050,7 +1048,6 @@ def train_epoch(
 ):
     weights_dtype = DTYPE_CONVERSION[train_state.weights_dtype]
     vae_dtype = DTYPE_CONVERSION[train_state.vae_dtype]
-    using_sdxl = is_sdxl_model(train_state.model_id)
     noise_scheduler = models["noise_scheduler"]
 
     if "unet" in train_state.trainable_models:
@@ -1092,15 +1089,15 @@ def train_epoch(
                 )
                 latents = noise_scheduler.add_noise(model_input, noise, timesteps[:1].repeat(batch_size))
                 for i, t in enumerate(timesteps):
-                    unet_added_conditions = {}
                     token_embed_outputs = encode_tokens(
-                        models["text_encoder"], batch["input_ids"], using_sdxl
+                        models["text_encoder"], batch["input_ids"]
                     )
 
-                    if using_sdxl:
-                        raise NotImplementedError
-
                     curr_timesteps = timesteps[i:i+1].repeat(batch_size)
+
+
+                    unet_added_conditions = {}
+
                     model_pred = models["unet"](
                         latents,
                         curr_timesteps,
