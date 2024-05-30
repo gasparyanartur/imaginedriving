@@ -551,6 +551,30 @@ def unwrap_model(accelerator: Accelerator, model):
     return model
 
 
+def prepare_rgb_preprocess_steps(train_state: TrainState, is_split_train: bool, crop_size, downsample_size):
+    steps = {}
+
+    steps["resizer"] = transforms.Resize(
+        downsample_size, interpolation=transforms.InterpolationMode.BILINEAR
+    ) 
+
+    if is_split_train: 
+        steps["flipper"] = transforms.RandomHorizontalFlip(
+            p=train_state.flip_prob
+        )
+
+        steps["cropper"] = (
+            transforms.CenterCrop(crop_size)
+            if train_state.center_crop
+            else transforms.RandomCrop(crop_size)
+        )
+    
+    else:
+        steps["cropper"] = transforms.CenterCrop(crop_size)
+
+    return steps
+
+
 def prepare_preprocessors(models, train_state: TrainState):
     crop_height = train_state.crop_height or train_state.image_height
     crop_width = train_state.crop_width or train_state.image_width
@@ -567,47 +591,32 @@ def prepare_preprocessors(models, train_state: TrainState):
 
     preprocessors = {"train": {}, "val": {}}
 
-    _train_rgb_preprocess_steps = {}
-    _val_rgb_preprocess_steps = {}
+    _train_rgb_preprocess_steps = prepare_rgb_preprocess_steps(train_state, True, crop_size, downsample_size)
+    _val_rgb_preprocess_steps = prepare_rgb_preprocess_steps(train_state, False, crop_size, downsample_size)
 
-    if resize_factor != 1:
-        _train_rgb_preprocess_steps["resizer"] = transforms.Resize(
-            downsample_size, interpolation=transforms.InterpolationMode.BILINEAR
-        )
-        _val_rgb_preprocess_steps["resizer"] = transforms.Resize(
-            downsample_size, interpolation=transforms.InterpolationMode.BILINEAR
-        )
+    rgb_keys = ["rgb"]
+    for signal_info in train_state.conditioning_signal_infos:
+        match signal_info.type:
+            case "rgb":
+                rgb_keys.append(signal_info.name)
+            case _:
+                raise NotImplementedError
 
-    if train_state.flip_prob > 0:
-        _train_rgb_preprocess_steps["flipper"] = transforms.RandomHorizontalFlip(
-            p=train_state.flip_prob
-        )
-
-    if (crop_height != train_state.image_height) or (
-        crop_width != train_state.image_width
-    ):
-        _train_rgb_preprocess_steps["cropper"] = (
-            transforms.CenterCrop(crop_size)
-            if train_state.center_crop
-            else transforms.RandomCrop(crop_size)
-        )
-        _val_rgb_preprocess_steps["cropper"] = transforms.CenterCrop(crop_size)
-
-    preprocessors["train"]["rgb"] = functools.partial(
-        preprocess_rgb,
-        preprocessors=_train_rgb_preprocess_steps,
-        target_size=crop_size,
-        center_crop=train_state.center_crop,
-    )
     
-    # TODO:
+    for key in rgb_keys:
+        preprocessors["train"][key] = functools.partial(
+            preprocess_rgb,
+            preprocessors=_train_rgb_preprocess_steps,
+            target_size=crop_size,
+            center_crop=train_state.center_crop,
+        )
 
-    preprocessors["val"]["rgb"] = functools.partial(
-        preprocess_rgb,
-        preprocessors=_val_rgb_preprocess_steps,
-        target_size=crop_size,
-        center_crop=True,
-    )
+        preprocessors["val"][key] = functools.partial(
+            preprocess_rgb,
+            preprocessors=_val_rgb_preprocess_steps,
+            target_size=crop_size,
+            center_crop=True,
+        )
 
     preprocessors["train"]["prompt"] = functools.partial(
         preprocess_prompt, models=models
