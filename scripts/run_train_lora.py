@@ -351,13 +351,6 @@ def generate_timestep_weights(args, num_timesteps):
     return weights
 
 
-def compute_time_ids(original_size, crops_coords_top_left, target_size, device, dtype):
-    # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
-    add_time_ids = list(original_size + crops_coords_top_left + target_size)
-    add_time_ids = torch.tensor([add_time_ids], device=device, dtype=dtype)
-    return add_time_ids
-
-
 def preprocess_rgb(rgb, preprocessors, target_size: tuple[int, int], center_crop: bool):
     # preprocess rgb:
     # out: rgb, original_size, crop_top_left, target_size
@@ -406,23 +399,32 @@ def preprocess_prompt(prompt: list[str], models):
 
 
 def preprocess_sample(batch, preprocessors):
-    rgb = preprocessors["rgb"](batch["rgb"])
-    prompt = preprocessors["prompt"](batch["prompt"]["positive_prompt"])
+    sample = {"meta": batch["meta"]}
+    
+    for processor_name, processor in preprocessors:
+        if processor_name == "rgb":
+            rgb_out = processor(batch["rgb"])
+            sample["rgb"] = rgb_out["rgb"]
+            sample["original_size"] = rgb_out["original_size"]
+            sample["crop_top_left"] = rgb_out["crop_top_left"]
+            sample["target_size"] = rgb_out["target_size"]
 
-    sample = {
-        "rgb": rgb["rgb"],
-        "original_size": rgb["original_size"],
-        "crop_top_left": rgb["crop_top_left"],
-        "target_size": rgb["target_size"],
-        "input_ids": prompt["input_ids"],
-        "meta": batch["meta"],
-    }
+        elif processor_name == "prompt":
+            prompt_out = processor(batch["prompt"]["positive_prompt"])
+            sample["input_ids"] = prompt_out["input_ids"]
+
+        elif processor_name.starts_with("cn_rgb"):
+            rgb_out = processor(batch[processor_name])
+            sample[processor_name] = rgb_out["rgb"]
+
+        else:
+            raise NotImplementedError
 
     return sample
 
 
 def collate_fn(batch: list[dict[str, Any]], accelerator: Accelerator) -> dict[list[str], Any]:
-    collated = {}
+    collated: dict[str, Any] = {}
     for key, item in batch[0].items():
         collated[key] = [sample[key] for sample in batch]
 
@@ -433,8 +435,9 @@ def collate_fn(batch: list[dict[str, Any]], accelerator: Accelerator) -> dict[li
             collated[key] = torch.tensor(collated[key])
 
 
-    if "rgb" in collated:
-        collated["rgb"] = collated["rgb"].to(memory_format=torch.contiguous_format, dtype=torch.float32)
+    for sample_name, sample in collated.items():
+        if sample_name == "rgb" or sample_name.startswith("cn_rgb"):
+            collated[sample_name] = sample.to(memory_format=torch.contiguous_format, dtype=torch.float32)
 
     return collated
 
