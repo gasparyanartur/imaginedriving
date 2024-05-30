@@ -134,7 +134,7 @@ def _prepare_image(kwargs, image):
     return channel_first, batch_size
 
 
-def _prepare_conditioning(kwargs: Dict[str, Any], sample: Dict[str, Tensor], conditioning_signal_infos: list["ConditioningSignalInfo"]) -> None:
+def combine_conditioning_info(sample: Dict[str, Tensor], conditioning_signal_infos: list["ConditioningSignalInfo"]) -> torch.Tensor:
     signals = []
 
     for signal_info in conditioning_signal_infos:
@@ -149,7 +149,11 @@ def _prepare_conditioning(kwargs: Dict[str, Any], sample: Dict[str, Tensor], con
 
         signals.append(signal)
 
-    kwargs["control_image"] = torch.cat(signals, dim=1)
+    return torch.cat(signals, dim=1)
+
+
+def _prepare_conditioning(kwargs: Dict[str, Any], sample: Dict[str, Tensor], conditioning_signal_infos: list["ConditioningSignalInfo"]) -> None:
+    kwargs["control_image"] = combine_conditioning_info(sample, conditioning_signal_infos)
 
 
 def _prepare_prompt(sample: dict[str, Any], tokenizer: CLIPTokenizer, text_encoder: CLIPTextModel, batch_size: int) -> None:
@@ -206,13 +210,16 @@ class ConditioningSignalInfo:
     type: str
     num_channels: int
     note: str
-    name: str
 
     @staticmethod
     def from_signal_name(name: str):
         group = CN_SIGNAL_PATTERN.match(name).groupdict()
         group["num_channels"] = int(group["num_channels"])
-        return ConditioningSignalInfo(**group, name=name)
+        return ConditioningSignalInfo(**group)
+
+    @property
+    def name(self):
+        return f"cn_{self.type}_{self.num_channels}_{self.note}"
 
 
 @dataclass
@@ -533,6 +540,9 @@ class ControlNetDiffusionModel(DiffusionModel):
 
         self.conditioning_channels = sum(signal.num_channels for signal in self.conditioning_signal_infos)
         
+        if config.controlnet_weights:
+            controlnet = ControlLoRAModel.from_pretrained(config.controlnet_weights)
+
         self.pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
             config.model_id,
             torch_dtype=dtype,
@@ -744,10 +754,24 @@ def tokenize_prompt(
     return tokens
 
 
-def encode_tokens(
+
+@lru_cache(maxsize=4)
+def _encode_hashable_tokens(
     text_encoder: Union[CLIPTextModel, CLIPTextModelWithProjection],
     tokens: torch.Tensor,
 ) -> torch.Tensor:
+    prompt_embeds = text_encoder(tokens.to(text_encoder.device))
+    return prompt_embeds.last_hidden_state
+
+
+def encode_tokens(
+    text_encoder: Union[CLIPTextModel, CLIPTextModelWithProjection],
+    tokens: torch.Tensor,
+    use_cache: bool = True
+) -> torch.Tensor:
+    if use_cache:
+        return _encode_hashable_tokens(text_encoder, tokens)
+
     prompt_embeds = text_encoder(tokens.to(text_encoder.device))
     return prompt_embeds.last_hidden_state
 

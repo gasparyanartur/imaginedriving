@@ -10,7 +10,7 @@ from dataclasses import dataclass, asdict, field
 import math
 import itertools as it
 from src.data import get_meta_word
-from src.diffusion import get_diffusion_cls, parse_target_ranks
+from src.diffusion import combine_conditioning_info, get_diffusion_cls, parse_target_ranks
 from src.diffusion import get_random_timesteps
 from src.diffusion import get_ordered_timesteps
 from src.diffusion import LOWER_DTYPES
@@ -66,9 +66,9 @@ from peft.utils import get_peft_model_state_dict
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 from src.data import setup_project, DynamicDataset
-from src.diffusion import is_sdxl_model, is_sdxl_vae, get_noised_img
+from src.diffusion import get_noised_img
 from src.diffusion import tokenize_prompt
-from src.diffusion import encode_tokens
+from src.diffusion import encode_tokens, ConditioningSignalInfo
 from src.utils import get_env
 from src.control_lora import ControlLoRAModel
 from src.diffusion import StableDiffusionModel, DiffusionModelConfig
@@ -77,6 +77,7 @@ from src.diffusion import StableDiffusionModel, DiffusionModelConfig
 check_min_version("0.27.0")
 logger = get_logger(__name__, log_level="INFO")
 
+from src.diffusion import DiffusionModelType, DiffusionModelId
 
 @dataclass(init=True)
 class TrainState:
@@ -86,8 +87,8 @@ class TrainState:
     cache_dir: str = None
     datasets: dict[str, Any] = field(default_factory=dict)
 
-    model_id: str = "stabilityai/stable-diffusion-2-1"
-    # model_id: str = "stabilityai/stable-diffusion-xl-base-1.0"
+    model_type: str = DiffusionModelType.sd     
+    model_id: str = DiffusionModelId.sd_v2_1
 
     # Path to pretrained VAE model with better numerical stability.
     # More details: https://github.com/huggingface/diffusers/pull/4038.
@@ -185,6 +186,9 @@ class TrainState:
         }
     })
     lora_peft_type: str = "LORA"        # LORA, LOHA, or LOKR. LOKR seems best for this task https://arxiv.org/pdf/2309.14859
+
+    conditioning_signals: list[str] = field(default_factory=lambda: [])
+    conditioning_signal_infos: list[ConditioningSignalInfo] = field(default_factory=lambda: [])
 
     rec_loss_strength: float = 0.4
 
@@ -595,6 +599,8 @@ def prepare_preprocessors(models, train_state: TrainState):
         target_size=crop_size,
         center_crop=train_state.center_crop,
     )
+    
+    # TODO:
 
     preprocessors["val"]["rgb"] = functools.partial(
         preprocess_rgb,
@@ -860,11 +866,13 @@ def prepare_models(train_state: TrainState, device):
             )
 
     if "controlnet" in models:
-        models["controlnet"].train()
         if "vae" in models:
             models["controlnet"].bind_vae(models["vae"])
         else:
             logging.warning(f"Could not find a VAE in models to bind with ControlNet. Current models: {models.keys()}" )
+
+        if "controlnet" in train_state.trainable_models:
+            models["controlnet"].train()
 
 
     # Sanity check
@@ -913,6 +921,14 @@ def validate_model(
         "variant": train_state.variant,
         "num_inference_steps": train_state.val_noise_num_steps
     }
+    DiffusionModelConfig(
+        model_type=train_state.model_type,
+        model_id=train_state.model_id,
+        low_mem_mode=False,
+        compile_model=False,
+        lora_weights=None,
+    )
+
     pipeline_models = {"scheduler": noise_scheduler}
 
     if "vae" in models:
@@ -932,20 +948,15 @@ def validate_model(
     pipeline = StableDiffusionModel(pipeline_args, accelerator.device, dtype=weights_dtype, **pipeline_models)
     noise_scheduler = pipeline.pipe.noise_scheduler
 
-    # Often we end up using the same prompt, just reuse the previous one then, no need to re-embed
-    use_cached_tokens = (not "text_encoder" in train_state.trainable_models) and train_state.use_cached_tokens
-    cached_input_ids = None
-    cached_prompt_embeds = None
-
     for step, batch in enumerate(dataloader):
-        pipeline_kwargs = {}
+        pipeline_kwargs = {"strength": train_state.val_noise_strength}
 
         pipeline_kwargs["rgb"] = batch["rgb"].to(dtype=vae_dtype, device=accelerator.device)
         batch_size = len(batch["rgb"])
         random_seeds = np.arange(batch_size * step, batch_size * (step + 1))
 
         if "controlnet" in models:
-            for conditioning in train_state.conditioning_signals:
+            for conditioning in train_state.conditioning_signal_infos:
                 pipeline_kwargs[conditioning] = batch[conditioning]
 
         pipeline_kwargs["generator"] = [
@@ -954,26 +965,15 @@ def validate_model(
         ]
 
         if "input_ids" in batch:
-            if use_cached_tokens and cached_input_ids and torch.all(batch["input_ids"] == cached_input_ids):
-                pipeline_kwargs["prompt_embeds"] = cached_prompt_embeds
-            else:
-                with torch.no_grad():
-                    pipeline_kwargs["prompt_embeds"] = encode_tokens(
-                        pipeline.text_encoder,
-                        batch["input_ids"].to(device=accelerator.device),
-                        using_sdxl=is_sdxl_model(train_state.model_id)
-                    )["embeds"]
-
-                if use_cached_tokens:
-                    cached_input_ids = batch["input_ids"]
-                    cached_prompt_embeds = pipeline_kwargs["prompt_embeds"]
+            with torch.no_grad():
+                pipeline_kwargs["prompt_embeds"] = encode_tokens(
+                    pipeline.text_encoder,
+                    batch["input_ids"].to(device=accelerator.device),
+                    use_cache=True
+                )["embeds"]
 
         output_imgs = pipeline(
             **pipeline_kwargs,
-            model_kwargs={
-                    
-            }
-            strength=train_state.val_noise_strength,
         ).images.to(dtype=weights_dtype, device=accelerator.device)
 
         val_start_timestep = int(
@@ -1059,10 +1059,11 @@ def train_epoch(
     train_loss = 0.0
     for batch in dataloader:
         assert "rgb" in batch
+        if "controlnet" in models:
+            for signal in train_state.conditioning_signal_infos:
+                assert signal.name in batch
 
-        batch_size = len(batch["rgb"])
-
-        with accelerator.accumulate(models["unet"]):
+        with accelerator.accumulate(models[m] for m in train_state.trainable_models):
             rgb = models["image_processor"].preprocess(batch["rgb"].to(dtype=vae_dtype, device=accelerator.device))
             model_input = (
                 models["vae"]
@@ -1075,100 +1076,57 @@ def train_epoch(
                 model_input.shape, model_input.device, train_state
             )
 
-            # Recreation_loss
-            if train_state.use_recreation_loss:
-                # TODO: Investigate outputs of these recreation losses 
-                diff_loss = 0
+            unet_added_conditions = {}
+            unet_kwargs = {}
 
-                # Run diffusion all the way to the end, add recreation loss at the end
-                timesteps = get_ordered_timesteps(
-                    train_state.train_noise_strength,
-                    noise_scheduler.config.num_train_timesteps,
-                    model_input.device,
-                    train_state.train_noise_num_steps
-                )
-                latents = noise_scheduler.add_noise(model_input, noise, timesteps[:1].repeat(batch_size))
-                for i, t in enumerate(timesteps):
-                    token_embed_outputs = encode_tokens(
-                        models["text_encoder"], batch["input_ids"]
-                    )
+            timesteps = get_random_timesteps(
+                train_state.train_noise_strength,
+                noise_scheduler.config.num_train_timesteps,
+                model_input.device,
+                model_input.size(0),
+            )
 
-                    curr_timesteps = timesteps[i:i+1].repeat(batch_size)
+            # Add noise to the model input according to the noise magnitude at each timestep
+            # (this is the forward diffusion process)
+            noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
 
+            prompt_hidden_state = encode_tokens(
+                models["text_encoder"], batch["input_ids"], use_cache="text_encoder" not in train_state.trainable_models
+            )
+            
+            if "controlnet" in models:
+                conditioning = combine_conditioning_info(batch, train_state.conditioning_signal_infos)
 
-                    unet_added_conditions = {}
-
-                    model_pred = models["unet"](
-                        latents,
-                        curr_timesteps,
-                        token_embed_outputs["embeds"],
-                        added_cond_kwargs=unet_added_conditions,
-                        return_dict=False,
-                    )[0]
-
-                    diff_loss += get_diffusion_loss(
-                        models, train_state, model_input, model_pred, noise, curr_timesteps
-                    ) 
-                    latents = noise_scheduler.step(model_pred, t, latents, return_dict=False)[0]
-                
-                from src.diffusion import decode_img
-                pred_rgb = decode_img(models["image_processor"], models["vae"], latents)
-                rec_loss = nn.functional.mse_loss(pred_rgb, rgb)
-                diff_loss /= len(timesteps)
-                loss = diff_loss + train_state.rec_loss_strength * rec_loss
-
-
-            else:
-                timesteps = get_random_timesteps(
-                    train_state.train_noise_strength,
-                    noise_scheduler.config.num_train_timesteps,
-                    model_input.device,
-                    model_input.size(0),
-                )
-
-                # Add noise to the model input according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
-
-                unet_added_conditions = {}
-                token_embed_outputs = encode_tokens(
-                    models["text_encoder"], batch["input_ids"], using_sdxl
-                )
-
-                if using_sdxl:
-                    add_time_ids = torch.cat(
-                        [
-                            compute_time_ids(s, c, ts, accelerator.device, weights_dtype)
-                            for s, c, ts in zip(
-                                batch["original_size"],
-                                batch["crop_top_left"],
-                                batch["target_size"],
-                            )
-                        ]
-                    )
-                    unet_added_conditions["time_ids"] = add_time_ids
-                    unet_added_conditions["pooled_embeds"] = token_embed_outputs[
-                        "pooled_embeds"
-                    ]
-
-                model_pred = models["unet"](
+                down_block_res_samples, mid_block_res_sample = models["controlnet"](
                     noisy_model_input,
                     timesteps,
-                    token_embed_outputs["embeds"],
-                    added_cond_kwargs=unet_added_conditions,
-                    return_dict=False,
-                )[0]
+                    encoder_hidden_states=prompt_hidden_state["embeds"],
+                    controlnet_cond=conditioning,
+                    return_dict=False
+                ) 
+                unet_kwargs["down_block_additional_residuals"] = [
+                    sample.to(dtype=weights_dtype) for sample in down_block_res_samples
+                ]
+                unet_kwargs["mid_block_additional_residual"] = mid_block_res_sample.to(dtype=weights_dtype)
 
-                loss = get_diffusion_loss(
-                    models, train_state, model_input, model_pred, noise, timesteps
-                )
 
-                if train_state.debug_loss and "meta" in batch:
-                    for meta in batch["meta"]:
-                        accelerator.log(
-                            {"loss_for_" + get_meta_word(meta): loss}, step=train_state.global_step
-                        )
+            model_pred = models["unet"](
+                noisy_model_input,
+                timesteps,
+                prompt_hidden_state["embeds"],
+                added_cond_kwargs=unet_added_conditions,
+                **unet_kwargs
+            ).sample
 
+            loss = get_diffusion_loss(
+                models, train_state, model_input, model_pred, noise, timesteps
+            )
+
+            if train_state.debug_loss and "meta" in batch:
+                for meta in batch["meta"]:
+                    accelerator.log(
+                        {"loss_for_" + get_meta_word(meta): loss}, step=train_state.global_step
+                    )
 
             # Gather the losses across all processes for logging (if we use distributed training).
             avg_loss = accelerator.gather(
@@ -1208,19 +1166,15 @@ def main(args):
     # ===   Setup script   ===
     # ========================
     config = setup_project(args.config_path)
-    train_state = TrainState(**config)
+    train_state = TrainState(**config)      # TODO: Implement `from_config` to enable support for dataclasses 
 
     init_job_id(train_state)
-    logging.info(f"Launching script under id: {train_state.job_id}")
 
-    using_sdxl = is_sdxl_model(train_state.model_id)
-    if (train_state.vae_id is not None) and (
-        (using_sdxl and not is_sdxl_vae(train_state.vae_id))
-        or (not using_sdxl and is_sdxl_vae(train_state.vae_id))
-    ):
-        raise ValueError(
-            f"Mismatch between model_id and vae_id. Both models need to either be SDXL or SD, but received {train_state.model_id} and {train_state.vae_id}"
-        )
+    train_state.conditioning_signal_infos = [
+       ConditioningSignalInfo.from_signal_name(signal) for signal in train_state.conditioning_signals
+    ]
+
+    logging.info(f"Launching script under id: {train_state.job_id}")
 
     accelerator = Accelerator(
         gradient_accumulation_steps=train_state.gradient_accumulation_steps,
