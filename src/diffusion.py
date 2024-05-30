@@ -117,7 +117,7 @@ def prep_hf_pipe(
         pipe = pipe.to(device)
 
     pipe.set_progress_bar_config(disable=True)
-    pipe.noise_scheduler.set_timesteps(num_inference_steps)
+    pipe.scheduler.set_timesteps(num_inference_steps)
 
     pipe.safety_checker = None
     pipe.requires_safety_checker = False
@@ -125,7 +125,8 @@ def prep_hf_pipe(
     return pipe
 
 
-def _prepare_image(kwargs, image):
+def _prepare_image(kwargs):
+    image = kwargs["image"]
     image = batch_if_not_iterable(image)
     batch_size = len(image)
 
@@ -202,13 +203,14 @@ def _prepare_prompt(
 
     # If no promp embed keys were passed, create one from an empty prompt
     if not prompt_embed_keys:
-        prompt_embed_keys.append("prompt_embeds")
+        prompt_embed_key = "prompt_embeds"
+        prompt_embed_keys.append(prompt_embed_key)
         with torch.no_grad():
-            sample["prompt_embeds"] = embed_prompt(tokenizer, text_encoder, "")
+            sample[prompt_embed_key] = embed_prompt(tokenizer, text_encoder, "")
 
     # Ensure batch size of prompts matches batch size of images
     for prompt_embed_key in prompt_embed_keys:
-        sample[prompt_key] = batch_if_not_iterable(sample[prompt_key], single_dim=2)
+        sample[prompt_embed_key] = batch_if_not_iterable(sample[prompt_embed_key], single_dim=2)
 
         embed_size = sample[prompt_embed_key].shape
         if embed_size[0] == 1 and batch_size > 1:
@@ -314,7 +316,8 @@ class DiffusionModel(ABC):
         raise NotImplementedError
 
     @classmethod
-    def from_config(cls, config: DiffusionModelConfig, **kwargs) -> "DiffusionModel":
+    def from_config(cls, config: DiffusionModelConfig, pipe_models: Dict[str, Any] = None, **kwargs) -> "DiffusionModel":
+        pipe_models = pipe_models or {}
         model_type_to_constructor = {
             DiffusionModelType.sd: StableDiffusionModel,
             DiffusionModelType.cn: ControlNetDiffusionModel,
@@ -327,12 +330,12 @@ class DiffusionModel(ABC):
                 "Compiling the model currently leads to a bug when a LoRA is loaded, proceed with caution"
             )
 
-        return model(config=config, **kwargs)
+        return model(config=config, pipe_models=pipe_models, **kwargs)
 
 
 class MockDiffusionModel(DiffusionModel):
     def __init__(
-        self, config: DiffusionModelConfig, device=get_device(), *args, **kwargs
+        self, config: DiffusionModelConfig, pipe_models: Dict[str, Any] = None, device=get_device(), *args, **kwargs
     ) -> None:
         super().__init__()
         self.mse = nn.MSELoss()
@@ -401,14 +404,12 @@ class StableDiffusionModel(DiffusionModel):
         dtype: torch.dtype = torch.float16,
         use_safetensors: bool = True,
         variant: Optional[str] = None,
-        unet: UNet2DConditionModel = None,
-        vae: AutoencoderKL = None,
-        tokenizer: CLIPTokenizer = None,
-        scheduler: KarrasDiffusionSchedulers = None,
+        pipe_models: Dict[str, Any] = None,
         verbose: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
+        pipe_models = pipe_models or {}
 
         self.config = config
         self.device = device
@@ -418,10 +419,7 @@ class StableDiffusionModel(DiffusionModel):
             torch_dtype=dtype,
             variant=variant,
             use_safetensors=use_safetensors,
-            unet=unet,
-            vae=vae,
-            tokenizer=tokenizer,
-            scheduler=scheduler,
+            **pipe_models
         )
 
         self.pipe = prep_hf_pipe(
@@ -435,7 +433,7 @@ class StableDiffusionModel(DiffusionModel):
         if config.lora_weights:
             self.pipe.load_lora_weights(config.lora_weights)
 
-        if verbose:
+        if verbose and kwargs:
             logging.info(f"Ignoring unrecognized kwargs: {kwargs.keys()}")
 
         self.diffusion_metrics = {
@@ -468,8 +466,6 @@ class StableDiffusionModel(DiffusionModel):
         - original_size (sdxl)
         - target_size (sdxl)
         """
-        batch_size = len(image)
-
         pipeline_kwargs = pipeline_kwargs or {}
         pipeline_kwargs["image"] = sample["rgb"]
         pipeline_kwargs["output_type"] = pipeline_kwargs.get("output_type", "pt")
@@ -481,7 +477,7 @@ class StableDiffusionModel(DiffusionModel):
         )
 
         channel_first, batch_size = _prepare_image(pipeline_kwargs)
-        _prepare_generator(pipeline_kwargs)
+        _prepare_generator(pipeline_kwargs, batch_size)
         _prepare_prompt(
             pipeline_kwargs, self.pipe.tokenizer, self.pipe.text_encoder, batch_size
         )
@@ -539,15 +535,12 @@ class ControlNetDiffusionModel(DiffusionModel):
         dtype: torch.dtype = torch.float16,
         use_safetensors: bool = True,
         variant: Optional[str] = None,
-        unet: UNet2DConditionModel = None,
-        vae: AutoencoderKL = None,
-        tokenizer: CLIPTokenizer = None,
-        scheduler: KarrasDiffusionSchedulers = None,
-        controlnet: ControlNetModel = None,
+        pipe_models: dict[str, Any] = None,
         verbose: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
+        pipe_models = pipe_models or {}
 
         self.config = config
         self.device = device
@@ -562,18 +555,14 @@ class ControlNetDiffusionModel(DiffusionModel):
         )
 
         if config.controlnet_weights:
-            controlnet = ControlLoRAModel.from_pretrained(config.controlnet_weights)
+            pipe_models["controlnet"] = ControlLoRAModel.from_pretrained(config.controlnet_weights)
 
         self.pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
             config.model_id,
             torch_dtype=dtype,
             variant=variant,
             use_safetensors=use_safetensors,
-            unet=unet,
-            vae=vae,
-            tokenizer=tokenizer,
-            scheduler=scheduler,
-            controlnet=controlnet,
+            **pipe_models 
         )
 
         self.pipe = prep_hf_pipe(
@@ -587,7 +576,7 @@ class ControlNetDiffusionModel(DiffusionModel):
         if config.lora_weights:
             self.pipe.load_lora_weights(config.lora_weights)
 
-        if verbose:
+        if verbose and kwargs:
             logging.info(f"Ignoring unrecognized kwargs: {kwargs.keys()}")
 
         self.diffusion_metrics = {
@@ -620,8 +609,6 @@ class ControlNetDiffusionModel(DiffusionModel):
         - original_size (sdxl)
         - target_size (sdxl)
         """
-        batch_size = len(image)
-
         pipeline_kwargs = pipeline_kwargs or {}
         pipeline_kwargs["image"] = sample["rgb"]
         pipeline_kwargs["output_type"] = pipeline_kwargs.get("output_type", "pt")
@@ -635,7 +622,7 @@ class ControlNetDiffusionModel(DiffusionModel):
         channel_first, batch_size = _prepare_image(pipeline_kwargs)
         _prepare_conditioning(pipeline_kwargs, sample, self.conditioning_signal_infos)
 
-        _prepare_generator(pipeline_kwargs)
+        _prepare_generator(pipeline_kwargs, batch_size)
         _prepare_prompt(
             pipeline_kwargs, self.pipe.tokenizer, self.pipe.text_encoder, batch_size
         )
@@ -743,13 +730,10 @@ def upcast_vae(vae):
     return vae
 
 
-def get_noised_img(img, timestep, pipe, noise_scheduler, seed=None):
-    vae = pipe.vae
-    img_processor = pipe.image_processor
-
+def get_noised_img(img, timestep, vae, img_processor, noise_scheduler, seed=None):
     with torch.no_grad():
         model_input = encode_img(
-            img_processor, vae, img, sample_latent=True, device=vae.device, seed=seed
+            img_processor, vae, img, device=vae.device, seed=seed, sample_mode="sample"
         )
         noise = torch.randn_like(model_input, device=vae.device)
         timestep = noise_scheduler.timesteps[timestep]

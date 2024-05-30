@@ -15,6 +15,7 @@ from src.diffusion import get_random_timesteps
 from src.diffusion import get_ordered_timesteps
 from src.diffusion import LOWER_DTYPES
 from src.diffusion import DTYPE_CONVERSION
+from src.diffusion import DiffusionModel
 from src.utils import nearest_multiple
 import torch.utils
 import torch.utils.data
@@ -79,6 +80,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 from src.diffusion import DiffusionModelType, DiffusionModelId
 
+
 @dataclass(init=True)
 class TrainState:
     job_id: str = None
@@ -87,7 +89,7 @@ class TrainState:
     cache_dir: str = None
     datasets: dict[str, Any] = field(default_factory=dict)
 
-    model_type: str = DiffusionModelType.sd     
+    model_type: str = DiffusionModelType.sd
     model_id: str = DiffusionModelId.sd_v2_1
 
     # Path to pretrained VAE model with better numerical stability.
@@ -138,54 +140,34 @@ class TrainState:
     snr_gamma: float = None
     max_grad_norm: float = 1.0
 
-
     lora_rank_linear: int = 4
     lora_rank_conv2d: int = 4
     use_dora: bool = True
 
-    use_controlnet: bool = False 
+    use_controlnet: bool = False
     control_lora_rank_linear: int = 4
     control_lora_rank_conv2d: int = 4
-    lora_target_ranks: dict[str, Any] = field(default_factory=lambda: {
-        "unet": {
-            "downblocks": {
-                "attn": 4,
-                "resnet": 4, 
-                "ff": 8,
-                "proj": 8
+    lora_target_ranks: dict[str, Any] = field(
+        default_factory=lambda: {
+            "unet": {
+                "downblocks": {"attn": 4, "resnet": 4, "ff": 8, "proj": 8},
+                "midblocks": {"attn": 8, "resnet": 8, "ff": 16, "proj": 16},
+                "upblocks": {"attn": 8, "resnet": 8, "ff": 16, "proj": 16},
             },
-            "midblocks": {
-                "attn": 8,
-                "resnet": 8, 
-                "ff": 16,
-                "proj": 16
-            },
-            "upblocks": {
-                "attn": 8,
-                "resnet": 8, 
-                "ff": 16,
-                "proj": 16
-            }
-        },
-        "controlnet": {
-            "downblocks": {
-                "attn": 8,
-                "resnet": 8, 
-                "ff": 16,
-                "proj": 16
-            },
-            "midblocks": {
-                "attn": 8,
-                "resnet": 8, 
-                "ff": 16,
-                "proj": 16
-            }
-        }   # ControlNet not implemented atm, refer to `control_lora_rank_linear` and `control_lora_rank_conv2d`
-    })
-    lora_peft_type: str = "LORA"        # LORA, LOHA, or LOKR. LOKR seems best for this task https://arxiv.org/pdf/2309.14859
+            "controlnet": {
+                "downblocks": {"attn": 8, "resnet": 8, "ff": 16, "proj": 16},
+                "midblocks": {"attn": 8, "resnet": 8, "ff": 16, "proj": 16},
+            },  # ControlNet not implemented atm, refer to `control_lora_rank_linear` and `control_lora_rank_conv2d`
+        }
+    )
+    lora_peft_type: str = (
+        "LORA"  # LORA, LOHA, or LOKR. LOKR seems best for this task https://arxiv.org/pdf/2309.14859
+    )
 
     conditioning_signals: list[str] = field(default_factory=lambda: [])
-    conditioning_signal_infos: list[ConditioningSignalInfo] = field(default_factory=lambda: [])
+    conditioning_signal_infos: list[ConditioningSignalInfo] = field(
+        default_factory=lambda: []
+    )
 
     rec_loss_strength: float = 0.4
 
@@ -233,15 +215,16 @@ class TrainState:
 
 def init_job_id(train_state: TrainState) -> None:
     if train_state.job_id is not None:
-        return 
+        return
 
     if "SLURM_JOB_ID" in os.environ:
         train_state.job_id = os.environ["SLURM_JOB_ID"]
         return
-
-    logging.warning(f"Could not find SLURM_JOB_ID or predefined job_id, setting job_id to 0")
+    logging.warning(
+        f"Could not find SLURM_JOB_ID or predefined job_id, setting job_id to 0"
+    )
     train_state.job_id = "0"
-    return 
+    return
 
 
 def find_checkpoint_paths(cp_dir: str, cp_prefix: str = "checkpoint", cp_delim="-"):
@@ -293,6 +276,7 @@ def parse_args():
 
     args = parser.parse_args()
     return args
+
 
 def compute_vae_encodings(batch, vae):
     images = batch.pop("rgb")
@@ -395,9 +379,11 @@ def preprocess_prompt(prompt: list[str], models):
     return {"input_ids": input_ids}
 
 
-def preprocess_sample(batch: Dict[str, Any], preprocessors: Dict[str, Callable]) -> Dict[str, Any]:
+def preprocess_sample(
+    batch: Dict[str, Any], preprocessors: Dict[str, Callable]
+) -> Dict[str, Any]:
     sample = {"meta": batch["meta"]}
-    
+
     for processor_name, processor in preprocessors.items():
         if processor_name == "rgb":
             rgb_out = processor(batch["rgb"])
@@ -420,26 +406,31 @@ def preprocess_sample(batch: Dict[str, Any], preprocessors: Dict[str, Callable])
     return sample
 
 
-def collate_fn(batch: list[dict[str, Any]], accelerator: Accelerator) -> dict[list[str], Any]:
+def collate_fn(
+    batch: list[dict[str, Any]], accelerator: Accelerator
+) -> dict[list[str], Any]:
     collated: dict[str, Any] = {}
     for key, item in batch[0].items():
         collated[key] = [sample[key] for sample in batch]
 
         if isinstance(item, (torch.Tensor, np.ndarray, int, float, bool)):
-            collated[key] = torch.stack(collated[key])            
+            collated[key] = torch.stack(collated[key])
 
-        elif (isinstance(item, (tuple, list)) and isinstance(item[0], (int, float))):
+        elif isinstance(item, (tuple, list)) and isinstance(item[0], (int, float)):
             collated[key] = torch.tensor(collated[key])
-
 
     for sample_name, sample in collated.items():
         if sample_name == "rgb" or sample_name.startswith("cn_rgb"):
-            collated[sample_name] = sample.to(memory_format=torch.contiguous_format, dtype=torch.float32)
+            collated[sample_name] = sample.to(
+                memory_format=torch.contiguous_format, dtype=torch.float32
+            )
 
     return collated
 
 
-def save_model_hook(loaded_models, weights, output_dir, accelerator, models, train_state):
+def save_model_hook(
+    loaded_models, weights, output_dir, accelerator, models, train_state
+):
     if not accelerator.is_main_process:
         return
 
@@ -467,7 +458,6 @@ def save_model_hook(loaded_models, weights, output_dir, accelerator, models, tra
     dst_dir = Path(output_dir, train_state.job_id)
     if not dst_dir.exists():
         dst_dir.mkdir(exist_ok=True, parents=True)
-
 
     StableDiffusionImg2ImgPipeline.save_lora_weights(
         save_directory=str(dst_dir),
@@ -531,7 +521,9 @@ def load_model_hook(
         )
 
     if "controlnet" in loaded_models_dict:
-        loaded_controlnet = ControlLoRAModel.from_pretrained(input_dir, subfolder="controlnet")
+        loaded_controlnet = ControlLoRAModel.from_pretrained(
+            input_dir, subfolder="controlnet"
+        )
         loaded_models_dict["controlnet"].load_state_dict(loaded_controlnet.state_dict())
         loaded_models_dict["controlnet"].tie_weights(models["unet"])
 
@@ -551,24 +543,24 @@ def unwrap_model(accelerator: Accelerator, model):
     return model
 
 
-def prepare_rgb_preprocess_steps(train_state: TrainState, is_split_train: bool, crop_size, downsample_size):
+def prepare_rgb_preprocess_steps(
+    train_state: TrainState, is_split_train: bool, crop_size, downsample_size
+):
     steps = {}
 
     steps["resizer"] = transforms.Resize(
         downsample_size, interpolation=transforms.InterpolationMode.BILINEAR
-    ) 
+    )
 
-    if is_split_train: 
-        steps["flipper"] = transforms.RandomHorizontalFlip(
-            p=train_state.flip_prob
-        )
+    if is_split_train:
+        steps["flipper"] = transforms.RandomHorizontalFlip(p=train_state.flip_prob)
 
         steps["cropper"] = (
             transforms.CenterCrop(crop_size)
             if train_state.center_crop
             else transforms.RandomCrop(crop_size)
         )
-    
+
     else:
         steps["cropper"] = transforms.CenterCrop(crop_size)
 
@@ -591,8 +583,12 @@ def prepare_preprocessors(models, train_state: TrainState):
 
     preprocessors = {"train": {}, "val": {}}
 
-    _train_rgb_preprocess_steps = prepare_rgb_preprocess_steps(train_state, True, crop_size, downsample_size)
-    _val_rgb_preprocess_steps = prepare_rgb_preprocess_steps(train_state, False, crop_size, downsample_size)
+    _train_rgb_preprocess_steps = prepare_rgb_preprocess_steps(
+        train_state, True, crop_size, downsample_size
+    )
+    _val_rgb_preprocess_steps = prepare_rgb_preprocess_steps(
+        train_state, False, crop_size, downsample_size
+    )
 
     rgb_keys = ["rgb"]
     for signal_info in train_state.conditioning_signal_infos:
@@ -602,7 +598,6 @@ def prepare_preprocessors(models, train_state: TrainState):
             case _:
                 raise NotImplementedError
 
-    
     for key in rgb_keys:
         preprocessors["train"][key] = functools.partial(
             preprocess_rgb,
@@ -666,7 +661,6 @@ def get_diffusion_loss(
 ):
     noise_scheduler = models["noise_scheduler"]
 
-
     # Get the target for loss depending on the prediction type
     if train_state.prediction_type is not None:
         # set prediction_type of scheduler if defined
@@ -682,7 +676,6 @@ def get_diffusion_loss(
             raise ValueError(
                 f"Unknown prediction type {noise_scheduler.config.prediction_type}"
             )
-
 
     if train_state.snr_gamma is None:
         loss = nn.functional.mse_loss(
@@ -731,9 +724,7 @@ def save_checkpoint(accelerator: Accelerator, train_state: TrainState) -> None:
                 cp_path = os.path.join(output_dir, cp_path)
                 shutil.rmtree(cp_path)
 
-    cp_path = os.path.join(
-        output_dir, f"checkpoint-{train_state.global_step}"
-    )
+    cp_path = os.path.join(output_dir, f"checkpoint-{train_state.global_step}")
     accelerator.save_state(cp_path)
     logger.info(f"Saved state to {cp_path}")
 
@@ -821,10 +812,12 @@ def prepare_models(train_state: TrainState, device):
     if train_state.use_controlnet:
         models["controlnet"] = ControlLoRAModel.from_unet(
             unet=models["unet"],
-            conditioning_channels=sum(info.num_channels for info in train_state.conditioning_signal_infos), 
-            lora_linear_rank=train_state.control_lora_rank_linear, 
+            conditioning_channels=sum(
+                info.num_channels for info in train_state.conditioning_signal_infos
+            ),
+            lora_linear_rank=train_state.control_lora_rank_linear,
             lora_conv2d_rank=train_state.control_lora_rank_conv2d,
-            use_dora=train_state.use_dora
+            use_dora=train_state.use_dora,
         )
 
     # ===================
@@ -848,15 +841,15 @@ def prepare_models(train_state: TrainState, device):
             unet_ranks = parse_target_ranks(unet_target_ranks)
 
             models["unet"].add_adapter(
-                LoraConfig( 
+                LoraConfig(
                     r=train_state.lora_rank_linear,
                     lora_alpha=train_state.lora_rank_linear,
                     init_lora_weights="gaussian",
                     target_modules="|".join(unet_ranks.keys()),
                     peft_type=unet_ranks,
-                    use_dora=train_state.use_dora
+                    use_dora=train_state.use_dora,
                 )
-        )
+            )
 
     if "text_encoder" in models:
         models["text_encoder"].requires_grad_(False)
@@ -878,11 +871,12 @@ def prepare_models(train_state: TrainState, device):
         if "vae" in models:
             models["controlnet"].bind_vae(models["vae"])
         else:
-            logging.warning(f"Could not find a VAE in models to bind with ControlNet. Current models: {models.keys()}" )
+            logger.warning(
+                f"Could not find a VAE in models to bind with ControlNet. Current models: {models.keys()}"
+            )
 
         if "controlnet" in train_state.trainable_models:
             models["controlnet"].train()
-
 
     # Sanity check
     for model_name in train_state.trainable_models:
@@ -910,7 +904,8 @@ def validate_model(
     metrics: dict[str, Any],
     run_prefix: str,
 ) -> None:
-    logging.info(f"Running: {run_prefix}")
+    assert "noise_scheduler" in models and "unet" in models
+    logger.info(f"Running: {run_prefix}")
 
     using_wandb = any(tracker.name == "wandb" for tracker in accelerator.trackers)
     if using_wandb:
@@ -919,29 +914,24 @@ def validate_model(
     weights_dtype = DTYPE_CONVERSION[train_state.weights_dtype]
     vae_dtype = DTYPE_CONVERSION[train_state.vae_dtype]
 
-    assert "noise_scheduler" in models and "unet" in models
-
-
-    # create pipeline
-    pipeline_args = {
-        "model_type": "sd_base", "model_id": train_state.model_id,
-        "torch_dtype": weights_dtype,
-        "revision": train_state.revision,
-        "variant": train_state.variant,
-        "num_inference_steps": train_state.val_noise_num_steps
-    }
-    DiffusionModelConfig(
+    # No need for LoRA configs, since we will pass in predefined models anyways
+    diffusion_config = DiffusionModelConfig(
         model_type=train_state.model_type,
         model_id=train_state.model_id,
+        noise_strength=train_state.val_noise_strength,
+        num_inference_steps=train_state.val_noise_num_steps,
+        conditioning_signals=train_state.conditioning_signals,
         low_mem_mode=False,
         compile_model=False,
         lora_weights=None,
     )
 
-    pipeline_models = {"scheduler": noise_scheduler}
+    pipeline_models = {"scheduler": models["noise_scheduler"]}
 
     if "vae" in models:
-        pipeline_models["vae"] = models["vae"].to(dtype=vae_dtype, device=accelerator.device)
+        pipeline_models["vae"] = models["vae"].to(
+            dtype=vae_dtype, device=accelerator.device
+        )
 
     if "text_encoder" in models:
         pipeline_models["text_encoder"] = unwrap_model(
@@ -949,55 +939,72 @@ def validate_model(
         ).to(dtype=weights_dtype, device=accelerator.device)
 
     if "unet" in models:
-        pipeline_models["unet"] = unwrap_model(accelerator, models["unet"]).to(dtype=weights_dtype, device=accelerator.device)
+        pipeline_models["unet"] = unwrap_model(accelerator, models["unet"]).to(
+            dtype=weights_dtype, device=accelerator.device
+        )
 
     if "controlnet" in models:
-        pipeline_models["controlnet"] = unwrap_model(accelerator, models["model"]).to(dtype=weights_dtype, device=accelerator.device)
+        pipeline_models["controlnet"] = unwrap_model(
+            accelerator, models["controlnet"]
+        ).to(dtype=weights_dtype, device=accelerator.device)
 
-    pipeline = StableDiffusionModel(pipeline_args, accelerator.device, dtype=weights_dtype, **pipeline_models)
-    noise_scheduler = pipeline.pipe.noise_scheduler
+    if "tokenizer" in models:
+        pipeline_models["tokenizer"] = models["tokenizer"]
+
+    pipeline = DiffusionModel.from_config(
+        diffusion_config,
+        device=accelerator.device,
+        dtype=weights_dtype,
+        pipe_models=pipeline_models,
+    )
 
     for step, batch in enumerate(dataloader):
-        pipeline_kwargs = {"strength": train_state.val_noise_strength}
+        diffusion_inputs = {}
+        diffusion_kwargs = {"strength": train_state.val_noise_strength}
 
-        pipeline_kwargs["rgb"] = batch["rgb"].to(dtype=vae_dtype, device=accelerator.device)
-        batch_size = len(batch["rgb"])
+        rgb = batch["rgb"].to(dtype=vae_dtype, device=accelerator.device)
+        diffusion_inputs["rgb"] = rgb
+        batch_size = len(rgb)
         random_seeds = np.arange(batch_size * step, batch_size * (step + 1))
 
         if "controlnet" in models:
             for conditioning in train_state.conditioning_signal_infos:
-                pipeline_kwargs[conditioning] = batch[conditioning]
+                signal_name = conditioning.name
+                diffusion_inputs[signal_name] = batch[signal_name]
 
-        pipeline_kwargs["generator"] = [
+        diffusion_inputs["generator"] = [
             torch.Generator(device=accelerator.device).manual_seed(int(seed))
             for seed in random_seeds
         ]
 
         if "input_ids" in batch:
             with torch.no_grad():
-                pipeline_kwargs["prompt_embeds"] = encode_tokens(
-                    pipeline.text_encoder,
+                diffusion_inputs["prompt_embeds"] = encode_tokens(
+                    pipeline.pipe.text_encoder,
                     batch["input_ids"].to(device=accelerator.device),
-                    use_cache=True
-                )["embeds"]
+                    use_cache=True,
+                )
 
-        output_imgs = pipeline(
-            **pipeline_kwargs,
-        ).images.to(dtype=weights_dtype, device=accelerator.device)
+        rgb_out = pipeline.get_diffusion_output(
+            diffusion_inputs,
+            diffusion_kwargs,
+        )["rgb"]
 
         val_start_timestep = int(
-            (1 - train_state.val_noise_strength) * len(noise_scheduler.timesteps)
+            (1 - train_state.val_noise_strength)
+            * len(models["noise_scheduler"].timesteps)
         )
-        noised_imgs = get_noised_img(
-            pipeline_kwargs["image"],
+        rgb_noised = get_noised_img(
+            rgb,
             timestep=val_start_timestep,
-            pipe=pipeline,
-            noise_scheduler=noise_scheduler,
+            vae=pipeline.pipe.vae,
+            img_processor=pipeline.pipe.image_processor,
+            noise_scheduler=models["noise_scheduler"],
         )
 
         # Benchmark
         for metric_name, metric in metrics.items():
-            values = metric(output_imgs, pipeline_kwargs["image"])
+            values = metric(rgb_out, rgb)
             if len(values.shape) == 0:
                 values = [values.item()]
 
@@ -1011,7 +1018,7 @@ def validate_model(
             if tracker.name == "tensorboard":
                 tracker.writer.add_images(
                     f"{run_prefix}_images",
-                    np.stack([np.asarray(img) for img in output_imgs]),
+                    np.stack([np.asarray(img) for img in rgb_out]),
                     train_state.epoch,
                     dataformats="NHWC",
                 )
@@ -1024,21 +1031,21 @@ def validate_model(
                                 img,
                                 caption=meta_to_str(meta),
                             )
-                            for (img, meta) in (zip(batch["rgb"], batch["meta"]))
+                            for (img, meta) in (zip(rgb, batch["meta"]))
                         ],
                         f"{run_prefix}_images": [
                             wandb.Image(
                                 img,
                                 caption=meta_to_str(meta),
                             )
-                            for (img, meta) in (zip(output_imgs, batch["meta"]))
+                            for (img, meta) in (zip(rgb_out, batch["meta"]))
                         ],
                         "noised_images": [
                             wandb.Image(
                                 img,
                                 caption=meta_to_str(meta),
                             )
-                            for (img, meta) in (zip(noised_imgs, batch["meta"]))
+                            for (img, meta) in (zip(rgb_noised, batch["meta"]))
                         ],
                     },
                     step=train_state.global_step,
@@ -1073,11 +1080,11 @@ def train_epoch(
                 assert signal.name in batch
 
         with accelerator.accumulate(models[m] for m in train_state.trainable_models):
-            rgb = models["image_processor"].preprocess(batch["rgb"].to(dtype=vae_dtype, device=accelerator.device))
+            rgb = models["image_processor"].preprocess(
+                batch["rgb"].to(dtype=vae_dtype, device=accelerator.device)
+            )
             model_input = (
-                models["vae"]
-                .encode(rgb)
-                .latent_dist.sample()
+                models["vae"].encode(rgb).latent_dist.sample()
                 * models["vae"].config.scaling_factor
             ).to(weights_dtype)
 
@@ -1100,31 +1107,36 @@ def train_epoch(
             noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
 
             prompt_hidden_state = encode_tokens(
-                models["text_encoder"], batch["input_ids"], use_cache="text_encoder" not in train_state.trainable_models
+                models["text_encoder"],
+                batch["input_ids"],
+                use_cache="text_encoder" not in train_state.trainable_models,
             )
-            
+
             if "controlnet" in models:
-                conditioning = combine_conditioning_info(batch, train_state.conditioning_signal_infos)
+                conditioning = combine_conditioning_info(
+                    batch, train_state.conditioning_signal_infos
+                )
 
                 down_block_res_samples, mid_block_res_sample = models["controlnet"](
                     noisy_model_input,
                     timesteps,
                     encoder_hidden_states=prompt_hidden_state,
                     controlnet_cond=conditioning,
-                    return_dict=False
-                ) 
+                    return_dict=False,
+                )
                 unet_kwargs["down_block_additional_residuals"] = [
                     sample.to(dtype=weights_dtype) for sample in down_block_res_samples
                 ]
-                unet_kwargs["mid_block_additional_residual"] = mid_block_res_sample.to(dtype=weights_dtype)
-
+                unet_kwargs["mid_block_additional_residual"] = mid_block_res_sample.to(
+                    dtype=weights_dtype
+                )
 
             model_pred = models["unet"](
                 noisy_model_input,
                 timesteps,
-                prompt_hidden_state["embeds"],
+                prompt_hidden_state,
                 added_cond_kwargs=unet_added_conditions,
-                **unet_kwargs
+                **unet_kwargs,
             ).sample
 
             loss = get_diffusion_loss(
@@ -1134,7 +1146,8 @@ def train_epoch(
             if train_state.use_debug_loss and "meta" in batch:
                 for meta in batch["meta"]:
                     accelerator.log(
-                        {"loss_for_" + meta_to_str(meta): loss}, step=train_state.global_step
+                        {"loss_for_" + meta_to_str(meta): loss},
+                        step=train_state.global_step,
                     )
 
             # Gather the losses across all processes for logging (if we use distributed training).
@@ -1175,19 +1188,17 @@ def main(args):
     # ===   Setup script   ===
     # ========================
     config = setup_project(args.config_path)
-    train_state = TrainState(**config)      # TODO: Implement `from_config` to enable support for dataclasses 
-
-    init_job_id(train_state)
-
-    train_state.conditioning_signal_infos = [
-       ConditioningSignalInfo.from_signal_name(signal) for signal in train_state.conditioning_signals
-    ]
-
-    logging.info(f"Launching script under id: {train_state.job_id}")
+    train_state = TrainState(
+        **config
+    )  # TODO: Implement `from_config` to enable support for dataclasses
 
     accelerator = Accelerator(
         gradient_accumulation_steps=train_state.gradient_accumulation_steps,
-        mixed_precision=train_state.weights_dtype if train_state.weights_dtype in LOWER_DTYPES else "no",
+        mixed_precision=(
+            train_state.weights_dtype
+            if train_state.weights_dtype in LOWER_DTYPES
+            else "no"
+        ),
         log_with=train_state.loggers,
         project_config=ProjectConfiguration(
             project_dir=train_state.output_dir,
@@ -1195,10 +1206,16 @@ def main(args):
         ),
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
-
-    logging.info(
+    init_job_id(train_state)
+    logger.info(f"Launching script under id: {train_state.job_id}")
+    logger.info(
         f"Number of cuda detected devices: {torch.cuda.device_count()}, Using device: {accelerator.device}, distributed: {accelerator.distributed_type}"
     )
+
+    train_state.conditioning_signal_infos = [
+        ConditioningSignalInfo.from_signal_name(signal)
+        for signal in train_state.conditioning_signals
+    ]
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -1254,7 +1271,11 @@ def main(args):
             wandb.init(
                 project=train_state.wandb_project or get_env("WANDB_PROJECT"),
                 entity=train_state.wandb_entity or get_env("WANDB_ENTITY"),
-                dir=train_state.logging_dir if train_state.logging_dir else get_env("WANDB_DIR"),
+                dir=(
+                    train_state.logging_dir
+                    if train_state.logging_dir
+                    else get_env("WANDB_DIR")
+                ),
                 group=train_state.wandb_group or get_env("WANDB_GROUP"),
                 reinit=True,
                 config=asdict(train_state),
