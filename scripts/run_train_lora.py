@@ -9,14 +9,7 @@ import os
 from dataclasses import dataclass, asdict, field
 import math
 import itertools as it
-from src.data import meta_to_str
-from src.diffusion import combine_conditioning_info, parse_target_ranks
-from src.diffusion import get_random_timesteps
-from src.diffusion import get_ordered_timesteps
-from src.diffusion import LOWER_DTYPES
-from src.diffusion import DTYPE_CONVERSION
-from src.diffusion import DiffusionModel
-from src.utils import nearest_multiple
+
 import torch.utils
 import torch.utils.data
 import tqdm
@@ -73,6 +66,15 @@ from src.diffusion import encode_tokens, ConditioningSignalInfo
 from src.utils import get_env
 from src.control_lora import ControlLoRAModel
 from src.diffusion import StableDiffusionModel, DiffusionModelConfig
+from src.data import meta_to_str
+from src.diffusion import combine_conditioning_info, parse_target_ranks
+from src.diffusion import get_random_timesteps
+from src.diffusion import get_ordered_timesteps
+from src.diffusion import LOWER_DTYPES
+from src.diffusion import DTYPE_CONVERSION
+from src.diffusion import DiffusionModel
+from src.diffusion import decode_img
+from src.utils import nearest_multiple
 
 
 check_min_version("0.27.0")
@@ -106,7 +108,7 @@ class TrainState:
 
     enable_gradient_checkpointing: bool = False
     checkpointing_steps: int = 500
-    checkpoints_total_limit: int = None
+    checkpoints_total_limit: int = 0
     resume_from_checkpoint: bool = False
     n_epochs: int = 100
     max_train_samples: int = None
@@ -435,6 +437,7 @@ def save_model_hook(
         return
 
     layers_to_save = {}
+    other_models = {}
 
     for loaded_model in loaded_models:
         # Map the list of loaded_models given by accelerator to keys given in train_state.
@@ -442,6 +445,10 @@ def save_model_hook(
         # TODO: Find a better way of mapping this.
 
         unwrapped_model = unwrap_model(accelerator, loaded_model)
+        if isinstance(unwrapped_model, ControlLoRAModel):   # This one has special saving logic that we handle later
+            other_models["controlnet"] = unwrapped_model
+            continue
+
         state_model_dict = convert_state_dict_to_diffusers(
             get_peft_model_state_dict(loaded_model)
         )
@@ -464,8 +471,8 @@ def save_model_hook(
         unet_lora_layers=layers_to_save.get("unet"),
         text_encoder_lora_layers=layers_to_save.get("text_encoder"),
     )
-    if "controlnet" in layers_to_save:
-        layers_to_save["controlnet"].save_pretrained(str(dst_dir / "controlnet"))
+    if "controlnet" in other_models:
+        other_models["controlnet"].save_pretrained(str(dst_dir / "controlnet"))
 
 
 def load_model_hook(
@@ -707,6 +714,7 @@ def get_diffusion_loss(
 def save_checkpoint(accelerator: Accelerator, train_state: TrainState) -> None:
     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
     output_dir = os.path.join(train_state.output_dir, train_state.job_id)
+    
     if train_state.checkpoints_total_limit is not None:
         cp_paths = find_checkpoint_paths(output_dir)
 
@@ -1144,7 +1152,6 @@ def train_epoch(
             )
 
             if train_state.use_recreation_loss:
-                from src.diffusion import decode_img
                 pred_rgb = decode_img(models["image_processor"], models["vae"], noisy_model_input)
                 rec_loss = torch.mean(train_state.rec_loss_strength * nn.functional.mse_loss(pred_rgb, rgb, reduce=None) * (1 - (timesteps+1)/noise_scheduler.num_train_timesteps))**2
                 loss += rec_loss
