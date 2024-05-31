@@ -169,7 +169,7 @@ class TrainState:
         default_factory=lambda: []
     )
 
-    rec_loss_strength: float = 0.4
+    rec_loss_strength: float = 0.1
 
     max_train_steps: int = None  # Gets set later
     num_update_steps_per_epoch: int = None  # Gets set later
@@ -905,7 +905,6 @@ def validate_model(
     run_prefix: str,
 ) -> None:
     assert "noise_scheduler" in models and "unet" in models
-    logger.info(f"Running: {run_prefix}")
 
     using_wandb = any(tracker.name == "wandb" for tracker in accelerator.trackers)
     if using_wandb:
@@ -1100,6 +1099,7 @@ def train_epoch(
                 noise_scheduler.config.num_train_timesteps,
                 model_input.device,
                 model_input.size(0),
+                low_noise_high_step=False,
             )
 
             # Add noise to the model input according to the noise magnitude at each timestep
@@ -1143,12 +1143,20 @@ def train_epoch(
                 models, train_state, model_input, model_pred, noise, timesteps
             )
 
+            if train_state.use_recreation_loss:
+                from src.diffusion import decode_img
+                pred_rgb = decode_img(models["image_processor"], models["vae"], noisy_model_input)
+                rec_loss = torch.mean(train_state.rec_loss_strength * nn.functional.mse_loss(pred_rgb, rgb, reduce=None) * (1 - (timesteps+1)/noise_scheduler.num_train_timesteps))**2
+                loss += rec_loss
+
+
             if train_state.use_debug_loss and "meta" in batch:
                 for meta in batch["meta"]:
                     accelerator.log(
                         {"loss_for_" + meta_to_str(meta): loss},
                         step=train_state.global_step,
                     )
+
 
             # Gather the losses across all processes for logging (if we use distributed training).
             avg_loss = accelerator.gather(
@@ -1166,6 +1174,8 @@ def train_epoch(
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+
+            
 
         # Checks if the accelerator has performed an optimization step behind the scenes
         if accelerator.sync_gradients:

@@ -811,11 +811,18 @@ def embed_prompt(
     return embeddings
 
 
-def get_random_timesteps(noise_strength, total_num_timesteps, device, batch_size):
+def get_random_timesteps(noise_strength, total_num_timesteps, device, batch_size, low_noise_high_step: bool = False):
+    if low_noise_high_step:
+        start_step = int((1 - noise_strength) * total_num_timesteps)
+        end_step = total_num_timesteps
+    else:
+        start_step = 0
+        end_step = int(noise_strength * total_num_timesteps)
+
     # Sample a random timestep for each image
     timesteps = torch.randint(
-        int((1 - noise_strength) * total_num_timesteps),
-        total_num_timesteps,
+        start_step,
+        end_step,
         (batch_size,),
         device=device,
         dtype=torch.long,
