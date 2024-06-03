@@ -22,6 +22,7 @@ import torchvision
 import logging
 
 from src.utils import get_env, set_env, set_if_no_key
+import pyquaternion
 
 
 norm_img_pipeline = tvtf.Compose([tvtf.ConvertImageDtype(torch.float32)])
@@ -215,6 +216,15 @@ def read_data_tree(
 
 def meta_to_str(meta: dict[str, Any]) -> str:
     return f"{meta['dataset']} - {meta['scene']} - {meta['sample']}"
+
+
+def _pandaset_pose_to_matrix(pose):
+    translation = np.array([pose["position"]["x"], pose["position"]["y"], pose["position"]["z"]])
+    quaternion = np.array([pose["heading"]["w"], pose["heading"]["x"], pose["heading"]["y"], pose["heading"]["z"]])
+    pose = np.eye(4)
+    pose[:3, :3] = pyquaternion.Quaternion(quaternion).rotation_matrix
+    pose[:3, 3] = translation
+    return pose
 
 @dataclass
 class SampleInfo:
@@ -521,6 +531,8 @@ class PoseDataGetter(DataGetter):
         poses = load_json(file_path)
         pose_idx = int(info.sample)
         pose = poses[pose_idx]
+        pose = _pandaset_pose_to_matrix(pose)
+
         return pose
 
 
